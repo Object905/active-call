@@ -24,7 +24,6 @@ pub struct MediaStream {
     pub cancel_token: CancellationToken,
     recorder_option: Mutex<Option<RecorderOption>>,
     tracks: Mutex<HashMap<TrackId, (Box<dyn Track>, DtmfDetector)>>,
-    suppressed_sources: Mutex<HashSet<TrackId>>,
     event_sender: EventSender,
     pub packet_sender: TrackPacketSender,
     packet_receiver: Mutex<Option<TrackPacketReceiver>>,
@@ -79,7 +78,6 @@ impl MediaStreamBuilder {
             cancel_token,
             recorder_option: Mutex::new(self.recorder_config),
             tracks,
-            suppressed_sources: Mutex::new(HashSet::new()),
             event_sender: self.event_sender,
             packet_sender: track_packet_sender,
             packet_receiver: Mutex::new(Some(track_packet_receiver)),
@@ -138,7 +136,6 @@ impl MediaStream {
     pub async fn remove_track(&self, id: &TrackId, graceful: bool) {
         let track_entry = { self.tracks.lock().await.remove(id) };
         if let Some((track, _)) = track_entry {
-            self.suppressed_sources.lock().await.remove(id);
             let res = if !graceful {
                 track.stop().await
             } else {
@@ -266,17 +263,6 @@ impl MediaStream {
             }
         }
     }
-
-    pub async fn suppress_forwarding(&self, track_id: &TrackId) {
-        self.suppressed_sources
-            .lock()
-            .await
-            .insert(track_id.clone());
-    }
-
-    pub async fn resume_forwarding(&self, track_id: &TrackId) {
-        self.suppressed_sources.lock().await.remove(track_id);
-    }
 }
 
 #[derive(Clone)]
@@ -350,12 +336,6 @@ impl MediaStream {
     async fn handle_forward_track(&self, mut packet_receiver: TrackPacketReceiver) {
         let event_sender = self.event_sender.clone();
         while let Some(packet) = packet_receiver.recv().await {
-            let suppressed = {
-                self.suppressed_sources
-                    .lock()
-                    .await
-                    .contains(&packet.track_id)
-            };
             // Process the packet with each track
             for (track, dtmf_detector) in self.tracks.lock().await.values_mut() {
                 if track.id() == &packet.track_id {
@@ -380,9 +360,7 @@ impl MediaStream {
                     }
                     continue;
                 }
-                if suppressed {
-                    continue;
-                }
+
                 if packet.track_id == QUEUE_HOLD_TRACK_ID && track.id() == CALLEE_TRACK_ID {
                     continue;
                 }
