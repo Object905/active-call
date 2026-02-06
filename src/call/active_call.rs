@@ -2046,10 +2046,12 @@ impl ActiveCall {
             }
         }
 
+        warn!("start update_remote_description");
         self.media_stream
             .update_remote_description(&track_id, &answer)
             .await
             .ok();
+        warn!("end update_remote_description");
 
         Ok(answer)
     }

@@ -7,13 +7,13 @@ use crate::media::{
     track::{Track, TrackPacketReceiver, TrackPacketSender},
 };
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::{
     select,
-    sync::{Mutex, mpsc},
+    sync::{Mutex, mpsc, oneshot},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -23,13 +23,14 @@ pub struct MediaStream {
     id: String,
     pub cancel_token: CancellationToken,
     recorder_option: Mutex<Option<RecorderOption>>,
-    tracks: Mutex<HashMap<TrackId, (Box<dyn Track>, DtmfDetector)>>,
     event_sender: EventSender,
     pub packet_sender: TrackPacketSender,
     packet_receiver: Mutex<Option<TrackPacketReceiver>>,
     recorder_sender: mpsc::UnboundedSender<AudioFrame>,
     recorder_receiver: Mutex<Option<mpsc::UnboundedReceiver<AudioFrame>>>,
     recorder_handle: Mutex<Option<JoinHandle<()>>>,
+    track_command_receiver: Mutex<Option<mpsc::UnboundedReceiver<TrackCommand>>>,
+    track_command_sender: mpsc::UnboundedSender<TrackCommand>,
 }
 
 const CALLEE_TRACK_ID: &str = "callee-track";
@@ -70,20 +71,22 @@ impl MediaStreamBuilder {
         let cancel_token = self
             .cancel_token
             .unwrap_or_else(|| CancellationToken::new());
-        let tracks = Mutex::new(HashMap::new());
         let (track_packet_sender, track_packet_receiver) = mpsc::unbounded_channel();
         let (recorder_sender, recorder_receiver) = mpsc::unbounded_channel();
+        let (track_command_sender, track_command_receiver) = mpsc::unbounded_channel();
+
         MediaStream {
             id: self.id.unwrap_or_default(),
             cancel_token,
             recorder_option: Mutex::new(self.recorder_config),
-            tracks,
             event_sender: self.event_sender,
             packet_sender: track_packet_sender,
             packet_receiver: Mutex::new(Some(track_packet_receiver)),
             recorder_sender,
             recorder_receiver: Mutex::new(Some(recorder_receiver)),
             recorder_handle: Mutex::new(None),
+            track_command_sender,
+            track_command_receiver: Mutex::new(Some(track_command_receiver)),
         }
     }
 }
@@ -100,11 +103,22 @@ impl MediaStream {
                 return Ok(());
             }
         };
+        let track_command_receiver = match self.track_command_receiver.lock().await.take() {
+            Some(receiver) => receiver,
+            None => {
+                warn!(
+                    session_id = self.id,
+                    "MediaStream::serve() called multiple times, stream already serving"
+                );
+                return Ok(());
+            }
+        };
+
         self.start_recorder().await.ok();
         info!(session_id = self.id, "mediastream serving");
         select! {
             _ = self.cancel_token.cancelled() => {}
-            r = self.handle_forward_track(packet_receiver) => {
+            r = self.handle_forward_track(packet_receiver, track_command_receiver) => {
                 info!(session_id = self.id, "track packet receiver stopped {:?}", r);
             }
         }
@@ -134,36 +148,28 @@ impl MediaStream {
     }
 
     pub async fn remove_track(&self, id: &TrackId, graceful: bool) {
-        let track_entry = { self.tracks.lock().await.remove(id) };
-        if let Some((track, _)) = track_entry {
-            let res = if !graceful {
-                track.stop().await
-            } else {
-                track.stop_graceful().await
-            };
-            match res {
-                Ok(_) => {}
-                Err(e) => {
-                    warn!(session_id = self.id, "failed to stop track: {}", e);
-                }
-            }
-        }
+        self.send_track_command(TrackCommand::RemoveTrack {
+            track_id: id.clone(),
+            graceful,
+        })
+        .await;
     }
+
     pub async fn update_remote_description(
         &self,
         track_id: &TrackId,
         answer: &String,
     ) -> Result<()> {
-        let track_entry = { self.tracks.lock().await.remove(track_id) };
-        if let Some((mut track, dtmf)) = track_entry {
-            let res = track.update_remote_description(answer).await;
-            self.tracks
-                .lock()
-                .await
-                .insert(track_id.clone(), (track, dtmf));
-            res?;
-        }
-        Ok(())
+        let (result_tx, result_rx) = oneshot::channel();
+        self.send_track_command(TrackCommand::UpdateRemoteDescription {
+            track_id: track_id.clone(),
+            answer: answer.clone(),
+            force: false,
+            result_tx,
+        })
+        .await;
+        warn!("update_remote_description cmd sent");
+        result_rx.await.expect("sender shouldn't be dropped")
     }
 
     pub async fn update_remote_description_force(
@@ -171,16 +177,15 @@ impl MediaStream {
         track_id: &TrackId,
         answer: &String,
     ) -> Result<()> {
-        let track_entry = { self.tracks.lock().await.remove(track_id) };
-        if let Some((mut track, dtmf)) = track_entry {
-            let res = track.update_remote_description_force(answer).await;
-            self.tracks
-                .lock()
-                .await
-                .insert(track_id.clone(), (track, dtmf));
-            res?;
-        }
-        Ok(())
+        let (result_tx, result_rx) = oneshot::channel();
+        self.send_track_command(TrackCommand::UpdateRemoteDescription {
+            track_id: track_id.clone(),
+            answer: answer.clone(),
+            force: true,
+            result_tx,
+        })
+        .await;
+        result_rx.await.expect("sender shouldn't be dropped")
     }
 
     pub async fn handshake(
@@ -189,17 +194,15 @@ impl MediaStream {
         offer: String,
         timeout: Option<Duration>,
     ) -> Result<String> {
-        let track_entry = { self.tracks.lock().await.remove(track_id) };
-        if let Some((mut track, dtmf)) = track_entry {
-            let res = track.handshake(offer, timeout).await;
-            self.tracks
-                .lock()
-                .await
-                .insert(track_id.clone(), (track, dtmf));
-            res
-        } else {
-            anyhow::bail!("track not found: {}", track_id)
-        }
+        let (result_tx, result_rx) = oneshot::channel();
+        self.send_track_command(TrackCommand::Handshake {
+            track_id: track_id.clone(),
+            offer,
+            timeout,
+            result_tx,
+        })
+        .await;
+        result_rx.await.expect("sender shouldn't be dropped")
     }
 
     pub async fn update_track(&self, mut track: Box<dyn Track>, play_id: Option<String>) {
@@ -216,10 +219,11 @@ impl MediaStream {
             Ok(_) => {
                 info!(session_id = self.id, track_id = track.id(), "track started");
                 let track_id = track.id().clone();
-                self.tracks
-                    .lock()
-                    .await
-                    .insert(track_id.clone(), (track, DtmfDetector::new()));
+                self.send_track_command(TrackCommand::AddTrack {
+                    track: track,
+                    track_id: track_id.clone(),
+                })
+                .await;
                 self.event_sender
                     .send(SessionEvent::TrackStart {
                         track_id,
@@ -241,28 +245,56 @@ impl MediaStream {
     }
 
     pub async fn mute_track(&self, id: Option<TrackId>) {
-        if let Some(id) = id {
-            if let Some((track, _)) = self.tracks.lock().await.get_mut(&id) {
-                MuteProcessor::mute_track(track.as_mut());
-            }
-        } else {
-            for (track, _) in self.tracks.lock().await.values_mut() {
-                MuteProcessor::mute_track(track.as_mut());
-            }
-        }
+        self.send_track_command(TrackCommand::MuteTrack {
+            track_id: id.clone(),
+        })
+        .await;
     }
 
     pub async fn unmute_track(&self, id: Option<TrackId>) {
-        if let Some(id) = id {
-            if let Some((track, _)) = self.tracks.lock().await.get_mut(&id) {
-                MuteProcessor::unmute_track(track.as_mut());
-            }
-        } else {
-            for (track, _) in self.tracks.lock().await.values_mut() {
-                MuteProcessor::unmute_track(track.as_mut());
-            }
-        }
+        self.send_track_command(TrackCommand::UnmuteTrack {
+            track_id: id.clone(),
+        })
+        .await;
     }
+
+    async fn send_track_command(&self, cmd: TrackCommand) {
+        self.track_command_sender
+            .send(cmd)
+            .expect("track_command_receiver is dropped");
+    }
+}
+
+pub enum TrackCommand {
+    AddTrack {
+        track: Box<dyn Track>,
+        track_id: String,
+    },
+    RemoveTrack {
+        track_id: TrackId,
+        graceful: bool,
+    },
+    UpdateRemoteDescription {
+        track_id: TrackId,
+        answer: String,
+        force: bool,
+        result_tx: oneshot::Sender<Result<()>>,
+    },
+    Handshake {
+        track_id: TrackId,
+        offer: String,
+        timeout: Option<Duration>,
+        result_tx: oneshot::Sender<Result<String>>,
+    },
+    MuteTrack {
+        track_id: Option<TrackId>,
+    },
+    UnmuteTrack {
+        track_id: Option<TrackId>,
+    },
+    AudioFrame {
+        packet: AudioFrame,
+    },
 }
 
 #[derive(Clone)]
@@ -333,45 +365,160 @@ impl MediaStream {
         Ok(())
     }
 
-    async fn handle_forward_track(&self, mut packet_receiver: TrackPacketReceiver) {
-        let event_sender = self.event_sender.clone();
-        while let Some(packet) = packet_receiver.recv().await {
-            // Process the packet with each track
-            for (track, dtmf_detector) in self.tracks.lock().await.values_mut() {
-                if track.id() == &packet.track_id {
-                    match &packet.samples {
-                        Samples::RTP {
-                            payload_type,
-                            payload,
-                            ..
-                        } => {
-                            if let Some(digit) = dtmf_detector.detect_rtp(*payload_type, payload) {
-                                debug!(track_id = track.id(), digit, "DTMF detected");
-                                event_sender
-                                    .send(SessionEvent::Dtmf {
-                                        track_id: packet.track_id.to_string(),
-                                        timestamp: packet.timestamp,
-                                        digit,
-                                    })
-                                    .ok();
-                            }
-                        }
-                        _ => {}
-                    }
-                    continue;
+    async fn handle_forward_track(
+        &self,
+        mut packet_receiver: TrackPacketReceiver,
+        mut track_command_receiver: mpsc::UnboundedReceiver<TrackCommand>,
+    ) {
+        let mut tracks: HashMap<TrackId, (Box<dyn Track>, DtmfDetector)> = HashMap::new();
+        loop {
+            select! {
+                Some(track_event) = track_command_receiver.recv() => {
+                    self.handle_track_command(&mut tracks, track_event).await;
                 }
-
-                if packet.track_id == QUEUE_HOLD_TRACK_ID && track.id() == CALLEE_TRACK_ID {
-                    continue;
+                Some(packet) = packet_receiver.recv() => {
+                    self.send_track_command(TrackCommand::AudioFrame { packet }).await;
                 }
-                if let Err(e) = track.send_packet(&packet).await {
-                    warn!(
-                        id = track.id(),
-                        "media_stream: Failed to send packet to track: {}", e
-                    );
-                }
+                else => break,
             }
         }
+    }
+
+    async fn handle_track_command(
+        &self,
+        tracks: &mut HashMap<TrackId, (Box<dyn Track>, DtmfDetector)>,
+        cmd: TrackCommand,
+    ) {
+        warn!("cmd start");
+        match cmd {
+            TrackCommand::AddTrack { track, track_id } => {
+                warn!("AddTrack {}", track_id);
+                tracks.insert(track_id, (track, DtmfDetector::new()));
+            }
+            TrackCommand::RemoveTrack { track_id, graceful } => {
+                if let Some((track, _)) = tracks.remove(&track_id) {
+                    let res = if graceful {
+                        track.stop_graceful().await
+                    } else {
+                        track.stop().await
+                    };
+                    if let Err(e) = res {
+                        warn!(session_id = self.id, "failed to stop track: {}", e);
+                    }
+                }
+            }
+            TrackCommand::UpdateRemoteDescription {
+                track_id,
+                answer,
+                force,
+                result_tx,
+            } => {
+                warn!("UpdateRemoteDescription {}", track_id);
+                if let Some((track, _)) = tracks.get_mut(&track_id) {
+                    let res = if force {
+                        track.update_remote_description_force(&answer).await
+                    } else {
+                        track.update_remote_description(&answer).await
+                    };
+                    result_tx
+                        .send(res)
+                        .expect("update_remote_description receiver shouldn't be dropped");
+                } else {
+                    result_tx
+                        .send(Ok(()))
+                        .expect("update_remote_description receiver shouldn't be dropped");
+                }
+            }
+            TrackCommand::Handshake {
+                track_id,
+                offer,
+                timeout,
+                result_tx,
+            } => match tracks.get_mut(&track_id) {
+                Some(track) => {
+                    warn!("Handshake {}", track_id);
+                    let res = track.0.handshake(offer, timeout).await;
+                    result_tx
+                        .send(res)
+                        .expect("handshake receiver shouldn't be dropped");
+                }
+                None => {
+                    result_tx
+                        .send(Err(anyhow::anyhow!("track not found {}", track_id)))
+                        .expect("handshake receiver shouldn't be dropped");
+                }
+            },
+            TrackCommand::MuteTrack { track_id } => {
+                warn!("MuteTrack {:?}", track_id);
+                if let Some(id) = track_id {
+                    if let Some((track, _)) = tracks.get_mut(&id) {
+                        MuteProcessor::mute_track(track.as_mut());
+                    }
+                } else {
+                    for (track, _) in tracks.values_mut() {
+                        MuteProcessor::mute_track(track.as_mut());
+                    }
+                }
+            }
+            TrackCommand::UnmuteTrack { track_id } => {
+                warn!("UnmuteTrack {:?}", track_id);
+                if let Some(id) = track_id {
+                    if let Some((track, _)) = tracks.get_mut(&id) {
+                        MuteProcessor::unmute_track(track.as_mut());
+                    }
+                } else {
+                    for (track, _) in tracks.values_mut() {
+                        MuteProcessor::unmute_track(track.as_mut());
+                    }
+                }
+            }
+            TrackCommand::AudioFrame { packet } => self.handle_packet(tracks, packet).await,
+        }
+        warn!("cmd done");
+    }
+
+    async fn handle_packet(
+        &self,
+        tracks: &mut HashMap<TrackId, (Box<dyn Track>, DtmfDetector)>,
+        packet: AudioFrame,
+    ) {
+        warn!("packet start");
+        // Process the packet with each track
+        for (track_id, (track, dtmf_detector)) in tracks.iter_mut() {
+            if track_id == &packet.track_id {
+                match &packet.samples {
+                    Samples::RTP {
+                        payload_type,
+                        payload,
+                        ..
+                    } => {
+                        if let Some(digit) = dtmf_detector.detect_rtp(*payload_type, payload) {
+                            debug!(track_id = track_id, digit, "DTMF detected");
+                            self.event_sender
+                                .send(SessionEvent::Dtmf {
+                                    track_id: packet.track_id.to_string(),
+                                    timestamp: packet.timestamp,
+                                    digit,
+                                })
+                                .ok();
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            if packet.track_id == QUEUE_HOLD_TRACK_ID && track_id == CALLEE_TRACK_ID {
+                continue;
+            }
+            if let Err(e) = track.send_packet(&packet).await {
+                warn!(
+                    id = track_id,
+                    "media_stream: Failed to send packet to track: {}", e
+                );
+            }
+        }
+        warn!("packet done");
     }
 }
 

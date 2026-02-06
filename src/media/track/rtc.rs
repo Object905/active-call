@@ -784,7 +784,9 @@ impl Track for RtcTrack {
                             marker,
                             ..Default::default()
                         };
+                        tracing::warn!("send_audio start");
                         source.send_audio(frame).await.ok();
+                        tracing::warn!("send_audio end");
                     }
                 }
                 crate::media::Samples::RTP {
@@ -835,7 +837,9 @@ impl Track for RtcTrack {
                         marker,
                         ..Default::default()
                     };
+                    tracing::warn!("send_audio start");
                     source.send_audio(frame).await.ok();
+                    tracing::warn!("send_audio end");
                 }
                 _ => {}
             }
