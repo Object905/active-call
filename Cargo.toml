@@ -53,7 +53,7 @@ tracing = "0.1.43"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tracing-appender = "0.2.4"
 toml = "0.9.8"
-rsip = "0.4.0"
+rsip = { git = "https://github.com/Object905/rsip.git", branch = "fix_uri_parsing" }
 rsipstack = { git = "https://github.com/Object905/rsipstack.git", branch = "fix_rsip" } 
 #rsipstack = { path = "../rsipstack" }
 uuid = { version = "1.22.0", features = ["v4"] }
