@@ -19,7 +19,7 @@ not_vad = []
 
 [dependencies]
 libc = "0.2"
-audio-codec = { version = "0.3.33", features = ["opus"] }
+audio-codec = { version = "0.3.30", features = ["opus"] }
 rustrtc = "0.3.53"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
