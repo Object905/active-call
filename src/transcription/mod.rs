@@ -80,6 +80,7 @@ pub struct TranscriptionOption {
     pub endpoint: Option<String>,
     pub extra: Option<HashMap<String, String>>,
     pub start_when_answer: Option<bool>,
+    pub refer: Option<bool>,
 }
 
 impl std::fmt::Display for TranscriptionType {
