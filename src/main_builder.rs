@@ -136,6 +136,8 @@ impl MainBuilder {
 
         if let Ok(current) = tokio::runtime::Handle::try_current() {
             current.block_on(self.run_async())
+        } else if let Some(ref rt) = self.runtime {
+            rt.block_on(self.run_async())
         } else {
             self.runtime = Some(tokio::runtime::Runtime::new()?);
             self.runtime.as_ref().unwrap().block_on(self.run_async())
