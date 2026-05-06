@@ -36,6 +36,7 @@ pub struct VADOption {
     pub endpoint: Option<String>,
     pub secret_key: Option<String>,
     pub secret_id: Option<String>,
+    #[serde(skip)]
     pub refer: Option<bool>,
 }
 

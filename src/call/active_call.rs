@@ -1360,8 +1360,20 @@ impl ActiveCall {
             caller: Some(caller),
             callee: Some(callee.clone()),
             sip: refer_option.as_ref().and_then(|o| o.sip.clone()),
-            vad: refer_option.as_ref().and_then(|o| o.vad.clone()),
-            asr: refer_option.as_ref().and_then(|o| o.asr.clone()),
+            vad: refer_option
+                .as_ref()
+                .and_then(|o| o.vad.clone())
+                .map(|mut opts| {
+                    opts.refer = Some(true);
+                    opts
+                }),
+            asr: refer_option
+                .as_ref()
+                .and_then(|o| o.asr.clone())
+                .map(|mut opts| {
+                    opts.refer = Some(true);
+                    opts
+                }),
             denoise: refer_option.as_ref().and_then(|o| o.denoise.clone()),
             recorder,
             ..Default::default()
