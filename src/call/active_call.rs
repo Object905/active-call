@@ -266,6 +266,7 @@ pub struct ActiveCallState {
 pub type ActiveCallRef = Arc<ActiveCall>;
 pub type ActiveCallStateRef = Arc<RwLock<ActiveCallState>>;
 
+#[derive(Clone)]
 pub struct ActiveCall {
     pub call_state: ActiveCallStateRef,
     pub cancel_token: CancellationToken,
@@ -1433,63 +1434,71 @@ impl ActiveCall {
             "do_refer"
         );
 
-        let r = tokio::time::timeout(
-            Duration::from_secs(timeout_secs as u64),
-            self.create_outgoing_sip_track(
-                self.cancel_token.child_token(),
-                refer_call_state.clone(),
-                &track_id,
-                invite_option,
-                &call_option,
-                moh,
-                auto_hangup_requested,
-            ),
-        )
-        .await;
+        // Spawn the outgoing SIP call so the command loop is free to process
+        // Command::Invite (main call leg) while the refer call is in flight.
+        // All ActiveCall fields are Arc-based, so this clone shares the same
+        // underlying state.
+        let call_clone = self.clone();
+        crate::spawn(async move {
+            let r = tokio::time::timeout(
+                Duration::from_secs(timeout_secs as u64),
+                call_clone.create_outgoing_sip_track(
+                    call_clone.cancel_token.child_token(),
+                    refer_call_state,
+                    &track_id,
+                    invite_option,
+                    &call_option,
+                    moh,
+                    auto_hangup_requested,
+                ),
+            )
+            .await;
 
-        {
-            self.call_state.write().await.moh = None;
-        }
-
-        let result = match r {
-            Ok(res) => res,
-            Err(_) => {
-                warn!(
-                    session_id = session_id,
-                    "refer sip track creation timed out after {} seconds", timeout_secs
-                );
-                self.event_sender
-                    .send(SessionEvent::Reject {
-                        track_id,
-                        timestamp: crate::media::get_timestamp(),
-                        reason: "Timeout when refer".into(),
-                        code: Some(408),
-                        refer: Some(true),
-                    })
-                    .ok();
-                return Err(anyhow::anyhow!("refer sip track creation timed out").into());
+            {
+                call_clone.call_state.write().await.moh = None;
             }
-        };
 
-        match result {
-            Ok(answer) => {
-                self.event_sender
-                    .send(SessionEvent::Answer {
-                        timestamp: crate::media::get_timestamp(),
-                        track_id,
-                        sdp: answer,
-                        refer: Some(true),
-                    })
-                    .ok();
-            }
-            Err(e) => {
-                warn!(
-                    session_id = session_id,
-                    "failed to create refer sip track: {}", e
-                );
-                match &e {
-                    rsipstack::Error::DialogError(reason, _, code) => {
-                        self.event_sender
+            let result = match r {
+                Ok(res) => res,
+                Err(_) => {
+                    warn!(
+                        session_id = session_id,
+                        "refer sip track creation timed out after {} seconds", timeout_secs
+                    );
+                    call_clone
+                        .event_sender
+                        .send(SessionEvent::Reject {
+                            track_id,
+                            timestamp: crate::media::get_timestamp(),
+                            reason: "Timeout when refer".into(),
+                            code: Some(408),
+                            refer: Some(true),
+                        })
+                        .ok();
+                    return;
+                }
+            };
+
+            match result {
+                Ok(answer) => {
+                    call_clone
+                        .event_sender
+                        .send(SessionEvent::Answer {
+                            timestamp: crate::media::get_timestamp(),
+                            track_id,
+                            sdp: answer,
+                            refer: Some(true),
+                        })
+                        .ok();
+                }
+                Err(e) => {
+                    warn!(
+                        session_id = session_id,
+                        "failed to create refer sip track: {}", e
+                    );
+                    if let rsipstack::Error::DialogError(reason, _, code) = &e {
+                        call_clone
+                            .event_sender
                             .send(SessionEvent::Reject {
                                 track_id,
                                 timestamp: crate::media::get_timestamp(),
@@ -1499,11 +1508,10 @@ impl ActiveCall {
                             })
                             .ok();
                     }
-                    _ => {}
                 }
-                return Err(e.into());
             }
-        }
+        });
+
         Ok(())
     }
 
