@@ -261,6 +261,7 @@ pub struct ActiveCallState {
     pub audio_receiver: Option<WebsocketBytesReceiver>,
     pub ready_to_answer: Option<(String, Option<Box<dyn Track>>, ServerInviteDialog)>,
     pub pending_asr_resume: Option<(u32, TranscriptionOption)>,
+    pub promote_refer_token: Option<CancellationToken>,
 }
 
 pub type ActiveCallRef = Arc<ActiveCall>;
@@ -534,6 +535,12 @@ impl ActiveCall {
                                     session_id = self.session_id,
                                     ssrc, "auto hangup when track end track_id:{}", track_id
                                 );
+                                // Refer call ended — clear promote flag so do_hangup
+                                // performs a full media stream stop rather than a surgical one.
+                                // Cancel the token so the bridge task completes cleanly.
+                                if let Some(t) = self.call_state.write().await.promote_refer_token.take() {
+                                    t.cancel();
+                                }
                                 self.do_hangup(Some(hangup_reason), None, None).await.ok();
                             }
                         }
@@ -1275,14 +1282,112 @@ impl ActiveCall {
             _ => reason.unwrap_or(CallRecordHangupReason::BySystem),
         };
 
-        self.media_stream
-            .stop(Some(hangup_reason.to_string()), initiator);
+        let promote_refer_token = self.call_state.read().await.promote_refer_token.clone();
+
+        if let Some(refer_token) = promote_refer_token {
+            // Promoted refer call is alive — only tear down the main SIP leg,
+            // leaving the refer call's track and dialog untouched.
+            // Mark original call as refer so its hangup event is tagged correctly.
+            self.call_state.write().await.is_refer = true;
+            self.media_stream
+                .remove_track(&self.server_side_track_id, false)
+                .await;
+            if let Some(id) = self
+                .invitation
+                .find_dialog_id_by_session_id(&self.session_id)
+            {
+                self.invitation.hangup(id, None, None).await.ok();
+            }
+            // Bridge call B's token to the main token so the session ends
+            // when call B ends, even if it's cancelled externally.
+            let main_token = self.cancel_token.clone();
+            crate::spawn(async move {
+                refer_token.cancelled().await;
+                main_token.cancel();
+            });
+        } else {
+            self.media_stream
+                .stop(Some(hangup_reason.to_string()), initiator);
+        }
 
         self.call_state
             .write()
             .await
             .set_hangup_reason(hangup_reason);
         Ok(())
+    }
+
+    async fn retag_processors_as_refer(&self) {
+        let (asr_option, vad_option) = {
+            let mut cs = self.call_state.write().await;
+            if let Some(opt) = cs.option.as_mut() {
+                if let Some(asr) = opt.asr.as_mut() {
+                    asr.refer = Some(true);
+                }
+                if let Some(vad) = opt.vad.as_mut() {
+                    vad.refer = Some(true);
+                }
+            }
+            let asr = cs.option.as_ref().and_then(|o| o.asr.clone());
+            let vad = cs.option.as_ref().and_then(|o| o.vad.clone());
+            (asr, vad)
+        };
+
+        if let Some(asr_option) = asr_option {
+            self.media_stream
+                .remove_processor::<crate::media::asr_processor::AsrProcessor>(
+                    &self.server_side_track_id,
+                )
+                .await
+                .ok();
+            match self
+                .app_state
+                .stream_engine
+                .create_asr_processor(
+                    self.server_side_track_id.clone(),
+                    self.cancel_token.child_token(),
+                    asr_option,
+                    self.event_sender.clone(),
+                )
+                .await
+            {
+                Ok(p) => {
+                    self.media_stream
+                        .append_processor(&self.server_side_track_id, p)
+                        .await
+                        .ok();
+                }
+                Err(e) => warn!(
+                    session_id = self.session_id,
+                    "failed to re-create ASR processor after promote: {}", e
+                ),
+            }
+        }
+
+        if let Some(vad_option) = vad_option {
+            self.media_stream
+                .remove_processor::<crate::media::vad::VadProcessor>(
+                    &self.server_side_track_id,
+                )
+                .await
+                .ok();
+            match self.app_state.stream_engine.create_vad_processor(
+                self.cancel_token.child_token(),
+                self.event_sender.clone(),
+                vad_option,
+            ) {
+                Ok(p) => {
+                    self.media_stream
+                        .append_processor(&self.server_side_track_id, p)
+                        .await
+                        .ok();
+                }
+                Err(e) => warn!(
+                    session_id = self.session_id,
+                    "failed to re-create VAD processor after promote: {}", e
+                ),
+            }
+        }
     }
 
     async fn do_refer(
@@ -1292,6 +1397,11 @@ impl ActiveCall {
         refer_option: Option<ReferOption>,
     ) -> Result<()> {
         self.do_interrupt(false).await.ok();
+
+        let promote = refer_option
+            .as_ref()
+            .and_then(|o| o.promote)
+            .unwrap_or(false);
 
         // Check if we should pause parent ASR
         let pause_parent_asr = refer_option
@@ -1364,14 +1474,14 @@ impl ActiveCall {
                 .as_ref()
                 .and_then(|o| o.vad.clone())
                 .map(|mut opts| {
-                    opts.refer = Some(true);
+                    opts.refer = Some(!promote);
                     opts
                 }),
             asr: refer_option
                 .as_ref()
                 .and_then(|o| o.asr.clone())
                 .map(|mut opts| {
-                    opts.refer = Some(true);
+                    opts.refer = Some(!promote);
                     opts
                 }),
             denoise: refer_option.as_ref().and_then(|o| o.denoise.clone()),
@@ -1412,7 +1522,7 @@ impl ActiveCall {
             start_time: Utc::now(),
             ssrc,
             option: Some(call_option.clone()),
-            is_refer: true,
+            is_refer: !promote,
             ..Default::default()
         }));
 
@@ -1450,10 +1560,18 @@ impl ActiveCall {
             "do_refer"
         );
 
+        let refer_token = if promote {
+            let token = CancellationToken::new();
+            self.call_state.write().await.promote_refer_token = Some(token.clone());
+            token
+        } else {
+            self.cancel_token.child_token()
+        };
+
         let r = tokio::time::timeout(
             Duration::from_secs(timeout_secs as u64),
             self.create_outgoing_sip_track(
-                self.cancel_token.child_token(),
+                refer_token,
                 refer_call_state.clone(),
                 &track_id,
                 invite_option,
@@ -1481,7 +1599,7 @@ impl ActiveCall {
                         timestamp: crate::media::get_timestamp(),
                         reason: "Timeout when refer".into(),
                         code: Some(408),
-                        refer: Some(true),
+                        refer: Some(!promote),
                     })
                     .ok();
                 return Err(anyhow::anyhow!("refer sip track creation timed out").into());
@@ -1490,12 +1608,16 @@ impl ActiveCall {
 
         match result {
             Ok(answer) => {
+                if promote {
+                    self.retag_processors_as_refer().await;
+                }
+
                 self.event_sender
                     .send(SessionEvent::Answer {
                         timestamp: crate::media::get_timestamp(),
                         track_id,
                         sdp: answer,
-                        refer: Some(true),
+                        refer: Some(!promote),
                     })
                     .ok();
             }
@@ -1512,7 +1634,7 @@ impl ActiveCall {
                                 timestamp: crate::media::get_timestamp(),
                                 reason: reason.clone(),
                                 code: Some(code.code() as u32),
-                                refer: Some(true),
+                                refer: Some(!promote),
                             })
                             .ok();
                     }

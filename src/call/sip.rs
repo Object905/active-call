@@ -162,7 +162,12 @@ impl InviteDialogStates {
 impl Drop for InviteDialogStates {
     fn drop(&mut self) {
         self.on_terminated();
-        self.cancel_token.cancel();
+        // Don't cancel the main token when this leg has been demoted to a refer call
+        // (promote path) — the session must stay alive for the promoted call.
+        let is_refer = self.call_state.blocking_read().is_refer;
+        if !is_refer {
+            self.cancel_token.cancel();
+        }
     }
 }
 

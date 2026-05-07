@@ -178,6 +178,9 @@ pub struct ReferOption {
     pub call_id: Option<String>,
     /// Pause parent call's ASR during refer call, will resume after refer ends (if auto_hangup is false)
     pub pause_parent_asr: Option<bool>,
+    /// Promote the refer call to main: Answer/Reject events are emitted without refer=true,
+    /// making the refer leg appear as the new primary call to the application.
+    pub promote: Option<bool>,
 }
 
 #[skip_serializing_none]
