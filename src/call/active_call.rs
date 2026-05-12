@@ -1693,18 +1693,18 @@ impl ActiveCall {
             );
         });
 
+        // The caller-side track (RTC/WebRTC/WebSocket/SIP) is registered under
+        // session_id and is the one whose processor chain sees audio received
+        // from the remote endpoint. server_side_track_id is for server-originated
+        // playback (TTS/files) and is not what we want to tap.
         self.media_stream
-            .bridge_to(
-                &target.media_stream,
-                &self.server_side_track_id,
-                bridge_token.clone(),
-            )
+            .bridge_to(&target.media_stream, &self.session_id, bridge_token.clone())
             .await?;
         target
             .media_stream
             .bridge_to(
                 &self.media_stream,
-                &target.server_side_track_id,
+                &target.session_id,
                 bridge_token.clone(),
             )
             .await?;

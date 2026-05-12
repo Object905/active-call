@@ -408,6 +408,13 @@ impl Processor for ForwardingProcessor {
         if self.cancel_token.is_cancelled() {
             return Ok(());
         }
+        // Drop DTMF (telephone-event) RTP frames so digits stay on their
+        // originating call and don't leak across the bridge.
+        if let Samples::RTP { payload_type, .. } = &frame.samples {
+            if *payload_type >= 96 && *payload_type <= 127 {
+                return Ok(());
+            }
+        }
         let mut f = frame.clone();
         f.track_id = self.inject_track_id.clone();
         if self.sender.send(f).is_err() {
