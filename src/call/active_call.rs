@@ -757,6 +757,11 @@ impl ActiveCall {
             Command::Unmute { track_id } => self.do_unmute(track_id).await,
             Command::Pause {} => self.do_pause().await,
             Command::Resume {} => self.do_resume().await,
+            Command::TextMessage {
+                text,
+                content_type,
+                refer,
+            } => self.do_text_message(text, content_type, refer).await,
             Command::Interrupt {
                 graceful: passage,
                 fade_out_ms: _,
@@ -1278,6 +1283,33 @@ impl ActiveCall {
             .write()
             .await
             .set_hangup_reason(hangup_reason);
+        Ok(())
+    }
+
+    async fn do_text_message(
+        &self,
+        text: String,
+        content_type: Option<String>,
+        refer: Option<bool>,
+    ) -> Result<()> {
+        let session_id = if refer == Some(true) {
+            let refer_state = self.call_state.read().await.refer_callstate.clone();
+            match refer_state {
+                Some(rs) => rs.read().await.session_id.clone(),
+                None => return Err(anyhow::anyhow!("no refer call active")),
+            }
+        } else {
+            self.call_state.read().await.session_id.clone()
+        };
+
+        let dialog = match self.invitation.dialog_layer.get_dialog_with(&session_id) {
+            Some(d) => d,
+            None => return Err(anyhow::anyhow!("no active dialog for session {}", session_id)),
+        };
+
+        let ct = content_type.unwrap_or_else(|| "text/plain".to_string());
+        let headers = vec![rsipstack::rsip::Header::ContentType(ct.into())];
+        dialog.message(Some(headers), Some(text.into_bytes())).await?;
         Ok(())
     }
 

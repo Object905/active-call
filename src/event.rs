@@ -206,6 +206,14 @@ pub enum SessionEvent {
         timestamp: u64,
         data: Vec<u8>,
     },
+    TextMessage {
+        track_id: String,
+        timestamp: u64,
+        text: String,
+        content_type: Option<String>,
+        from: Option<String>,
+        refer: Option<bool>,
+    },
     Ping {
         timestamp: u64,
         payload: Option<String>,

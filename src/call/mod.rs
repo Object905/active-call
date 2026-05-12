@@ -72,6 +72,11 @@ pub enum Command {
     },
     Pause {},
     Resume {},
+    TextMessage {
+        text: String,
+        content_type: Option<String>,
+        refer: Option<bool>,
+    },
     Hangup {
         reason: Option<String>,
         initiator: Option<String>,

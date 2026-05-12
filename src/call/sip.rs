@@ -422,6 +422,32 @@ impl DialogStateReceiverGuard {
                         refer: Some(is_refer),
                     }).ok();
                 }
+                DialogState::Message(dialog_id, req, tx_handle) => {
+                    let body = String::from_utf8_lossy(req.body()).to_string();
+                    let content_type = req.headers.iter().find_map(|h| {
+                        if let rsipstack::rsip::Header::ContentType(ct) = h {
+                            return Some(ct.value().to_string());
+                        }
+                        None
+                    });
+                    let from = req.headers.iter().find_map(|h| {
+                        if let rsipstack::rsip::Header::From(f) = h {
+                            return Some(f.value().to_string());
+                        }
+                        None
+                    });
+                    let is_refer = states.call_state.read().await.is_refer;
+                    info!(session_id = states.session_id, %dialog_id, body = %body, "dialog message received");
+                    states.event_sender.send(crate::event::SessionEvent::TextMessage {
+                        track_id: states.track_id.clone(),
+                        timestamp: crate::media::get_timestamp(),
+                        text: body,
+                        content_type,
+                        from,
+                        refer: Some(is_refer),
+                    }).ok();
+                    tx_handle.reply(rsipstack::rsip::StatusCode::OK).await.ok();
+                }
                 DialogState::Terminated(dialog_id, reason) => {
                     info!(
                         session_id = states.session_id,
