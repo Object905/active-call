@@ -354,7 +354,8 @@ impl MediaStream {
         let inject_track_id = format!("bridge-{}", uuid::Uuid::new_v4());
         let processor =
             ForwardingProcessor::new(other.packet_sender.clone(), inject_track_id, cancel_token);
-        self.append_processor(my_track_id, Box::new(processor)).await
+        self.append_processor(my_track_id, Box::new(processor))
+            .await
     }
 }
 

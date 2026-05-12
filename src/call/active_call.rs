@@ -1702,11 +1702,7 @@ impl ActiveCall {
             .await?;
         target
             .media_stream
-            .bridge_to(
-                &self.media_stream,
-                &target.session_id,
-                bridge_token.clone(),
-            )
+            .bridge_to(&self.media_stream, &target.session_id, bridge_token.clone())
             .await?;
 
         info!(
