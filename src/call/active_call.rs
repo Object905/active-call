@@ -347,9 +347,9 @@ pub struct ActiveCallState {
     pub audio_receiver: Option<WebsocketBytesReceiver>,
     pub ready_to_answer: Option<(String, Option<Box<dyn Track>>, ServerInviteDialog)>,
     pub pending_asr_resume: Option<(u32, TranscriptionOption)>,
+    pub bridge_paused: Arc<AtomicBool>,
     // Cancel this token to hang up only the refer call, leaving the main call alive
     pub refer_call_token: Option<CancellationToken>,
-    pub bridge_paused: Arc<AtomicBool>,
 }
 
 pub type ActiveCallRef = Arc<ActiveCall>;
