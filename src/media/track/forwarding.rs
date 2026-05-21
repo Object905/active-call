@@ -48,6 +48,30 @@ impl ForwardingTrack {
             paused,
         }
     }
+
+    /// Send-only variant: forwards this stream's packets to the peer but never receives.
+    /// The track stays alive until the cancel_token fires (e.g. call hangup).
+    pub fn new_send_only(
+        track_id: TrackId,
+        source_peer_track_id: TrackId,
+        peer_sender: mpsc::Sender<AudioFrame>,
+        config: TrackConfig,
+        cancel_token: CancellationToken,
+        ssrc: u32,
+        paused: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            processor_chain: ProcessorChain::new(config.samplerate),
+            track_id,
+            source_peer_track_id,
+            peer_sender,
+            inbound_receiver: None,
+            config,
+            cancel_token,
+            ssrc,
+            paused,
+        }
+    }
 }
 
 #[async_trait]
@@ -81,45 +105,44 @@ impl Track for ForwardingTrack {
         _event_sender: EventSender,
         packet_sender: TrackPacketSender,
     ) -> Result<()> {
-        let mut inbound_receiver = self
-            .inbound_receiver
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("forwarding track already started"))?;
+        let inbound_receiver = self.inbound_receiver.take();
         let track_id = self.track_id.clone();
         let cancel_token = self.cancel_token.clone();
         let mut processor_chain = self.processor_chain.clone();
 
-        crate::spawn(async move {
-            let stop_reason = loop {
-                tokio::select! {
-                    _ = cancel_token.cancelled() => {
-                        break "track stopped";
-                    }
-                    packet = inbound_receiver.recv() => {
-                        match packet {
-                            Some(mut packet) => {
-                                packet.track_id = track_id.clone();
-                                if let Err(e) = processor_chain.process_frame(&mut packet) {
-                                    warn!(track_id, "processor_chain process_frame error: {:?}", e);
+        if let Some(mut inbound_receiver) = inbound_receiver {
+            crate::spawn(async move {
+                let stop_reason = loop {
+                    tokio::select! {
+                        _ = cancel_token.cancelled() => {
+                            break "track stopped";
+                        }
+                        packet = inbound_receiver.recv() => {
+                            match packet {
+                                Some(mut packet) => {
+                                    packet.track_id = track_id.clone();
+                                    if let Err(e) = processor_chain.process_frame(&mut packet) {
+                                        warn!(track_id, "processor_chain process_frame error: {:?}", e);
+                                    }
+                                    if packet_sender.send(packet).is_err() {
+                                        break "media stream closed";
+                                    }
                                 }
-                                if packet_sender.send(packet).is_err() {
-                                    break "media stream closed";
+                                None => {
+                                    break "peer bridge channel closed";
                                 }
-                            }
-                            None => {
-                                break "peer bridge channel closed";
                             }
                         }
                     }
-                }
-            };
-            cancel_token.cancel();
-            info!(
-                track_id,
-                reason = stop_reason,
-                "audio bridge forwarding task stopped"
-            );
-        });
+                };
+                cancel_token.cancel();
+                info!(
+                    track_id,
+                    reason = stop_reason,
+                    "audio bridge forwarding task stopped"
+                );
+            });
+        }
         Ok(())
     }
 

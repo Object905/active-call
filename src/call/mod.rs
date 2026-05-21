@@ -97,6 +97,22 @@ pub enum Command {
         /// session_id of the other call to unbridge from
         target_session_id: String,
     },
+    /// Connect a trainer (supervisor) to two already-established calls.
+    ///
+    /// The trainer hears both calls mixed together.  `listen_session_id` is one-sided:
+    /// that call does not hear the trainer.  `talk_session_id` is bidirectional: that
+    /// call hears and is heard by the trainer.
+    ///
+    /// Must be sent to the trainer's session.
+    TrainerBridge {
+        listen_session_id: String,
+        talk_session_id: String,
+    },
+    /// Remove a previously established trainer bridge.  Must be sent to the trainer's session.
+    TrainerUnbridge {
+        listen_session_id: String,
+        talk_session_id: String,
+    },
     Mute {
         track_id: Option<String>,
     },

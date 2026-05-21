@@ -14,6 +14,7 @@ use crate::{
             Track, TrackConfig,
             file::FileTrack,
             forwarding::ForwardingTrack,
+            mixing_forwarding::{MixInput, MixingForwardingTrack},
             media_pass::MediaPassTrack,
             rtc::{RtcTrack, RtcTrackConfig},
             tts::SynthesisHandle,
@@ -863,6 +864,14 @@ impl ActiveCall {
             } => self.do_refer(caller, callee, options).await,
             Command::Bridge { target_session_id } => self.do_bridge(target_session_id).await,
             Command::Unbridge { target_session_id } => self.do_unbridge(target_session_id).await,
+            Command::TrainerBridge {
+                listen_session_id,
+                talk_session_id,
+            } => self.do_trainer_bridge(listen_session_id, talk_session_id).await,
+            Command::TrainerUnbridge {
+                listen_session_id,
+                talk_session_id,
+            } => self.do_trainer_unbridge(listen_session_id, talk_session_id).await,
             Command::Mute { track_id } => self.do_mute(track_id).await,
             Command::Unmute { track_id } => self.do_unmute(track_id).await,
             Command::Pause {} => self.do_pause().await,
@@ -1793,6 +1802,191 @@ impl ActiveCall {
             );
         }
 
+        Ok(())
+    }
+
+    fn trainer_mixer_track_id(owner_session_id: &str) -> TrackId {
+        format!("trainer-mixer:{}", owner_session_id)
+    }
+
+    /// Connect `self` (the trainer) to two live calls.
+    ///
+    /// - `listen_session_id` (A): trainer hears this call; this call does NOT hear the trainer.
+    /// - `talk_session_id` (B):   bidirectional with trainer.
+    ///
+    /// Also re-establishes the A↔B bridge so that B hears A + C mixed (and A hears B).
+    /// Any prior A↔B bridge is replaced.
+    async fn do_trainer_bridge(
+        &self,
+        listen_session_id: String,
+        talk_session_id: String,
+    ) -> Result<()> {
+        let (listen_session, talk_session) = {
+            let calls = self.app_state.active_calls.lock().unwrap();
+            let l = calls.get(&listen_session_id).cloned().ok_or_else(|| {
+                anyhow::anyhow!("listen session not found: {}", listen_session_id)
+            })?;
+            let t = calls.get(&talk_session_id).cloned().ok_or_else(|| {
+                anyhow::anyhow!("talk session not found: {}", talk_session_id)
+            })?;
+            (l, t)
+        };
+
+        // Track IDs
+        let a_to_b_track_id = Self::bridge_track_id(&listen_session_id, &talk_session_id);
+        let a_to_c_track_id = Self::bridge_track_id(&listen_session_id, &self.session_id);
+        let b_to_a_track_id_legacy = Self::bridge_track_id(&talk_session_id, &listen_session_id);
+        let b_mixer_track_id = Self::trainer_mixer_track_id(&talk_session_id);
+        let c_mixer_track_id = Self::trainer_mixer_track_id(&self.session_id);
+
+        // Remove any prior trainer / A↔B bridge tracks so we cleanly rebuild.
+        listen_session
+            .media_stream
+            .remove_track(&a_to_b_track_id, false)
+            .await;
+        listen_session
+            .media_stream
+            .remove_track(&a_to_c_track_id, false)
+            .await;
+        talk_session
+            .media_stream
+            .remove_track(&b_to_a_track_id_legacy, false)
+            .await;
+        talk_session
+            .media_stream
+            .remove_track(&b_mixer_track_id, false)
+            .await;
+        self.media_stream
+            .remove_track(&c_mixer_track_id, false)
+            .await;
+
+        // Channels for the trainer topology.
+        let (a_to_b_tx, a_to_b_rx) = mpsc::channel(25); // A → B
+        let (b_to_a_tx, b_to_a_rx) = mpsc::channel(25); // B → A
+        let (a_to_c_tx, a_to_c_rx) = mpsc::channel(25); // A → C
+        let (b_to_c_tx, b_to_c_rx) = mpsc::channel(25); // B → C
+        let (c_to_b_tx, c_to_b_rx) = mpsc::channel(25); // C → B  (no C → A)
+
+        let a_paused = listen_session.call_state.read().await.bridge_paused.clone();
+        let b_paused = talk_session.call_state.read().await.bridge_paused.clone();
+        let c_paused = self.call_state.read().await.bridge_paused.clone();
+
+        // A's stream: bidirectional with B + send-only to C.
+        let a_to_b_track = ForwardingTrack::new(
+            a_to_b_track_id.clone(),
+            listen_session_id.clone(),
+            a_to_b_tx,
+            b_to_a_rx,
+            listen_session.track_config.clone(),
+            listen_session.cancel_token.child_token(),
+            rand::random::<u32>(),
+            a_paused.clone(),
+        );
+        let a_to_c_track = ForwardingTrack::new_send_only(
+            a_to_c_track_id.clone(),
+            listen_session_id.clone(),
+            a_to_c_tx,
+            listen_session.track_config.clone(),
+            listen_session.cancel_token.child_token(),
+            rand::random::<u32>(),
+            a_paused,
+        );
+        listen_session
+            .media_stream
+            .update_track(Box::new(a_to_b_track), None)
+            .await;
+        listen_session
+            .media_stream
+            .update_track(Box::new(a_to_c_track), None)
+            .await;
+
+        // B's stream: mix A+C into B's audio output; forward B's audio to both A and C.
+        let b_mixer = MixingForwardingTrack::new(
+            b_mixer_track_id.clone(),
+            talk_session_id.clone(),
+            vec![
+                MixInput { inbound_receiver: a_to_b_rx },
+                MixInput { inbound_receiver: c_to_b_rx },
+            ],
+            vec![b_to_a_tx, b_to_c_tx],
+            talk_session.track_config.clone(),
+            talk_session.cancel_token.child_token(),
+            rand::random::<u32>(),
+            b_paused,
+        );
+        talk_session
+            .media_stream
+            .update_track(Box::new(b_mixer), None)
+            .await;
+
+        // C's stream: mix A+B into trainer's audio output; forward trainer audio to B only.
+        let c_mixer = MixingForwardingTrack::new(
+            c_mixer_track_id.clone(),
+            self.session_id.clone(),
+            vec![
+                MixInput { inbound_receiver: a_to_c_rx },
+                MixInput { inbound_receiver: b_to_c_rx },
+            ],
+            vec![c_to_b_tx],
+            self.track_config.clone(),
+            self.cancel_token.child_token(),
+            rand::random::<u32>(),
+            c_paused,
+        );
+        self.media_stream
+            .update_track(Box::new(c_mixer), None)
+            .await;
+
+        info!(
+            trainer = self.session_id,
+            listen = listen_session_id,
+            talk = talk_session_id,
+            "trainer bridge established"
+        );
+        Ok(())
+    }
+
+    async fn do_trainer_unbridge(
+        &self,
+        listen_session_id: String,
+        talk_session_id: String,
+    ) -> Result<()> {
+        let (listen_session, talk_session) = {
+            let calls = self.app_state.active_calls.lock().unwrap();
+            (
+                calls.get(&listen_session_id).cloned(),
+                calls.get(&talk_session_id).cloned(),
+            )
+        };
+
+        let a_to_b_track_id = Self::bridge_track_id(&listen_session_id, &talk_session_id);
+        let a_to_c_track_id = Self::bridge_track_id(&listen_session_id, &self.session_id);
+        let b_mixer_track_id = Self::trainer_mixer_track_id(&talk_session_id);
+        let c_mixer_track_id = Self::trainer_mixer_track_id(&self.session_id);
+
+        if let Some(l) = listen_session {
+            l.media_stream
+                .remove_track(&a_to_b_track_id, false)
+                .await;
+            l.media_stream
+                .remove_track(&a_to_c_track_id, false)
+                .await;
+        }
+        if let Some(t) = talk_session {
+            t.media_stream
+                .remove_track(&b_mixer_track_id, false)
+                .await;
+        }
+        self.media_stream
+            .remove_track(&c_mixer_track_id, false)
+            .await;
+
+        info!(
+            trainer = self.session_id,
+            listen = listen_session_id,
+            talk = talk_session_id,
+            "trainer bridge removed"
+        );
         Ok(())
     }
 

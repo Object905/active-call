@@ -56,6 +56,7 @@ impl TrackConfig {
 pub mod file;
 pub mod forwarding;
 pub mod media_pass;
+pub mod mixing_forwarding;
 pub mod rtc;
 pub mod track_codec;
 pub mod tts;
