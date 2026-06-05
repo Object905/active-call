@@ -48,6 +48,7 @@ pub struct PlaybookConfig {
     pub llm: Option<LlmConfig>,
     pub vad: Option<VADOption>,
     pub denoise: Option<bool>,
+    pub normalize_loudness: Option<bool>,
     pub ambiance: Option<AmbianceOption>,
     pub recorder: Option<RecorderOption>,
     pub extra: Option<HashMap<String, String>>,

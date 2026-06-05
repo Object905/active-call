@@ -40,6 +40,7 @@ llm:
 ```yaml
 greeting: "Hello, I am your AI assistant. How can I help you today?"
 denoise: true # Enable noise reduction
+normalizeLoudness: true # Enable EBU R128 loudness normalization (-18 LUFS target)
 interruption:
   strategy: "both" # Strategies: "none", "vad", "asr", "both"
   minSpeechMs: 500 # User must speak for at least 500ms to trigger interruption

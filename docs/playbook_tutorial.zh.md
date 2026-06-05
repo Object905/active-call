@@ -40,6 +40,7 @@ llm:
 ```yaml
 greeting: "您好，我是您的 AI 助手，请问有什么可以帮您？"
 denoise: true # 启用语音降噪
+normalizeLoudness: true # 启用 EBU R128 响度归一化（目标 -18 LUFS）
 interruption:
   strategy: "both" # 打断策略: "none", "vad", "asr", "both"
   minSpeechMs: 500 # 用户说话超过 500ms 才触发打断

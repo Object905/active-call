@@ -241,6 +241,7 @@ The `mediaPass` option in `CallOption` configures the WebSocket connection for a
     "callee": "sip:agent@rustpbx.com",
     "codec": "pcmu",
     "denoise": true,
+    "normalizeLoudness": true,
     "mediaPass": {
       "url": "ws://ai-voice-processor.rustpbx.com:8090/stream",
       "inputSampleRate": 8000,
@@ -499,6 +500,7 @@ Resume continues paused server-side file/TTS playback from the paused playback p
 - `callee` (string): Address of Record (AOR) of the transfer target (e.g., sip:bob@rustpbx.com)
 - `options` (ReferOption, optional): Transfer configuration
   - `denoise` (boolean, optional): Enable noise reduction
+  - `normalizeLoudness` (boolean, optional): Enable EBU R128 loudness normalization
   - `timeout` (number, optional): Transfer timeout in seconds
   - `moh` (string, optional): Music on hold URL to play during transfer
   - `asr` (TranscriptionOption, optional): Automatic Speech Recognition configuration
@@ -521,6 +523,7 @@ Resume continues paused server-side file/TTS playback from the paused playback p
   "callee": "sip:charlie@rustpbx.com",
   "options": {
     "denoise": true,
+    "normalizeLoudness": true,
     "timeout": 30,
     "moh": "http://rustpbx.com/hold_music.wav",
     "asr": {
@@ -666,6 +669,7 @@ The `CallOption` object is used in `invite` and `accept` commands and contains t
 ```json
 {
   "denoise": true,
+  "normalizeLoudness": true,
   "offer": "SDP offer string",
   "callee": "sip:callee@rustpbx.com",
   "caller": "sip:caller@rustpbx.com",
@@ -753,6 +757,7 @@ The `CallOption` object is used in `invite` and `accept` commands and contains t
 
 **CallOption Fields:**
 - `denoise` (boolean, optional): Enable noise reduction for audio processing
+- `normalizeLoudness` (boolean, optional): Enable EBU R128 loudness normalization targeting -18 LUFS
 - `offer` (string, optional): SDP offer string for WebRTC/SIP negotiation
 - `callee` (string, optional): Callee's SIP URI or phone number (e.g., "sip:bob@rustpbx.com")
 - `caller` (string, optional): Caller's SIP URI or phone number (e.g., "sip:alice@rustpbx.com")
@@ -860,6 +865,7 @@ The `ReferOption` object is used in the `refer` command and contains the followi
 
 **Fields:**
 - `denoise` (boolean, optional): Enable noise reduction during transfer
+- `normalizeLoudness` (boolean, optional): Enable EBU R128 loudness normalization targeting -18 LUFS
 - `timeout` (number, optional): Transfer timeout in seconds
 - `moh` (string, optional): Music on hold URL to play during transfer
 - `asr` (TranscriptionOption, optional): Automatic Speech Recognition configuration

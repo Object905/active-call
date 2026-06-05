@@ -263,6 +263,9 @@ pub fn apply_playbook_config(option: &mut CallOption, config: &PlaybookConfig) {
     if let Some(denoise) = config.denoise {
         option.denoise = Some(denoise);
     }
+    if let Some(normalize_loudness) = config.normalize_loudness {
+        option.normalize_loudness = Some(normalize_loudness);
+    }
     if let Some(ambiance) = config.ambiance.clone() {
         option.ambiance = Some(ambiance);
     }

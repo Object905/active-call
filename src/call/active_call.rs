@@ -1527,6 +1527,7 @@ impl ActiveCall {
                     opts
                 }),
             denoise: refer_option.as_ref().and_then(|o| o.denoise.clone()),
+            normalize_loudness: refer_option.as_ref().and_then(|o| o.normalize_loudness),
             recorder,
             ..Default::default()
         };
@@ -2762,6 +2763,9 @@ impl ActiveCallState {
             }
             if option.denoise.is_none() {
                 option.denoise = existing.denoise;
+            }
+            if option.normalize_loudness.is_none() {
+                option.normalize_loudness = existing.normalize_loudness;
             }
             if option.recorder.is_none() {
                 option.recorder = existing.recorder.clone();

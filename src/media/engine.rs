@@ -2,6 +2,7 @@ use super::{
     INTERNAL_SAMPLERATE,
     asr_processor::AsrProcessor,
     denoiser::NoiseReducer,
+    loudness_normalizer::LoudnessNormalizer,
     processor::Processor,
     track::{
         Track, TrackPacketSender,
@@ -308,6 +309,14 @@ impl StreamEngine {
                     debug!(%track_id, "Adding NoiseReducer processor");
                     let noise_reducer = NoiseReducer::new(INTERNAL_SAMPLERATE as usize);
                     processors.push(Box::new(noise_reducer) as Box<dyn Processor>);
+                }
+                _ => {}
+            }
+            match option.normalize_loudness {
+                Some(true) => {
+                    debug!(%track_id, "Adding LoudnessNormalizer processor");
+                    let normalizer = LoudnessNormalizer::new(INTERNAL_SAMPLERATE as u32)?;
+                    processors.push(Box::new(normalizer) as Box<dyn Processor>);
                 }
                 _ => {}
             }

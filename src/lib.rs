@@ -50,6 +50,7 @@ pub struct SipOption {
 #[serde(rename_all = "camelCase")]
 pub struct CallOption {
     pub denoise: Option<bool>,
+    pub normalize_loudness: Option<bool>,
     pub offer: Option<String>,
     pub callee: Option<String>,
     pub caller: Option<String>,
@@ -77,6 +78,7 @@ impl Default for CallOption {
     fn default() -> Self {
         Self {
             denoise: None,
+            normalize_loudness: None,
             offer: None,
             callee: None,
             caller: None,
@@ -172,6 +174,7 @@ impl CallOption {
 #[serde(rename_all = "camelCase")]
 pub struct ReferOption {
     pub denoise: Option<bool>,
+    pub normalize_loudness: Option<bool>,
     pub timeout: Option<u32>,
     pub moh: Option<String>,
     pub vad: Option<VADOption>,
