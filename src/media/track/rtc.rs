@@ -501,9 +501,15 @@ impl RtcTrack {
             for attr in &media.attributes {
                 if attr.key == "rtpmap" {
                     if let Some(value) = &attr.value {
-                        if let Ok((pt, codec, _, _)) = parse_rtpmap(value) {
-                            self.encoder.set_payload_type(pt, codec.clone());
-                            self.processor_chain.codec.set_payload_type(pt, codec);
+                        match parse_rtpmap(value) {
+                            Ok((pt, codec, _, _)) => {
+                                debug!(track_id=%self.track_id, "rtpmap {:?}: PT {} -> {:?}", sdp_type, pt, codec);
+                                self.encoder.set_payload_type(pt, codec.clone());
+                                self.processor_chain.codec.set_payload_type(pt, codec);
+                            }
+                            Err(e) => {
+                                debug!(track_id=%self.track_id, "rtpmap parse failed for {:?}: {}", value, e);
+                            }
                         }
                     }
                 }
@@ -515,6 +521,7 @@ impl RtcTrack {
             // When parsing an answer, prefer our configured codec order among accepted codecs.
             // Offer parsing is provisional; the final outgoing PT is set from the answer.
             if sdp_type == rustrtc::sdp::SdpType::Answer && !self.rtc_config.codecs.is_empty() {
+                debug!(track_id=%self.track_id, "Answer codec selection: formats={:?} config={:?}", media.formats, self.rtc_config.codecs);
                 for preferred_codec in &self.rtc_config.codecs {
                     if *preferred_codec == CodecType::TelephoneEvent {
                         continue;
@@ -522,6 +529,7 @@ impl RtcTrack {
                     for fmt in &media.formats {
                         if let Ok(pt) = fmt.parse::<u8>() {
                             let codec = self.encoder.get_codec_for_pt(pt);
+                            debug!(track_id=%self.track_id, "  checking PT {} -> {:?} against preferred {:?}", pt, codec, preferred_codec);
                             if let Some(c) = codec {
                                 if c == *preferred_codec {
                                     negotiated = Some((pt, c));
