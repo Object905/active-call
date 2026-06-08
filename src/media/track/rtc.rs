@@ -700,7 +700,6 @@ impl Track for RtcTrack {
 
         let mut answer = pc.create_answer().await?;
         crate::media::negotiate::intersect_answer(&sdp, &mut answer);
-        self.parse_sdp_payload_types(rustrtc::SdpType::Answer, &answer.to_sdp_string())?;
 
         pc.set_local_description(answer.clone())?;
 
@@ -711,6 +710,8 @@ impl Track for RtcTrack {
         let final_answer = pc
             .local_description()
             .ok_or(anyhow::anyhow!("No local description"))?;
+
+        self.parse_sdp_payload_types(rustrtc::SdpType::Answer, &final_answer.to_sdp_string())?;
 
         Ok(final_answer.to_sdp_string())
     }
