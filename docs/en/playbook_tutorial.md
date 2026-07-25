@@ -58,6 +58,14 @@ ambiance:
   normalLevel: 0.5 # Default background volume
 recorder:
   recorderFile: "recordings/call_{id}.wav" # Automatically record the call
+ringbackDetection:
+  enabled: true # Detect ringback tones before call answer
+  confidenceThreshold: 0.8
+  onStateChangeOnly: false # Emit RingbackState event on every detection interval
+sip:
+  extractHeaders:
+    - "X-Customer-Id" # Extract SIP headers into {{ sip["X-Customer-Id"] }}
+    - "X-Session-Token"
 ```
 
 ---
@@ -90,9 +98,12 @@ Simple tags that can be output by the model during streaming for real-time execu
 
 -   **Hang up**: `<hangup/>`
 -   **Transfer**: `<refer to="sip:1001@127.0.0.1"/>`
--   **Send SIP metadata body**: `<message body="customer_id=12345"/>`
+-   **Send SIP metadata body**: `<message body="customer_id=12345" contentType="text/plain;charset=utf-8" refer="false"/>`
 -   **Play audio file**: `<play file="config/media/ding.wav"/>`
 -   **Switch scene**: `<goto scene="support"/>`
+-   **Set variable**: `<set_var key="user_name" value="John"/>` — stores `{{ user_name }}` for use in templates
+-   **HTTP call**: `<http url="https://api.example.com/query" method="POST" body='{"id":"123"}'/>` — results fed back to AI
+-   **DTMF collect**: `<collect type="phone" var="user_phone" prompt="Please enter your phone number"/>` — collects DTMF digits into `{{ user_phone }}`
 
 ### 4.2 JSON Tool Calling
 Used for complex operations like HTTP calls. Results are fed back to the AI for a follow-up response.
@@ -305,8 +316,18 @@ Automatically generate a summary and push it to your business system after the c
 posthook:
   url: "https://your-crm.com/api/callback"
   summary: "detailed" # Types: short, detailed, intent, json
-  include_history: true
+  method: "POST" # HTTP method (default: POST)
+  headers:
+    Authorization: "Bearer ${API_TOKEN}"
+  include_history: true # Include full conversation history in the payload
+  timeout: 30 # Request timeout in seconds (default: 30)
 ```
+
+**Summary Types:**
+- `short`: Brief one-sentence summary
+- `detailed`: Full conversation summary with key points
+- `intent`: Extracted user intent only
+- `json`: Structured JSON with caller, callee, duration, intent, and key info
 
 ---
 

@@ -415,6 +415,7 @@ Commands are sent as JSON messages through the WebSocket connection. All timesta
 - `waitInputTimeout` (number, optional): Maximum time to wait for user input in seconds
 - `option` (SynthesisOption, optional): TTS provider specific options
 - `base64` (bool, optional): If true, text is base64 encoded PCM samples of sample rate 16000 hz, **DO NOT use this feature in Streaming TTS**
+- `cacheKey` (string, optional): Custom cache key for TTS audio. If set and the key exists in cache, returns cached audio instead of re-synthesizing.
 ```json
 {
   "command": "tts",
@@ -655,6 +656,7 @@ The bridge is a media-only operation. It creates separate internal bridge tracks
 - `reason` (string, optional): Reason for hanging up
 - `initiator` (string, optional): Who initiated the hangup (user, system, etc.)
 - `headers` (object, optional): Additional SIP headers to include in the BYE request (SIP calls only)
+- `refer` (boolean, optional): If true, hangs up only the referred call instead of the main call
 
 ```json
 {
@@ -753,7 +755,17 @@ The `CallOption` object is used in `invite` and `accept` commands and contains t
   },
   "handshakeTimeout": 30,
   "enableIpv6": false,
+  "enableIceLite": false,
   "inactivityTimeout": 50,
+  "ambiance": {
+    "path": "./config/office.wav",
+    "duckLevel": 0.1,
+    "normalLevel": 0.3
+  },
+  "ringbackDetection": {
+    "enabled": true,
+    "confidenceThreshold": 0.8
+  },
   "sip": {
     "username": "user",
     "password": "password",
@@ -787,7 +799,7 @@ The `CallOption` object is used in `invite` and `accept` commands and contains t
   - `samplerate` (number): Recording sample rate in Hz (default: 16000)
   - `ptime` (number): Packet time in milliseconds (default: 200)
 - `asr` (TranscriptionOption, optional): Automatic Speech Recognition configuration
-  - `provider` (string): ASR provider ("tencent", "aliyun", "voiceapi")
+  - `provider` (string): ASR provider ("tencent", "aliyun", "deepgram", "sensevoice")
   - `language` (string, optional): Language code (e.g., "zh-CN", "en-US")
   - `appId` (string, optional): Application ID for the ASR service
   - `secretId` (string, optional): Secret ID for authentication
@@ -820,7 +832,7 @@ The `CallOption` object is used in `invite` and `accept` commands and contains t
   - `secretId` (string, optional): Secret ID for VAD service authentication
 - `tts` (SynthesisOption, optional): Text-to-Speech configuration
   - `samplerate` (number, optional): TTS output sample rate in Hz
-  - `provider` (string, optional): TTS provider ("tencent", "aliyun", "deepgram", "supertonic"). Default: "aliyun" for Chinese (zh), "supertonic" for English (en).
+  - `provider` (string, optional): TTS provider ("tencent", "tencent_basic", "aliyun", "deepgram", "supertonic", "voiceapi"). Default: "aliyun" for Chinese (zh), "supertonic" for English (en).
   - `speed` (number, optional): Speech speed multiplier (default: 1.0)
   - `appId` (string, optional): Application ID for TTS service
   - `secretId` (string, optional): Secret ID for authentication
@@ -841,7 +853,23 @@ The `CallOption` object is used in `invite` and `accept` commands and contains t
 - `subscribe` (boolean, optional): Enable real-time audio subscription for non-WebSocket calls (SIP/WebRTC). If true, audio will be pushed via the control WebSocket using binary frames with a 1-byte track header (0x00 for caller, 0x01 for callee).
 - `handshakeTimeout` (number, optional): Timeout for connection handshake in seconds (e.g., 30)
 - `enableIpv6` (boolean, optional): Enable IPv6 support for networking
+- `enableIceLite` (boolean, optional): Enable ICE lite mode for WebRTC media
 - `inactivityTimeout` (number, optional): Timeout for audio inactivity in seconds
+- `ambiance` (AmbianceOption, optional): Background audio mixing configuration
+  - `path` (string): Path to background audio file
+  - `duckLevel` (number, optional): Volume reduction when AI speaks (default: 0.1)
+  - `normalLevel` (number, optional): Default background volume (default: 0.3)
+  - `transitionSpeed` (number, optional): Speed of volume transition (default: 0.01)
+- `ringbackDetection` (RingbackDetectionOption, optional): Ringback tone detection configuration
+  - `enabled` (boolean): Enable ringback detection
+  - `modelWeightsPath` (string, optional): Path to classifier weights (default: "./telcoclassifier_weights.bin")
+  - `confidenceThreshold` (number, optional): Detection confidence threshold (default: 0.5)
+- `realtime` (RealtimeOption, optional): Realtime API configuration for full-duplex streaming
+  - `provider` (string): Realtime provider ("openai", "azure")
+  - `model` (string, optional): Model name
+  - `apiKey` (string, optional): API key for the realtime provider
+  - `turnDetection` (object, optional): Turn detection configuration (passed through to provider)
+  - `tools` (array, optional): Function tools for the realtime session
 - `sip` (SipOption, optional): SIP protocol configuration
   - `username` (string): SIP username for authentication
   - `password` (string): SIP password for authentication
@@ -967,6 +995,22 @@ Events are received as JSON messages from the server. All timestamps are in mill
 }
 ```
 
+#### MediaReady Event
+**Triggered when:** Media layer is ready for audio processing (after SDP negotiation completes).
+
+**Fields:**
+- `event` (string): Always "mediaReady"
+- `trackId` (string): **Unique identifier for the audio track.**
+- `timestamp` (number): Event timestamp in milliseconds since Unix epoch
+
+```json
+{
+  "event": "mediaReady",
+  "trackId": "track-abc123",
+  "timestamp": 1640995200000
+}
+```
+
 #### Ringing Event
 **Triggered when:** Call is ringing (SIP calls only).
 
@@ -1025,6 +1069,36 @@ Events are received as JSON messages from the server. All timestamps are in mill
     "call_quality": "good",
     "network_type": "wifi"
   }
+}
+```
+
+### Media Processing Events
+
+#### RingbackState Event
+**Triggered when:** Ringback detection state changes.
+
+**Fields:**
+- `event` (string): Always "ringbackState"
+- `trackId` (string): **Unique identifier for the audio track.**
+- `timestamp` (number): Event timestamp in milliseconds since Unix epoch
+- `state` (string): Current ringback state
+- `stateIndex` (number): State sequence index
+- `confidence` (number): Detection confidence (0.0–1.0)
+- `prevState` (string, optional): Previous ringback state
+- `prevConfidence` (number, optional): Previous detection confidence
+- `isFinal` (boolean): Whether this is the final detection result
+
+```json
+{
+  "event": "ringbackState",
+  "trackId": "track-abc123",
+  "timestamp": 1640995200000,
+  "state": "ringing",
+  "stateIndex": 3,
+  "confidence": 0.92,
+  "prevState": "unknown",
+  "prevConfidence": 0.5,
+  "isFinal": false
 }
 ```
 
@@ -1261,6 +1335,48 @@ Events are received as JSON messages from the server. All timestamps are in mill
 }
 ```
 
+### Call Transfer Events
+
+#### TransferRequest Event
+**Triggered when:** An in-dialog SIP REFER (transfer) request is received.
+
+**Fields:**
+- `event` (string): Always "transferRequest"
+- `trackId` (string): **Unique identifier for the audio track.**
+- `timestamp` (number): Event timestamp in milliseconds since Unix epoch
+- `referTo` (string): SIP URI of the transfer target
+- `referredBy` (string, optional): SIP URI of the transfer initiator
+
+```json
+{
+  "event": "transferRequest",
+  "trackId": "track-abc123",
+  "timestamp": 1640995200000,
+  "referTo": "sip:operator@domain.com",
+  "referredBy": "sip:ivr@domain.com"
+}
+```
+
+#### Message Event (Inbound SIP MESSAGE)
+**Triggered when:** An in-dialog SIP MESSAGE is received during an active call.
+
+**Fields:**
+- `event` (string): Always "message"
+- `trackId` (string): **Unique identifier for the audio track.**
+- `timestamp` (number): Event timestamp in milliseconds since Unix epoch
+- `body` (string): Message body content
+- `contentType` (string, optional): MIME content type of the message
+
+```json
+{
+  "event": "message",
+  "trackId": "track-abc123",
+  "timestamp": 1640995200000,
+  "body": "customer_id=12345",
+  "contentType": "text/plain;charset=utf-8"
+}
+```
+
 ### System Events
 
 #### Ping Event
@@ -1400,6 +1516,27 @@ Events are received as JSON messages from the server. All timestamps are in mill
   "timestamp": 1640995200000,
   "speaker": "user",
   "text": "Hello, I need help with my account"
+}
+```
+
+#### Custom Event
+**Triggered when:** External systems send custom JSON data to the call session.
+
+**Fields:**
+- `event` (string): Always "custom"
+- `timestamp` (number): Event timestamp in milliseconds since Unix epoch
+- `sender` (string, optional): Component that generated the custom event
+- `data` (object): Custom JSON payload
+
+```json
+{
+  "event": "custom",
+  "timestamp": 1640995200000,
+  "sender": "external_service",
+  "data": {
+    "action": "update_context",
+    "value": "customer_premium"
+  }
 }
 ```
 
@@ -1733,6 +1870,42 @@ curl -X POST http://localhost:8080/api/playbook/run \
 **Usage:**
 ```bash
 curl http://localhost:8080/api/records
+```
+
+#### Precache TTS
+
+**Endpoint:** `POST /precache`
+
+**Description:** Pre-generates and caches TTS audio for a given text without requiring an active call session. Useful for warming the cache during off-peak hours.
+
+**Request Body (JSON):**
+```json
+{
+  "text": "Hello, welcome to our service!",
+  "speaker": "F1",
+  "option": {
+    "provider": "supertonic"
+  },
+  "cacheKey": "welcome-message-en"
+}
+```
+
+**Fields:**
+- `text` (string, required): Text to synthesize
+- `speaker` (string, optional): Speaker voice
+- `option` (object, optional): TTS provider options
+- `cacheKey` (string, optional): Custom cache key
+
+**Response:**
+```json
+{ "status": "cached", "key": "welcome-message-en" }
+```
+
+**Usage:**
+```bash
+curl -X POST http://localhost:8080/precache \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Hello!", "speaker": "F1", "cacheKey": "greeting"}'
 ```
 
 ## Error Handling

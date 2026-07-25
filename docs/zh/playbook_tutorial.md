@@ -58,6 +58,14 @@ ambiance:
   normalLevel: 0.5 # 默认背景音量
 recorder:
   recorderFile: "recordings/call_{id}.wav" # 自动开启通话录音
+ringbackDetection:
+  enabled: true # 检测回铃音
+  confidenceThreshold: 0.8
+  onStateChangeOnly: false # 每次检测都发送 RingbackState 事件
+sip:
+  extractHeaders:
+    - "X-Customer-Id" # 提取 SIP 头到模板变量 {{ sip["X-Customer-Id"] }}
+    - "X-Session-Token"
 ```
 
 ---
@@ -90,9 +98,12 @@ Playbook 支持两种方式触发系统动作：
 
 -   **挂断**: `<hangup/>`
 -   **转接**: `<refer to="sip:1001@127.0.0.1"/>`
--   **发送 SIP 元信息正文**: `<message body="customer_id=12345"/>`
+-   **发送 SIP 元信息正文**: `<message body="customer_id=12345" contentType="text/plain;charset=utf-8" refer="false"/>`
 -   **音效播放**: `<play file="config/media/ding.wav"/>`
 -   **场景跳转**: `<goto scene="support"/>`
+-   **设置变量**: `<set_var key="user_name" value="John"/>` — 存储为 `{{ user_name }}`，可在后续模板中使用
+-   **HTTP 调用**: `<http url="https://api.example.com/query" method="POST" body='{"id":"123"}'/>` — 结果回传 LLM
+-   **DTMF 收集**: `<collect type="phone" var="user_phone" prompt="请输入您的手机号"/>` — 收集按键存入 `{{ user_phone }}`
 
 ### 4.2 JSON 工具调用 (自定义推理)
 用于复杂操作，如 HTTP 调用。结果会自动喂回给 AI 进行下一次推理。
@@ -305,8 +316,18 @@ llm:
 posthook:
   url: "https://your-crm.com/api/callback"
   summary: "detailed" # 摘要精细度: short, detailed, intent, json
-  include_history: true
+  method: "POST" # HTTP 方法（默认 POST）
+  headers:
+    Authorization: "Bearer ${API_TOKEN}"
+  include_history: true # 是否包含完整对话历史
+  timeout: 30 # 请求超时（秒，默认 30）
 ```
+
+**摘要类型说明：**
+- `short`: 一句话简短摘要
+- `detailed`: 详细对话摘要
+- `intent`: 仅提取用户意图
+- `json`: 结构化 JSON，含主被叫、时长、意图、关键信息等
 
 ---
 
