@@ -36,6 +36,7 @@ pub enum SessionEvent {
         caller: String,
         callee: String,
         sdp: String,
+        headers: Option<HashMap<String, String>>,
     },
     Answer {
         track_id: String,

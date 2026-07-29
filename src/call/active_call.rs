@@ -41,6 +41,7 @@ use anyhow::Result;
 use audio_codec::CodecType;
 use chrono::{DateTime, Utc};
 use rsipstack::dialog::{invitation::InviteOption, server_dialog::ServerInviteDialog};
+use rsipstack::rsip::prelude::HeadersExt;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -3018,7 +3019,6 @@ impl ActiveCall {
         hangup_headers: Option<Vec<rsipstack::rsip::Header>>,
     ) -> Result<()> {
         let state_receiver = pending_dialog.state_receiver;
-        //let pending_token_clone = pending_dialog.token;
 
         let states = InviteDialogStates {
             is_client: false,
@@ -3034,6 +3034,38 @@ impl ActiveCall {
 
         let initial_request = pending_dialog.dialog.initial_request();
         let offer = String::from_utf8_lossy(&initial_request.body).to_string();
+
+        let caller = initial_request
+            .from_header()
+            .ok()
+            .and_then(|h| h.uri().ok())
+            .map(|u| u.to_string())
+            .unwrap_or_default();
+        let callee = initial_request
+            .to_header()
+            .ok()
+            .and_then(|h| h.uri().ok())
+            .map(|u| u.to_string())
+            .unwrap_or_default();
+        let headers: Option<HashMap<String, String>> = {
+            let mut h = HashMap::new();
+            for header in initial_request.headers.iter() {
+                if let rsipstack::rsip::Header::Other(name, value) = header {
+                    h.insert(name.to_string(), value.to_string());
+                }
+            }
+            if h.is_empty() { None } else { Some(h) }
+        };
+        self.event_sender
+            .send(SessionEvent::Incoming {
+                track_id: self.session_id.clone(),
+                timestamp: crate::media::get_timestamp(),
+                caller,
+                callee,
+                sdp: offer.clone(),
+                headers,
+            })
+            .ok();
 
         let (ssrc, option) = {
             let call_state = call_state_ref.read().await;

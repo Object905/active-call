@@ -642,6 +642,9 @@ mod tests {
     #[tokio::test]
     async fn test_file_track_with_cache() -> Result<()> {
         ensure_cache_dir().await?;
+        // Clear any stale cache from previous runs to avoid WAV-header-in-PCM issue
+        let cache_key = crate::media::cache::generate_cache_key("fixtures/sample.wav", 16000, None, None);
+        let _ = crate::media::cache::delete_from_cache(&cache_key).await;
         let file_path = "fixtures/sample.wav".to_string();
 
         // Create a FileTrack instance

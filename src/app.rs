@@ -32,7 +32,11 @@ use rsipstack::transaction::{
     endpoint::{TargetLocator, TransportEventInspector},
 };
 use rsipstack::{dialog::dialog_layer::DialogLayer, transaction::endpoint::MessageInspector};
+use rsipstack::transport::transport_layer::DomainResolver;
+use rsipstack::{rsip::{Host, HostWithPort}, transport::SipAddr};
+use async_trait::async_trait;
 use std::future::pending;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -886,6 +890,43 @@ impl Drop for AppStateInner {
     }
 }
 
+struct SimpleDomainResolver;
+
+#[async_trait]
+impl DomainResolver for SimpleDomainResolver {
+    async fn resolve(&self, target: &SipAddr) -> rsipstack::Result<SipAddr> {
+        match &target.addr.host {
+            Host::Domain(domain) => {
+                let port: u16 = target.addr.port.map(|p| p.value()).unwrap_or(5060);
+                let addr_str = format!("{}:{}", domain, port);
+                match tokio::net::lookup_host(&addr_str).await {
+                    Ok(mut addrs) => {
+                        if let Some(addr) = addrs.next() {
+                            Ok(SipAddr {
+                                r#type: target.r#type,
+                                addr: HostWithPort {
+                                    host: Host::IpAddr(addr.ip()),
+                                    port: Some(rsipstack::rsip::Port(addr.port())),
+                                },
+                            })
+                        } else {
+                            Err(rsipstack::Error::DnsResolutionError(format!(
+                                "no addresses found for {}",
+                                domain
+                            )))
+                        }
+                    }
+                    Err(e) => Err(rsipstack::Error::DnsResolutionError(format!(
+                        "DNS resolution failed for {}: {}",
+                        domain, e
+                    ))),
+                }
+            }
+            _ => Ok(target.clone()),
+        }
+    }
+}
+
 impl AppStateBuilder {
     pub fn new() -> Self {
         Self {
@@ -955,7 +996,18 @@ impl AppStateBuilder {
         } else {
             crate::net_tool::get_first_non_loopback_interface()?
         };
-        let transport_layer = rsipstack::transport::TransportLayer::new(token.clone());
+        let transport_layer = match catch_unwind(AssertUnwindSafe(|| {
+            rsipstack::transport::TransportLayer::new(token.clone())
+        })) {
+            Ok(tl) => tl,
+            Err(_) => {
+                warn!("failed to initialize default DNS resolver with hickory-resolver, falling back to simple resolver via tokio::net::lookup_host");
+                rsipstack::transport::TransportLayer::new_with_domain_resolver(
+                    token.clone(),
+                    Box::new(SimpleDomainResolver),
+                )
+            }
+        };
         let local_addr: SocketAddr = format!("{}:{}", local_ip, config.udp_port).parse()?;
 
         // Create UDP socket with SO_REUSEPORT for graceful restarts
