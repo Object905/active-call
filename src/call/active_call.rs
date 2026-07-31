@@ -477,6 +477,98 @@ mod tests {
         cancel_token.cancel();
         Ok(())
     }
+
+    // ---------------------------------------------------------------------------
+    // Regression: double-ASR when Accept arrives without a prior Ringing
+    // ---------------------------------------------------------------------------
+    //
+    // prepare_incoming_sip_track starts the caller track during ringing. It must
+    // NOT build VAD/ASR/AGC processors at that point: the stored option already
+    // carries `asr` in the accept-first path, so finish_caller_stack would build a
+    // second set at accept time, producing two ASR clients (two WebSocket
+    // connections) on the same track.
+    //
+    // This test verifies that update_track_wrapper (the prepare-time path) never
+    // fires the ASR builder even when call_state.option carries an asr config.
+
+    #[tokio::test]
+    async fn test_update_track_wrapper_does_not_build_asr_processor() -> Result<()> {
+        let (asr_created_tx, mut asr_created_rx) = mpsc::channel::<()>(1);
+
+        let mock_provider =
+            crate::transcription::TranscriptionType::Other("mock-ringing-asr".to_string());
+
+        let mut engine = StreamEngine::new();
+        engine.register_asr(
+            mock_provider.clone(),
+            Box::new(move |_tid, _tok, _opt, _es| {
+                let tx = asr_created_tx.clone();
+                Box::pin(async move {
+                    let _ = tx.send(()).await;
+                    Ok(Box::new(MockAsrClient)
+                        as Box<dyn crate::transcription::TranscriptionClient>)
+                })
+            }),
+        );
+        let engine = Arc::new(engine);
+
+        let mut config = Config::default();
+        config.udp_port = 0;
+        config.media_cache_path = "/tmp/mediacache_update_track_wrapper_test".to_string();
+
+        let app_state = AppStateBuilder::new()
+            .with_config(config)
+            .with_stream_engine(engine)
+            .build()
+            .await?;
+
+        let cancel_token = CancellationToken::new();
+        let session_id = format!("test-no-asr-on-prepare-{}", uuid::Uuid::new_v4());
+
+        let active_call = Arc::new(ActiveCall::new(
+            ActiveCallType::Sip,
+            cancel_token.clone(),
+            session_id.clone(),
+            app_state.invitation.clone(),
+            app_state.clone(),
+            TrackConfig::default(),
+            None,
+            false,
+            None,
+            None,
+            None,
+        ));
+
+        // Simulate the accept-first path: setup_caller_track has already stored the
+        // full accept option (with asr) into call_state.option before the track is
+        // prepared.
+        {
+            let mut cs = active_call.call_state.write().await;
+            cs.option = Some(crate::CallOption {
+                asr: Some(crate::transcription::TranscriptionOption {
+                    provider: Some(mock_provider),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+
+        let mock_track = Box::new(MockCallerTrack::new(session_id.clone()));
+        active_call.update_track_wrapper(mock_track, None).await;
+
+        // update_track_wrapper must NOT fire the ASR builder; the processors are
+        // deferred to finish_caller_stack(StartedForEarlyMedia) at accept time.
+        let received =
+            tokio::time::timeout(std::time::Duration::from_millis(500), asr_created_rx.recv())
+                .await;
+        assert!(
+            received.is_err(),
+            "ASR builder fired during track preparation — double-ASR regression"
+        );
+
+        cancel_token.cancel();
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -3082,7 +3174,15 @@ impl ActiveCall {
                 // Processors are intentionally omitted here; they will be built from
                 // the accept option (which carries VAD/ASR/AGC config) when Accept
                 // is issued, via finish_caller_stack(StartedForEarlyMedia).
-                self.setup_track_with_stream(&option, track).await?;
+                //
+                // Do NOT call setup_track_with_stream here: it builds the VAD/ASR/AGC
+                // processors from the stored option. When Accept arrives without a prior
+                // Ringing, that option already carries `asr`, so processors would be built
+                // both here and again in finish_caller_stack(StartedForEarlyMedia),
+                // resulting in two ASR clients (two WebSocket connections) per session.
+                // update_track_wrapper only starts the track (plus ambiance/subscribe),
+                // deferring all VAD/ASR/AGC processors to accept time.
+                self.update_track_wrapper(track, None).await;
                 let mut state = self.call_state.write().await;
                 state.ready_to_answer = Some((
                     offer,
