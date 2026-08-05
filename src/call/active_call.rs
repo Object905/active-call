@@ -40,7 +40,7 @@ use crate::{
 use anyhow::Result;
 use audio_codec::CodecType;
 use chrono::{DateTime, Utc};
-use rsipstack::dialog::{invitation::InviteOption, server_dialog::ServerInviteDialog};
+use rsipstack::dialog::{invitation::InviteOption, invite_dialog::InviteDialog};
 use rsipstack::rsip::prelude::HeadersExt;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -615,7 +615,7 @@ pub struct ActiveCallState {
     pub moh: Option<String>,
     pub current_play_id: Option<String>,
     pub audio_receiver: Option<WebsocketBytesReceiver>,
-    pub ready_to_answer: Option<(String, PendingCallerTrack, ServerInviteDialog)>,
+    pub ready_to_answer: Option<(String, PendingCallerTrack, InviteDialog)>,
     pub pending_asr_resume: Option<(u32, TranscriptionOption)>,
     pub bridge_paused: Arc<AtomicBool>,
     // Cancel this token to hang up only the refer call, leaving the main call alive
@@ -2017,7 +2017,7 @@ impl ActiveCall {
                         rsipstack::dialog::dialog::DialogState::Confirmed(_, _)
                     )
                 })
-                .map(rsipstack::dialog::dialog::Dialog::ClientInvite);
+                .map(rsipstack::dialog::dialog::Dialog::Invite);
         }
 
         if dialog.is_none() && refer == Some(true) {
@@ -2033,7 +2033,7 @@ impl ActiveCall {
                             rsipstack::dialog::dialog::DialogState::Confirmed(_, _)
                         )
                     })
-                    .map(rsipstack::dialog::dialog::Dialog::ClientInvite);
+                    .map(rsipstack::dialog::dialog::Dialog::Invite);
             }
         }
 

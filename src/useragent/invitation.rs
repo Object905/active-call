@@ -10,14 +10,14 @@ use async_trait::async_trait;
 use rsipstack::dialog::{
     DialogId,
     dialog::{Dialog, DialogStateReceiver},
-    server_dialog::ServerInviteDialog,
+    invite_dialog::InviteDialog,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 pub struct PendingDialog {
     pub token: CancellationToken,
-    pub dialog: ServerInviteDialog,
+    pub dialog: InviteDialog,
     pub state_receiver: DialogStateReceiver,
 }
 pub struct PendingDialogGuard {
@@ -70,7 +70,7 @@ pub trait InvitationHandler: Send + Sync {
         &self,
         _session_id: String,
         _cancel_token: CancellationToken,
-        _dialog: ServerInviteDialog,
+        _dialog: InviteDialog,
         _routing_state: Arc<RoutingState>,
     ) -> Result<()> {
         return Err(anyhow!("invite not handled"));
