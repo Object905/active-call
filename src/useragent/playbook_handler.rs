@@ -5,8 +5,8 @@ use crate::{
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use regex::Regex;
+use rsipstack::dialog::invite_dialog::InviteDialog;
 use rsipstack::rsip::prelude::HeadersExt;
-use rsipstack::dialog::server_dialog::ServerInviteDialog;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -109,7 +109,7 @@ impl InvitationHandler for PlaybookInvitationHandler {
         &self,
         dialog_id: String,
         cancel_token: CancellationToken,
-        dialog: ServerInviteDialog,
+        dialog: InviteDialog,
         _routing_state: Arc<RoutingState>,
     ) -> Result<()> {
         let invite_request = dialog.initial_request();
