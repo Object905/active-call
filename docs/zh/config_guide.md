@@ -65,6 +65,40 @@ media_cache_path = "./config/mediacache"
 external_ip = "1.2.3.4"
 ```
 
+### Trunk 规则（匹配并改写外呼 INVITE/REFER）
+
+`trunk_rules` 在发出 SIP INVITE（以及 REFER 呼叫腿）之前对其改写。常用于根据呼叫目标智能选择 SIP `Contact` 地址（例如 external_ip 还是内网 IP），或者按 trunk 改写主被叫 URI。
+
+规则按**声明顺序**评估，**第一条**所有 match 条件都满足（AND 关系）的规则生效（first-match-wins）。没有 match 条件的规则永远命中，作为**默认兜底（catch-all）**。
+
+```toml
+[[trunk_rules]]
+rule.match.to.host = "^172\\.25\\."            # 目标在内网
+rule.rewrite.contact.host = "172.25.225.2"     # 用内网 IP 作为 Contact
+
+[[trunk_rules]]
+rule.rewrite.contact.host = "1.2.3.4"          # 兜底：外网目标用 external_ip
+```
+
+match 字段（正则，可任意组合——所有条件都要满足）：
+
+| 字段 | 匹配对象 |
+|---|---|
+| `rule.match.from.user` | 主叫用户名（`@` 之前） |
+| `rule.match.from.host` | 主叫 host（`@` 之后） |
+| `rule.match.to.user` | 被叫用户名（To 头 / Request-URI 的 user） |
+| `rule.match.to.host` | 被叫 host（To 头 / Request-URI 的 host） |
+
+rewrite 字段（可任意组合）：
+
+| 字段 | 改写对象 |
+|---|---|
+| `rule.rewrite.from.user` / `rule.rewrite.from.host` | 主叫 URI |
+| `rule.rewrite.to.user` / `rule.rewrite.to.host` | 被叫 URI |
+| `rule.rewrite.contact.user` / `rule.rewrite.contact.host` | Contact URI |
+
+`host` 改写值如果不带端口，会保留原端口；带端口（如 `"172.25.225.2:15060"`）则会一并改写端口。
+
 ### RTP 端口范围
 
 ```toml

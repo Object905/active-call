@@ -1087,10 +1087,6 @@ impl AppStateBuilder {
         // Optional SIP over TLS transport
         if let Some(tls_port) = config.tls_port {
             let tls_addr: std::net::SocketAddr = format!("{}:{}", local_ip, tls_port).parse()?;
-            let tls_sip_addr = rsipstack::transport::SipAddr {
-                r#type: Some(rsipstack::rsip::transport::Transport::Tls),
-                addr: tls_addr.into(),
-            };
             let mut tls_cfg = rsipstack::transport::tls::TlsConfig::default();
             if let Some(ref cert_path) = config.tls_cert_file {
                 tls_cfg.cert = Some(
@@ -1108,7 +1104,7 @@ impl AppStateBuilder {
                 .as_ref()
                 .and_then(|ip| format!("{}:{}", ip, tls_port).parse().ok());
             match rsipstack::transport::tls::TlsListenerConnection::new(
-                tls_sip_addr,
+                tls_addr,
                 external_tls_addr,
                 tls_cfg,
             )

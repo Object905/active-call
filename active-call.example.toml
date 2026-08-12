@@ -102,3 +102,36 @@ root = "./config/cdr"
 # [register_users.credential]
 # username = "1002"
 # password = ""     # Leave empty for IP-based auth
+
+# ---------------------------------------------------------------------------
+# Trunk rules: match + rewrite the outgoing SIP INVITE/REFER.
+#
+# Rules are evaluated in declaration order; the FIRST rule whose match
+# conditions all hold (AND) is applied (first-match-wins). A rule with no
+# match conditions always matches and acts as a catch-all default.
+#
+# Available match fields (regex against the From / To / Request-URI):
+#   rule.match.from.user  - caller username (before @)
+#   rule.match.from.host  - caller host     (after @)
+#   rule.match.to.user    - callee username (To header / Request-URI user)
+#   rule.match.to.host    - callee host     (To header / Request-URI host)
+#
+# Available rewrite fields:
+#   rule.rewrite.from.user / rule.rewrite.from.host      - rewrite caller URI
+#   rule.rewrite.to.user   / rule.rewrite.to.host        - rewrite callee URI
+#   rule.rewrite.contact.user / rule.rewrite.contact.host - rewrite Contact URI
+#
+# A host rewrite value without a port preserves the original port; include a
+# port (e.g. "1.2.3.4:5060") to change it too.
+#
+# Example: pick the SIP Contact address (external_ip vs internal IP) based on
+# whether the target is on the internal network, so the called SBC/trunk can
+# reach this UA on the right interface.
+#
+# [[trunk_rules]]
+# rule.match.to.host = "^172\\.25\\."          # target on internal network
+# rule.rewrite.contact.host = "172.25.225.2"   # advertise internal IP as contact
+#
+# [[trunk_rules]]
+# rule.rewrite.contact.host = "1.2.3.4"        # catch-all: external targets use external_ip
+# ---------------------------------------------------------------------------

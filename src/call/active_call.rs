@@ -2806,6 +2806,11 @@ impl ActiveCall {
         moh: Option<String>,
         auto_hangup: bool,
     ) -> Result<String, rsipstack::Error> {
+        // Apply trunk rules (match + rewrite caller/callee/contact) to the
+        // outgoing INVITE/REFER before it is sent. Covers both normal invite
+        // calls and refer legs since both flow through this function.
+        self.app_state.config.apply_trunk_rules(&mut invite_option);
+
         let ssrc = call_state_ref.read().await.ssrc;
         let per_call_srtp = call_option.sip.as_ref().and_then(|s| s.enable_srtp);
         let rtp_track = self
