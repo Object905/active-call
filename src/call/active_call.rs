@@ -580,6 +580,54 @@ pub struct CallParams {
     #[serde(rename = "ping")]
     pub ping_interval: Option<u32>,
     pub server_side_track: Option<String>,
+    /// Set when this connection is a peer-forward/find attempt coming from
+    /// another active-call node. A node receiving such a request must NOT create
+    /// a new call when the session id is absent locally; it must respond 404 so
+    /// the upstream node can try the next peer.
+    #[serde(default)]
+    pub forward: Option<bool>,
+    /// Comma-separated list of node http addrs already tried while forwarding,
+    /// used to break forwarding loops.
+    #[serde(default)]
+    pub visited: Option<String>,
+}
+
+impl CallParams {
+    /// Build the query string used when forwarding this request to a peer.
+    pub fn to_forward_query(&self, visited: &str) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(id) = &self.id {
+            parts.push(format!("id={}", urlencoding::encode(id)));
+        }
+        if let Some(dump) = self.dump_events {
+            parts.push(format!("dump={}", dump));
+        }
+        if let Some(ping) = self.ping_interval {
+            parts.push(format!("ping={}", ping));
+        }
+        if let Some(track) = &self.server_side_track {
+            parts.push(format!(
+                "server_side_track={}",
+                urlencoding::encode(track)
+            ));
+        }
+        parts.push("forward=true".to_string());
+        parts.push(format!("visited={}", urlencoding::encode(visited)));
+        parts.join("&")
+    }
+
+    /// Comma-separated addresses already visited while forwarding.
+    pub fn visited_list(&self) -> Vec<String> {
+        self.visited
+            .as_deref()
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]

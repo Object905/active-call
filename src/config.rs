@@ -343,6 +343,14 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub http_access_skip_paths: Vec<String>,
 
+    /// Peer active-call nodes ("ip:port" of their HTTP/WS endpoint).
+    ///
+    /// When a websocket client connects with a session id that is not hosted on
+    /// this node, the node polls each peer and tunnels the websocket to the peer
+    /// that hosts the call. See [`Config::peers`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<String>,
+
     #[serde(default = "default_config_useragent")]
     pub useragent: Option<String>,
     pub register_users: Option<Vec<RegisterOption>>,
@@ -465,6 +473,7 @@ impl Default for Config {
             log_level: None,
             log_file: None,
             http_access_skip_paths: Vec::new(),
+            peers: Vec::new(),
             addr: default_sip_addr(),
             udp_port: default_sip_port(),
             auto_learn_public_address: None,
@@ -554,6 +563,30 @@ impl Config {
                 }
             }
         }
+    }
+
+    /// Normalize a configured peer to a `ws://` (or `wss://`) base URL.
+    ///
+    /// Accepts bare `ip:port`, or an explicit `ws://`, `wss://`, `http://` or
+    /// `https://` scheme. Returns `None` when the value is empty or unusable.
+    pub fn peer_ws_endpoint(peer: &str) -> Option<String> {
+        let peer = peer.trim();
+        if peer.is_empty() {
+            return None;
+        }
+        if peer.starts_with("wss://") {
+            return Some(peer.to_string());
+        }
+        if peer.starts_with("ws://") {
+            return Some(peer.to_string());
+        }
+        if peer.starts_with("https://") {
+            return Some(peer.replacen("https://", "wss://", 1));
+        }
+        if peer.starts_with("http://") {
+            return Some(peer.replacen("http://", "ws://", 1));
+        }
+        Some(format!("ws://{}", peer))
     }
 }
 

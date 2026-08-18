@@ -319,12 +319,50 @@ pub async fn call_handler(
     app_state: AppState,
     params: CallParams,
 ) -> Response {
+    let has_explicit_id = params.id.is_some();
     let session_id = params
         .id
+        .clone()
         .unwrap_or_else(|| format!("s.{}", Uuid::new_v4().to_string()));
     let server_side_track = params.server_side_track.clone();
     let dump_events = params.dump_events.unwrap_or(true);
     let ping_interval = params.ping_interval.unwrap_or(20);
+
+    // Cross-node forwarding: when the requested session id is not hosted on
+    // this node, poll every configured peer and tunnel the websocket to the
+    // first peer that accepts it. A forward-marked request (forward=1) that
+    // cannot be satisfied anywhere is rejected instead of creating a brand-new
+    // call, so the upstream node can continue polling its remaining peers.
+    if has_explicit_id {
+        let found_locally = {
+            let active_calls = app_state.active_calls.lock().unwrap();
+            active_calls.contains_key(&session_id)
+        };
+        if !found_locally {
+            if let Some(peer_ws) =
+                crate::handler::peer::try_forward(&app_state, &session_id, &params).await
+            {
+                info!(
+                    session_id,
+                    "forwarding websocket to peer hosting the call"
+                );
+                return ws.on_upgrade(move |socket| async move {
+                    crate::handler::peer::tunnel(socket, peer_ws).await;
+                });
+            }
+            if params.forward.unwrap_or(false) {
+                warn!(
+                    session_id,
+                    "call not found locally or on any peer, rejecting forwarded request"
+                );
+                return (
+                    axum::http::StatusCode::NOT_FOUND,
+                    "call not found on this node or any peer",
+                )
+                    .into_response();
+            }
+        }
+    }
 
     let resp = ws.on_upgrade(move |socket| async move {
         let (mut ws_sender, mut ws_receiver) = socket.split();
