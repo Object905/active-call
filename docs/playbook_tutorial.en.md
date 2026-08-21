@@ -40,6 +40,7 @@ llm:
 ```yaml
 greeting: "Hello, I am your AI assistant. How can I help you today?"
 denoise: true # Enable noise reduction
+agc: {} # Enable WebRTC AGC2 Automatic Gain Control (5 dB headroom, 15 dB initial gain). Requires `vad` to be set.
 interruption:
   strategy: "both" # Strategies: "none", "vad", "asr", "both"
   minSpeechMs: 500 # User must speak for at least 500ms to trigger interruption
@@ -89,6 +90,7 @@ Simple tags that can be output by the model during streaming for real-time execu
 
 -   **Hang up**: `<hangup/>`
 -   **Transfer**: `<refer to="sip:1001@127.0.0.1"/>`
+-   **Send SIP metadata body**: `<message body="customer_id=12345"/>`
 -   **Play audio file**: `<play file="config/media/ding.wav"/>`
 -   **Switch scene**: `<goto scene="support"/>`
 

@@ -13,7 +13,7 @@ use audio_codec::CodecType;
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use rustrtc::{
-    AudioCapability, IceServer, MediaKind, PeerConnection, PeerConnectionEvent,
+    AudioCapability, IceCandidate, IceServer, MediaKind, PeerConnection, PeerConnectionEvent,
     PeerConnectionState, RtcConfiguration, RtpCodecParameters, SdpType, TransportMode,
     config::MediaCapabilities,
     media::{
@@ -22,7 +22,10 @@ use rustrtc::{
     },
 };
 use std::{
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
@@ -66,6 +69,8 @@ pub struct RtcTrack {
     rtc_config: RtcTrackConfig,
     processor_chain: ProcessorChain,
     packet_sender: Arc<Mutex<Option<TrackPacketSender>>>,
+    event_sender: Arc<Mutex<Option<EventSender>>>,
+    media_ready_sent: Arc<AtomicBool>,
     cancel_token: CancellationToken,
     local_source: Option<Arc<SampleStreamSource>>,
     encoder: TrackCodec,
@@ -93,6 +98,8 @@ impl RtcTrack {
             rtc_config,
             processor_chain,
             packet_sender: Arc::new(Mutex::new(None)),
+            event_sender: Arc::new(Mutex::new(None)),
+            media_ready_sent: Arc::new(AtomicBool::new(false)),
             cancel_token,
             local_source: None,
             encoder: TrackCodec::new(),
@@ -172,7 +179,6 @@ impl RtcTrack {
                     CodecType::G722 => AudioCapability::g722(),
                     CodecType::G729 => AudioCapability::g729(),
                     CodecType::TelephoneEvent => AudioCapability::telephone_event(),
-                    #[cfg(feature = "opus")]
                     CodecType::Opus => AudioCapability::opus(),
                 };
                 caps.audio.push(cap);
@@ -211,6 +217,8 @@ impl RtcTrack {
             self.track_id.clone(),
             self.processor_chain.clone(),
             payload_type,
+            self.event_sender.clone(),
+            self.media_ready_sent.clone(),
         );
 
         Ok(())
@@ -222,6 +230,8 @@ impl RtcTrack {
         track_id: TrackId,
         processor_chain: ProcessorChain,
         default_payload_type: u8,
+        event_sender: Arc<Mutex<Option<EventSender>>>,
+        media_ready_sent: Arc<AtomicBool>,
     ) {
         let cancel_token = self.cancel_token.clone();
         let packet_sender = self.packet_sender.clone();
@@ -229,6 +239,10 @@ impl RtcTrack {
         let pc_stats = pc.clone();
         let pc_state = pc.clone();
         let track_id_log = track_id.clone();
+        let is_rtp_media = matches!(
+            self.rtc_config.mode,
+            TransportMode::Rtp | TransportMode::Srtp
+        );
         let is_webrtc = self.rtc_config.mode != TransportMode::Rtp;
 
         crate::spawn(async move {
@@ -267,7 +281,24 @@ impl RtcTrack {
                         if let PeerConnectionEvent::Track(transceiver) = event {
                             if let Some(receiver) = transceiver.receiver() {
                                 let track = receiver.track();
-                                info!(track_id=%track_id_log, "New track received (SSRC latching complete)");
+                                if is_rtp_media {
+                                    let maybe_sender = event_sender.lock().await.clone();
+                                    if let Some(sender) = maybe_sender {
+                                        if media_ready_sent
+                                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                                            .is_ok()
+                                        {
+                                            let result = sender.send(SessionEvent::MediaReady {
+                                                track_id: track_id_log.clone(),
+                                                timestamp: crate::media::get_timestamp(),
+                                            });
+                                            if result.is_err() {
+                                                media_ready_sent.store(false, Ordering::SeqCst);
+                                            }
+                                        }
+                                    }
+                                }
+                                info!(track_id=%track_id_log, "New track received");
 
                                 let (f1, f2) = Self::create_track_workers(
                                     track,
@@ -295,7 +326,7 @@ impl RtcTrack {
                         }
                     }
 
-                    // Handle State Changes (WebRTC Only)
+                    // Handle state changes for transports that expose them.
                     res = async {
                         if let Some(rx) = state_rx.as_mut() {
                             rx.changed().await
@@ -429,9 +460,9 @@ impl RtcTrack {
         let packet_sender = packet_sender.lock().await;
         if let Some(sender) = packet_sender.as_ref() {
             let payload_type = frame.payload_type.unwrap_or(default_payload_type);
-            let src_codec = match CodecType::try_from(payload_type) {
-                Ok(c) => c,
-                Err(_) => {
+            let src_codec = match processor_chain.codec.get_codec_for_pt(payload_type) {
+                Some(c) => c,
+                None => {
                     debug!(track_id=%track_id, "Unknown payload type {}, skipping frame", payload_type);
                     return;
                 }
@@ -480,8 +511,8 @@ impl RtcTrack {
             // Negotiate primary audio codec
             let mut negotiated = None;
 
-            // If we are the offerer (receiving an Answer), we prioritize our own preferred codec order
-            // that is also present in the answer.
+            // When parsing an answer, prefer our configured codec order among accepted codecs.
+            // Offer parsing is provisional; the final outgoing PT is set from the answer.
             if sdp_type == rustrtc::sdp::SdpType::Answer && !self.rtc_config.codecs.is_empty() {
                 for preferred_codec in &self.rtc_config.codecs {
                     if *preferred_codec == CodecType::TelephoneEvent {
@@ -489,12 +520,7 @@ impl RtcTrack {
                     }
                     for fmt in &media.formats {
                         if let Ok(pt) = fmt.parse::<u8>() {
-                            let codec = self
-                                .encoder
-                                .payload_type_map
-                                .get(&pt)
-                                .cloned()
-                                .or_else(|| CodecType::try_from(pt).ok());
+                            let codec = self.encoder.get_codec_for_pt(pt);
                             if let Some(c) = codec {
                                 if c == *preferred_codec {
                                     negotiated = Some((pt, c));
@@ -513,13 +539,7 @@ impl RtcTrack {
             if negotiated.is_none() {
                 for fmt in &media.formats {
                     if let Ok(pt) = fmt.parse::<u8>() {
-                        let codec = self
-                            .encoder
-                            .payload_type_map
-                            .get(&pt)
-                            .cloned()
-                            .or_else(|| CodecType::try_from(pt).ok());
-
+                        let codec = self.encoder.get_codec_for_pt(pt);
                         if let Some(codec) = codec {
                             if codec != CodecType::TelephoneEvent {
                                 negotiated = Some((pt, codec));
@@ -679,6 +699,7 @@ impl Track for RtcTrack {
 
         let mut answer = pc.create_answer().await?;
         crate::media::negotiate::intersect_answer(&sdp, &mut answer);
+        self.parse_sdp_payload_types(rustrtc::SdpType::Answer, &answer.to_sdp_string())?;
 
         pc.set_local_description(answer.clone())?;
 
@@ -707,6 +728,7 @@ impl Track for RtcTrack {
         packet_sender: TrackPacketSender,
     ) -> Result<()> {
         *self.packet_sender.lock().await = Some(packet_sender.clone());
+        *self.event_sender.lock().await = Some(event_sender.clone());
         let token_clone = self.cancel_token.clone();
         let event_sender_clone = event_sender.clone();
         let track_id = self.track_id.clone();
@@ -747,10 +769,7 @@ impl Track for RtcTrack {
                     let (_, encoded) = self.encoder.encode(payload_type, packet.clone());
                     let target_codec = self
                         .encoder
-                        .payload_type_map
-                        .get(&payload_type)
-                        .cloned()
-                        .or_else(|| CodecType::try_from(payload_type).ok())
+                        .get_codec_for_pt(payload_type)
                         .ok_or_else(|| anyhow::anyhow!("Invalid codec type: {}", payload_type))?;
                     if !encoded.is_empty() {
                         let clock_rate = target_codec.clock_rate();
@@ -802,10 +821,7 @@ impl Track for RtcTrack {
                 } => {
                     let target_codec = self
                         .encoder
-                        .payload_type_map
-                        .get(payload_type)
-                        .cloned()
-                        .or_else(|| CodecType::try_from(*payload_type).ok())
+                        .get_codec_for_pt(*payload_type)
                         .ok_or_else(|| anyhow::anyhow!("Invalid codec type: {}", payload_type))?;
                     let clock_rate = target_codec.clock_rate();
 
@@ -853,6 +869,20 @@ impl Track for RtcTrack {
         }
         Ok(())
     }
+
+    fn add_ice_candidate(
+        &self,
+        candidate: &str,
+        // single audio m-line per track, so unused here
+        _sdp_mid: Option<&str>,
+        _sdp_mline_index: Option<u32>,
+    ) -> Result<()> {
+        let pc = self.peer_connection.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("No PeerConnection available for track {}", self.track_id)
+        })?;
+        pc.add_ice_candidate(IceCandidate::from_sdp(candidate)?)?;
+        Ok(())
+    }
 }
 
 impl RtcTrack {
@@ -865,7 +895,6 @@ impl RtcTrack {
             match self.rtc_config.preferred_codec.unwrap_or(CodecType::G722) {
                 CodecType::PCMU => 0,
                 CodecType::PCMA => 8,
-                #[cfg(feature = "opus")]
                 CodecType::Opus => 111,
                 CodecType::G722 => 9,
                 CodecType::G729 => 18,
@@ -920,6 +949,30 @@ mod tests {
             .parse_sdp_payload_types(rustrtc::SdpType::Offer, sdp3)
             .expect("parse offer");
         assert_eq!(track.get_payload_type(), 111);
+
+        // Case 4: Linphone can offer G729 first, but the final answer decides
+        // the outgoing payload type.
+        let mut rtc_config = RtcTrackConfig::default();
+        rtc_config.preferred_codec = Some(CodecType::PCMU);
+        rtc_config.codecs = vec![CodecType::PCMU, CodecType::PCMA];
+        let mut track4 = RtcTrack::new(
+            CancellationToken::new(),
+            "test-track-4".to_string(),
+            TrackConfig::default(),
+            rtc_config,
+        );
+
+        let sdp4 = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 1234 RTP/AVP 18 0 101\r\na=fmtp:18 annexb=yes\r\na=rtpmap:101 telephone-event/8000\r\n";
+        track4
+            .parse_sdp_payload_types(rustrtc::SdpType::Offer, sdp4)
+            .expect("parse offer");
+        assert_eq!(track4.get_payload_type(), 18);
+
+        let answer4 = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 1234 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+        track4
+            .parse_sdp_payload_types(rustrtc::SdpType::Answer, answer4)
+            .expect("parse answer");
+        assert_eq!(track4.get_payload_type(), 0);
     }
 
     #[tokio::test]
@@ -931,6 +984,8 @@ mod tests {
         let track_config = TrackConfig::default();
         let mut rtc_config = RtcTrackConfig::default();
         rtc_config.mode = TransportMode::Rtp;
+        rtc_config.preferred_codec = Some(CodecType::PCMU);
+        rtc_config.codecs = vec![CodecType::PCMU, CodecType::TelephoneEvent];
 
         let mut track = RtcTrack::new(cancel, track_id, track_config, rtc_config);
 
@@ -947,7 +1002,7 @@ a=sendrecv\r\n";
 
         // This should not panic and should set up the transceiver
         let res = track.handshake(offer.to_string(), None).await;
-        assert!(res.is_ok());
+        assert!(res.is_ok(), "handshake failed: {res:?}");
 
         // We can inspect the PeerConnection to ensure it has a transceiver with a receiver
         if let Some(pc) = &track.peer_connection {

@@ -1,18 +1,20 @@
 use crate::media::{AudioFrame, PcmBuf, Sample, Samples, processor::Processor};
 use anyhow::Result;
-use audio_codec::Resampler;
+use audio_codec::BoxedResampler;
 use nnnoiseless::DenoiseState;
 
 pub struct NoiseReducer {
-    resampler_target: Resampler,
-    resampler_source: Resampler,
+    resampler_target: BoxedResampler,
+    resampler_source: BoxedResampler,
     denoiser: Box<DenoiseState<'static>>,
 }
 
 impl NoiseReducer {
     pub fn new(input_sample_rate: usize) -> Self {
-        let resampler48k = Resampler::new(48000, input_sample_rate);
-        let resampler16k = Resampler::new(input_sample_rate, 48000 as usize);
+        let resampler48k =
+            BoxedResampler::new(48000, input_sample_rate).expect("invalid sample rate");
+        let resampler16k =
+            BoxedResampler::new(input_sample_rate, 48000).expect("invalid sample rate");
         let denoiser = DenoiseState::new();
         Self {
             resampler_target: resampler48k,

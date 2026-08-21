@@ -1,4 +1,8 @@
-use active_call::playbook::{LlmConfig, Playbook, PlaybookConfig};
+use active_call::{
+    playbook::{LlmConfig, Playbook, PlaybookConfig},
+    synthesis::SynthesisType,
+    transcription::TranscriptionType,
+};
 use dotenvy::dotenv;
 use reqwest::Client;
 use serde_json::json;
@@ -67,6 +71,65 @@ Hello, I am an AI assistant.
     );
 
     fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn test_ai_agent_1002_playbook_has_aliyun_voice_stack_and_greeting() {
+    let playbook = Playbook::load("config/playbook/ai_agent_1002.md")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        playbook.config.asr.as_ref().and_then(|asr| asr.provider.clone()),
+        Some(TranscriptionType::Aliyun)
+    );
+    assert_eq!(
+        playbook.config.tts.as_ref().and_then(|tts| tts.provider.clone()),
+        Some(SynthesisType::Aliyun)
+    );
+    assert!(playbook.config.llm.is_some(), "ai_agent_1002.md should configure LLM");
+    assert_eq!(
+        playbook.config.greeting.as_deref(),
+        Some("Hello, this is IVR 1002. 你好，这里是 IVR 1002，请问有什么可以帮您？")
+    );
+}
+
+#[tokio::test]
+async fn test_original_style_deepgram_asr_tts_config_loads() {
+    let content = r#"---
+asr:
+  provider: "deepgram"
+  language: "en"
+  model: "nova-3"
+  apiKey: "dg-test-key"
+tts:
+  provider: "deepgram"
+  voice: "aura-2-thalia-en"
+  apiKey: "dg-test-key"
+llm:
+  provider: "openai"
+  model: "qwen-plus"
+  apiKey: "dashscope-test-key"
+  baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+---
+Test prompt
+"#;
+
+    let playbook = Playbook::parse(content).unwrap();
+
+    let asr = playbook.config.asr.as_ref().unwrap();
+    assert_eq!(asr.provider, Some(TranscriptionType::Deepgram));
+    assert_eq!(asr.model_type.as_deref(), Some("nova-3"));
+    assert_eq!(asr.secret_key.as_deref(), Some("dg-test-key"));
+
+    let tts = playbook.config.tts.as_ref().unwrap();
+    assert_eq!(tts.provider, Some(SynthesisType::Deepgram));
+    assert_eq!(tts.model.as_deref(), Some("aura-2-thalia-en"));
+    assert_eq!(tts.secret_key.as_deref(), Some("dg-test-key"));
+
+    let llm = playbook.config.llm.as_ref().unwrap();
+    assert_eq!(llm.model.as_deref(), Some("qwen-plus"));
+    assert_eq!(llm.api_key.as_deref(), Some("dashscope-test-key"));
 }
 
 #[tokio::test]

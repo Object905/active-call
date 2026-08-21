@@ -1,6 +1,6 @@
 [package]
 name = "active-call"
-version = "0.3.54"
+version = "0.3.81"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 description = "A SIP/WebRTC voice agent"
@@ -9,49 +9,48 @@ repository = "https://github.com/miuda-ai/active-call"
 readme = "README.md"
 keywords = ["sip", "voip", "telephony", "voice-agent", "webrtc"]
 categories = ["network-programming", "multimedia"]
+exclude = ["fixtures/**", "examples/**", "src/media/tests/**"]
 
 [features]
-default = ["opus", "offline"]
-opus = ["dep:opusic-sys"]
+default = ["offline"]
+opus = []
 offline = ["dep:knf-rs-sys", "dep:ort", "dep:hf-hub", "dep:ndarray"]
-cross = ["opus", "offline", "aws-lc-rs/bindgen"]
+ringback-detection = ["dep:lele"]
+cross = ["offline", "aws-lc-rs/bindgen"]
 not_vad = []
 
 [dependencies]
 libc = "0.2"
-opusic-sys = { version = "0.6.0", optional = true }
-audio-codec = { version = "0.3.30", features = ["opus"] }
-#rustrtc = { path = "../rustrtc" }
-rustrtc = "0.3.43"
+audio-codec = "0.4.4"
+rustrtc = "0.3.124"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-minijinja = { version = "2.19.0", features = ["loader", "json"] }
+minijinja = { version = "2.23.0", features = ["loader", "json"] }
 anyhow = "1"
-arc-swap = "1.8.2"
-async-trait = "0.1.88"
+arc-swap = "1.9.2"
+async-trait = "0.1.92"
 async-stream = "0.3.6"
-axum = { version = "0.8.7", features = ["ws", "tokio", "multipart"] }
-tower-http = { version = "0.6.2", features = ["fs", "trace"] }
+axum = { version = "0.8.9", features = ["ws", "tokio", "multipart"] }
+tower-http = { version = "0.7.0", features = ["fs", "trace"] }
 bytes = "1"
-futures = "0.3.32"
-rustls = "0.23.37"
+futures = "0.3.33"
+rustls = "0.23.43"
 dotenvy = "0.15.7"
-clap = { version = "4.6.0", features = ["derive"] }
-chrono = { version = "0.4.44", features = ["serde"] }
-tokio = { version = "1.51.0", features = ["full", "tracing"] }
-tokio-stream = { version = "0.1.18", features = ["net", "sync"] }
-tokio-tungstenite = { version = "0.29.0", features = [
+clap = { version = "4.6.6", features = ["derive"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+tokio = { version = "1.53.1", features = ["full", "tracing"] }
+tokio-stream = { version = "0.1.19", features = ["net", "sync"] }
+tokio-tungstenite = { version = "0.30.0", features = [
     "rustls-tls-native-roots",
 ] }
-tokio-util = "0.7.18"
+tokio-util = "0.7.19"
 tracing = "0.1.43"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-tracing-appender = "0.2.4"
-toml = "1.1.2"
-rsipstack = "0.5.3"
-#rsipstack = { path = "../rsipstack" }
-uuid = { version = "1.23.0", features = ["v4"] }
-reqwest = { version = "0.13.2", features = [
+tracing-appender = "0.2.5"
+toml = "1.1.4"
+rsipstack = "0.6.4"
+uuid = { version = "1", features = ["v4"] }
+reqwest = { version = "0.13.4", features = [
     "json",
     "stream",
     "rustls",
@@ -60,29 +59,32 @@ reqwest = { version = "0.13.2", features = [
     "query",
     "gzip",
 ] }
-object_store = { version = "0.13.2", features = ["aws", "azure", "gcp"] }
-serde_with = "3.18.0"
-rand = "0.10.0"
-humantime = "2.1.0"
-lru = "0.16.3"
+object_store = { version = "0.14.1", features = ["aws", "azure", "gcp"] }
+serde_with = "3.22.0"
+rand = "0.10"
+humantime = "2"
+lru = "0.18.2"
 md5 = { package = "md-5", version = "0.11.0" }
 sha2 = "0.11.0"
 serde_yaml = "0.9.33"
-regex = "1.12.3"
+regex = "1"
 once_cell = "1.21.4"
 hex = "0.4.3"
 nnnoiseless = "0.5.2"
 hound = "3.5.1"
 get_if_addrs = "0.5.3"
-http = "1.4.0"
+http = "1.5.0"
 urlencoding = "2.1.3"
-base64 = "0.22.1"
+base64 = "0.23.1"
 url = "2.5.8"
 unic-emoji = "0.9.0"
-socket2 = { version = "0.6.3", features = ["all"] }
+socket2 = { version = "0.6.5", features = ["all"] }
 realfft = "3.3"
 tempfile = "3.27.0"
 aws-lc-rs = "1"
+
+# Ringback detection model
+lele = { version = "0.1.12", default-features = false, optional = true }
 
 # Math / arrays (keep in sync with ort 2.0.0-rc.10 -> ndarray 0.16)
 ndarray = { version = "0.16.1", optional = true }
@@ -103,16 +105,18 @@ ort = { version = "=2.0.0-rc.11", default-features = false, features = [
 knf-rs-sys = { version = "0.3.2", optional = true }
 
 # Audio processing
-symphonia = { version = "0.5", features = ["all"] }
+symphonia = { version = "0.6.0", features = ["all"] }
+ogg = "0.9"
 unicode-normalization = "0.1"
 rand_distr = "0.6.0"
 num_cpus = "1.16"
+sonora-agc2 = "0.2.0"
 
 [dev-dependencies]
 tempfile = "3.23.0"
-warp = { version = "0.4.1", features = ["server", "websocket"] }
+warp = { version = "0.4.3", features = ["server", "websocket"] }
 tokio-test = "0.4.5"
-mockall = "0.14.0"
+mockall = "0.15.0"
 portpicker = "0.1.1"
 dotenvy = "0.15.7"
 wiremock = "0.6"

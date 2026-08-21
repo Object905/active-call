@@ -25,6 +25,9 @@ pub struct MediaStream {
     pub cancel_token: CancellationToken,
     recorder_option: Mutex<Option<RecorderOption>>,
     tracks: Mutex<HashMap<TrackId, (Box<dyn Track>, DtmfDetector)>>,
+    /// Trickle ICE candidates that arrived before any track existed to feed
+    /// them to. Drained into the next track started.
+    pending_ice_candidates: Mutex<Vec<(String, Option<String>, Option<u32>)>>,
     suppressed_sources: Mutex<HashSet<TrackId>>,
     event_sender: EventSender,
     pub packet_sender: TrackPacketSender,
@@ -36,6 +39,7 @@ pub struct MediaStream {
 
 const CALLEE_TRACK_ID: &str = "callee-track";
 const QUEUE_HOLD_TRACK_ID: &str = "queue-hold-track";
+pub const SERVER_SIDE_TRACK_ID: &str = "server-side-track";
 
 pub struct MediaStreamBuilder {
     cancel_token: Option<CancellationToken>,
@@ -80,6 +84,7 @@ impl MediaStreamBuilder {
             cancel_token,
             recorder_option: Mutex::new(self.recorder_config),
             tracks,
+            pending_ice_candidates: Mutex::new(Vec::new()),
             suppressed_sources: Mutex::new(HashSet::new()),
             event_sender: self.event_sender,
             packet_sender: track_packet_sender,
@@ -222,7 +227,7 @@ impl MediaStream {
     pub async fn update_track(&self, mut track: Box<dyn Track>, play_id: Option<String>) {
         self.remove_track(track.id(), false).await;
         if self.recorder_option.lock().await.is_some() {
-            track.insert_processor(Box::new(RecorderProcessor::new(
+            track.append_processor(Box::new(RecorderProcessor::new(
                 self.recorder_sender.clone(),
             )));
         }
@@ -233,6 +238,21 @@ impl MediaStream {
             Ok(_) => {
                 info!(session_id = self.id, track_id = track.id(), "track started");
                 let track_id = track.id().clone();
+                if track_id.as_str() == self.id.as_str() {
+                    let pending = std::mem::take(&mut *self.pending_ice_candidates.lock().await);
+                    for (candidate, sdp_mid, sdp_mline_index) in pending {
+                        if let Err(e) =
+                            track.add_ice_candidate(&candidate, sdp_mid.as_deref(), sdp_mline_index)
+                        {
+                            warn!(
+                                session_id = self.id,
+                                track_id = track.id(),
+                                "failed to apply buffered ICE candidate: {}",
+                                e
+                            );
+                        }
+                    }
+                }
                 self.tracks
                     .lock()
                     .await
@@ -278,6 +298,61 @@ impl MediaStream {
             for (track, _) in self.tracks.lock().await.values_mut() {
                 MuteProcessor::unmute_track(track.as_mut());
             }
+        }
+    }
+
+    /// Trickle ICE: feed a remote candidate into the ICE-backed (WebRTC)
+    /// track, if it's up yet, or buffer it for `update_track` to replay
+    /// otherwise.
+    pub async fn add_ice_candidate(
+        &self,
+        candidate: &str,
+        sdp_mid: Option<&str>,
+        sdp_mline_index: Option<u32>,
+    ) -> Result<()> {
+        let tracks = self.tracks.lock().await;
+        if let Some((track, _)) = tracks.get(self.id.as_str()) {
+            track.add_ice_candidate(candidate, sdp_mid, sdp_mline_index)?;
+            return Ok(());
+        }
+        drop(tracks);
+        self.pending_ice_candidates.lock().await.push((
+            candidate.to_string(),
+            sdp_mid.map(|s| s.to_string()),
+            sdp_mline_index,
+        ));
+        Ok(())
+    }
+
+    pub async fn pause_playback(&self, id: TrackId) -> Result<()> {
+        self.set_playback_paused(id, true).await
+    }
+
+    pub async fn resume_playback(&self, id: TrackId) -> Result<()> {
+        self.set_playback_paused(id, false).await
+    }
+
+    async fn set_playback_paused(&self, id: TrackId, paused: bool) -> Result<()> {
+        if let Some((track, _)) = self.tracks.lock().await.get_mut(&id) {
+            if track.set_paused(paused) {
+                Ok(())
+            } else {
+                warn!(
+                    session_id = self.id,
+                    track_id = %id,
+                    paused,
+                    "pause state requested for track that does not support pausing"
+                );
+                Err(anyhow::anyhow!("track does not support pausing: {}", id))
+            }
+        } else {
+            warn!(
+                session_id = self.id,
+                track_id = %id,
+                paused,
+                "pause state requested for unknown track"
+            );
+            Err(anyhow::anyhow!("track not found: {}", id))
         }
     }
 
@@ -403,8 +478,27 @@ impl MediaStream {
                 }
             });
             *self.recorder_handle.lock().await = Some(recorder_handle);
+
+            // Inject RecorderProcessor into tracks that were added before the recorder started
+            for (track, _) in self.tracks.lock().await.values_mut() {
+                track.insert_processor(Box::new(RecorderProcessor::new(
+                    self.recorder_sender.clone(),
+                )));
+            }
         }
         Ok(())
+    }
+
+    pub async fn set_track_refer(&self, track_id: &TrackId, refer: Option<bool>) {
+        if let Some((_, dtmf)) = self.tracks.lock().await.get_mut(track_id) {
+            dtmf.refer = refer;
+        }
+    }
+
+    pub async fn set_track_dtmf_forward(&self, track_id: &TrackId, forward: bool) {
+        if let Some((_, dtmf)) = self.tracks.lock().await.get_mut(track_id) {
+            dtmf.suppress_dtmf_forward = !forward;
+        }
     }
 
     async fn handle_forward_track(&self, mut packet_receiver: TrackPacketReceiver) {
@@ -416,31 +510,46 @@ impl MediaStream {
                     .await
                     .contains(&packet.track_id)
             };
-            // Process the packet with each track
-            for (track, dtmf_detector) in self.tracks.lock().await.values_mut() {
+
+            let is_dtmf = matches!(&packet.samples,
+                Samples::RTP { payload_type, .. } if *payload_type >= 96 && *payload_type <= 127);
+
+            let mut tracks = self.tracks.lock().await;
+
+            // Check once whether the source track suppresses DTMF forwarding.
+            let source_suppresses_dtmf = is_dtmf
+                && tracks
+                    .get(&packet.track_id)
+                    .map(|(_, d)| d.suppress_dtmf_forward)
+                    .unwrap_or(false);
+
+            for (track, dtmf_detector) in tracks.values_mut() {
                 if track.id() == &packet.track_id {
-                    match &packet.samples {
-                        Samples::RTP {
-                            payload_type,
-                            payload,
-                            ..
-                        } => {
-                            if let Some(digit) = dtmf_detector.detect_rtp(*payload_type, payload) {
-                                debug!(track_id = track.id(), digit, "DTMF detected");
-                                event_sender
-                                    .send(SessionEvent::Dtmf {
-                                        track_id: packet.track_id.to_string(),
-                                        timestamp: packet.timestamp,
-                                        digit,
-                                    })
-                                    .ok();
-                            }
+                    if let Samples::RTP {
+                        payload_type,
+                        payload,
+                        ..
+                    } = &packet.samples
+                    {
+                        if let Some(digit) = dtmf_detector.detect_rtp(*payload_type, payload) {
+                            debug!(track_id = track.id(), digit, "DTMF detected");
+                            event_sender
+                                .send(SessionEvent::Dtmf {
+                                    track_id: packet.track_id.to_string(),
+                                    timestamp: packet.timestamp,
+                                    digit,
+                                    refer: dtmf_detector.refer,
+                                })
+                                .ok();
                         }
-                        _ => {}
                     }
                     continue;
                 }
                 if suppressed {
+                    continue;
+                }
+                // Skip DTMF forwarding if source or destination has it suppressed.
+                if source_suppresses_dtmf || (is_dtmf && dtmf_detector.suppress_dtmf_forward) {
                     continue;
                 }
                 if packet.track_id == QUEUE_HOLD_TRACK_ID && track.id() == CALLEE_TRACK_ID {

@@ -64,6 +64,7 @@ pub enum Command {
         play_id: Option<String>,
         auto_hangup: Option<bool>,
         wait_input_timeout: Option<u32>,
+        offset_ms: Option<u32>,
     },
     Interrupt {
         graceful: Option<bool>,
@@ -75,12 +76,36 @@ pub enum Command {
         reason: Option<String>,
         initiator: Option<String>,
         headers: Option<HashMap<String, String>>,
+        refer: Option<bool>,
     },
     Refer {
         caller: String,
         /// aor of the calee, e.g., sip:bob@restsend.com
         callee: String,
         options: Option<ReferOption>,
+    },
+    Message {
+        /// MIME body to send in a SIP MESSAGE request.
+        body: String,
+        /// Defaults to text/plain;charset=utf-8.
+        content_type: Option<String>,
+        /// Additional SIP headers for the MESSAGE request.
+        headers: Option<HashMap<String, String>>,
+        /// If true, send on the active refer dialog instead of the main call dialog.
+        refer: Option<bool>,
+    },
+    /// Bridge audio with another established call.
+    /// This creates separate bridge tracks for the two sessions and patches
+    /// audio bidirectionally. It does not replace the server-side track and
+    /// does not control hangup; each call keeps its own session/event flow.
+    Bridge {
+        /// session_id of the other call to bridge audio with
+        target_session_id: String,
+    },
+    /// Remove audio bridge tracks with another established call.
+    Unbridge {
+        /// session_id of the other call to unbridge from
+        target_session_id: String,
     },
     Mute {
         track_id: Option<String>,
@@ -95,6 +120,12 @@ pub enum Command {
     Custom {
         sender: Option<String>,
         data: serde_json::Value,
+    },
+    /// Trickle ICE: feed a remote candidate into an already-established session.
+    AddIceCandidate {
+        candidate: String,
+        sdp_mid: Option<String>,
+        sdp_mline_index: Option<u32>,
     },
 }
 
@@ -131,5 +162,57 @@ impl RoutingState {
         let r = *counter % trunk_count;
         *counter += 1;
         return r;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Command;
+
+    #[test]
+    fn message_command_deserializes_body() {
+        let command: Command = serde_json::from_value(serde_json::json!({
+            "command": "message",
+            "body": "customer_id=12345",
+            "contentType": "text/plain"
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            command,
+            Command::Message {
+                body,
+                content_type: Some(content_type),
+                ..
+            } if body == "customer_id=12345" && content_type == "text/plain"
+        ));
+    }
+
+    #[test]
+    fn message_command_deserializes_legacy_text() {
+        let command: Command = serde_json::from_value(serde_json::json!({
+            "command": "message",
+            "body": "customer_id=12345"
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            command,
+            Command::Message { body, .. } if body == "customer_id=12345"
+        ));
+    }
+
+    #[test]
+    fn message_command_serializes_body() {
+        let command = Command::Message {
+            body: "customer_id=12345".to_string(),
+            content_type: None,
+            headers: None,
+            refer: None,
+        };
+        let value = serde_json::to_value(command).unwrap();
+
+        assert_eq!(value["body"], "customer_id=12345");
+        assert!(value.get("text").is_none());
     }
 }

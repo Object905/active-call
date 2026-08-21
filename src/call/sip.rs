@@ -277,17 +277,49 @@ impl DialogStateReceiverGuard {
                     if body_str.starts_with("Signal=") {
                         let digit = body_str.trim_start_matches("Signal=").chars().next();
                         if let Some(digit) = digit {
+                            let is_refer = states.call_state.read().await.is_refer;
                             states.event_sender.send(crate::event::SessionEvent::Dtmf {
                                 track_id: states.track_id.clone(),
                                 timestamp: crate::media::get_timestamp(),
                                 digit: digit.to_string(),
+                                refer: Some(is_refer),
                             })?;
                         }
                     }
                     tx_handle.reply(rsipstack::rsip::StatusCode::OK).await.ok();
                 }
+                DialogState::Message(dialog_id, req, tx_handle) => {
+                    let body_str = String::from_utf8_lossy(req.body()).to_string();
+                    let content_type = req.headers.iter().find_map(|h| {
+                        if let rsipstack::rsip::Header::ContentType(content_type) = h {
+                            Some(content_type.value().to_string())
+                        } else {
+                            None
+                        }
+                    });
+                    info!(
+                        session_id=states.session_id,
+                        %dialog_id,
+                        content_type=content_type.as_deref(),
+                        body=%body_str,
+                        "dialog message received"
+                    );
+                    let is_refer = states.call_state.read().await.is_refer;
+                    states
+                        .event_sender
+                        .send(crate::event::SessionEvent::Message {
+                            track_id: states.track_id.clone(),
+                            timestamp: crate::media::get_timestamp(),
+                            body: body_str,
+                            content_type,
+                            refer: Some(is_refer),
+                        })
+                        .ok();
+                    tx_handle.reply(rsipstack::rsip::StatusCode::OK).await.ok();
+                }
                 DialogState::Updated(dialog_id, _req, tx_handle) => {
                     info!(session_id = states.session_id, %dialog_id, "dialog update received");
+                    let is_refer = states.call_state.read().await.is_refer;
                     let mut answer_sdp = None;
                     if let Some(sdp_body) = _req.body().get(..) {
                         let sdp_str = String::from_utf8_lossy(sdp_body);
@@ -322,6 +354,7 @@ impl DialogStateReceiverGuard {
                                     track_id: states.track_id.clone(),
                                     timestamp: crate::media::get_timestamp(),
                                     on_hold: is_on_hold,
+                                    refer: Some(is_refer),
                                 })
                                 .ok();
 
@@ -355,6 +388,7 @@ impl DialogStateReceiverGuard {
                                         track_id: states.track_id.clone(),
                                         timestamp: crate::media::get_timestamp(),
                                         on_hold: true,
+                                        refer: Some(is_refer),
                                     })
                                     .ok();
                             } else {
@@ -368,6 +402,7 @@ impl DialogStateReceiverGuard {
                                         track_id: states.track_id.clone(),
                                         timestamp: crate::media::get_timestamp(),
                                         on_hold: false,
+                                        refer: Some(is_refer),
                                     })
                                     .ok();
                             }
@@ -397,6 +432,30 @@ impl DialogStateReceiverGuard {
                 DialogState::Options(dialog_id, _req, tx_handle) => {
                     info!(session_id = states.session_id, %dialog_id, "dialog options received");
                     tx_handle.reply(rsipstack::rsip::StatusCode::OK).await.ok();
+                }
+                DialogState::Refer(dialog_id, req, tx_handle) => {
+                    let refer_to = req.headers.iter().find_map(|h| {
+                        if let rsipstack::rsip::Header::ReferTo(h) = h {
+                            return Some(h.value().to_string());
+                        }
+                        None
+                    }).unwrap_or_default();
+                    let referred_by = req.headers.iter().find_map(|h| {
+                        if let rsipstack::rsip::Header::ReferredBy(h) = h {
+                            return Some(h.value().to_string());
+                        }
+                        None
+                    });
+                    info!(session_id = states.session_id, %dialog_id, %refer_to, "received REFER");
+                    tx_handle.reply(rsipstack::rsip::StatusCode::Other(202, "Accepted".into())).await.ok();
+                    let is_refer = states.call_state.read().await.is_refer;
+                    states.event_sender.send(crate::event::SessionEvent::TransferRequest {
+                        track_id: states.track_id.clone(),
+                        timestamp: crate::media::get_timestamp(),
+                        refer_to,
+                        referred_by,
+                        refer: Some(is_refer),
+                    }).ok();
                 }
                 DialogState::Terminated(dialog_id, reason) => {
                     info!(
@@ -509,7 +568,6 @@ impl Invitation {
     ) -> Result<()> {
         if let Some(call) = self.get_pending_call(&dialog_id) {
             call.dialog.reject(code, reason).ok();
-            call.token.cancel();
         }
         match self.dialog_layer.get_dialog(&dialog_id) {
             Some(dialog) => {
@@ -524,7 +582,6 @@ impl Invitation {
     pub async fn reject(&self, dialog_id: DialogId) -> Result<()> {
         if let Some(call) = self.get_pending_call(&dialog_id) {
             call.dialog.reject(None, None).ok();
-            call.token.cancel();
         }
         match self.dialog_layer.get_dialog(&dialog_id) {
             Some(dialog) => {

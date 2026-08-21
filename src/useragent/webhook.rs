@@ -3,8 +3,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
 use reqwest::Client;
+use rsipstack::dialog::invite_dialog::InviteDialog;
 use rsipstack::rsip::prelude::{HasHeaders, HeadersExt};
-use rsipstack::dialog::server_dialog::ServerInviteDialog;
 use serde_json::json;
 use std::{sync::Arc, time::Instant};
 use tokio_util::sync::CancellationToken;
@@ -36,7 +36,7 @@ impl InvitationHandler for WebhookInvitationHandler {
         &self,
         dialog_id: String,
         _cancel_token: CancellationToken,
-        dialog: ServerInviteDialog,
+        dialog: InviteDialog,
         routing_state: Arc<RoutingState>,
     ) -> Result<()> {
         let client = Client::new();

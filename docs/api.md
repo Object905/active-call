@@ -241,6 +241,7 @@ The `mediaPass` option in `CallOption` configures the WebSocket connection for a
     "callee": "sip:agent@rustpbx.com",
     "codec": "pcmu",
     "denoise": true,
+    "agc": {},
     "mediaPass": {
       "url": "ws://ai-voice-processor.rustpbx.com:8090/stream",
       "inputSampleRate": 8000,
@@ -414,6 +415,7 @@ Commands are sent as JSON messages through the WebSocket connection. All timesta
 - `waitInputTimeout` (number, optional): Maximum time to wait for user input in seconds
 - `option` (SynthesisOption, optional): TTS provider specific options
 - `base64` (bool, optional): If true, text is base64 encoded PCM samples of sample rate 16000 hz, **DO NOT use this feature in Streaming TTS**
+- `cacheKey` (string, optional): Custom cache key for TTS audio. If set and the key exists in cache, returns cached audio instead of re-synthesizing.
 ```json
 {
   "command": "tts",
@@ -467,7 +469,9 @@ Commands are sent as JSON messages through the WebSocket connection. All timesta
 ```
 
 #### Pause Command
-**Purpose:** Pauses current playback.
+**Purpose:** Pauses current server-side file/TTS playback without ending the track.
+
+Pause targets the current server-side playback track. It freezes playback progress; it does not emit `trackEnd` while paused.
 
 ```json
 {
@@ -477,6 +481,8 @@ Commands are sent as JSON messages through the WebSocket connection. All timesta
 
 #### Resume Command
 **Purpose:** Resumes paused playback.
+
+Resume continues paused server-side file/TTS playback from the paused playback position.
 
 ```json
 {
@@ -495,6 +501,7 @@ Commands are sent as JSON messages through the WebSocket connection. All timesta
 - `callee` (string): Address of Record (AOR) of the transfer target (e.g., sip:bob@rustpbx.com)
 - `options` (ReferOption, optional): Transfer configuration
   - `denoise` (boolean, optional): Enable noise reduction
+  - `agc` (AGCOption, optional): Enable Automatic Gain Control (AGC); use `{}` for defaults
   - `timeout` (number, optional): Transfer timeout in seconds
   - `moh` (string, optional): Music on hold URL to play during transfer
   - `asr` (TranscriptionOption, optional): Automatic Speech Recognition configuration
@@ -517,6 +524,7 @@ Commands are sent as JSON messages through the WebSocket connection. All timesta
   "callee": "sip:charlie@rustpbx.com",
   "options": {
     "denoise": true,
+    "agc": {},
     "timeout": 30,
     "moh": "http://rustpbx.com/hold_music.wav",
     "asr": {
@@ -544,6 +552,67 @@ Commands are sent as JSON messages through the WebSocket connection. All timesta
       }
     }
   }
+}
+```
+
+#### Message Command
+**Purpose:** Sends an in-dialog SIP MESSAGE with a MIME body. This is useful for metadata that needs to reach the operator side during an active SIP call; some SIP proxies can forward these messages as SMS.
+
+**Fields:**
+- `command` (string): Always "message"
+- `body` (string): SIP MESSAGE body to send. `text` is accepted as a deprecated alias.
+- `contentType` (string, optional): SIP message content type. Default: `text/plain;charset=utf-8`
+- `headers` (object, optional): Additional SIP headers
+- `refer` (boolean, optional): If true, send on the active refer dialog instead of the main call dialog
+
+```json
+{
+  "command": "message",
+  "body": "customer_id=12345 status=verified",
+  "contentType": "text/plain;charset=utf-8",
+  "headers": {
+    "X-Meta-Source": "active-call"
+  }
+}
+```
+
+### Audio Bridge Commands
+
+#### Bridge Command
+**Purpose:** Connects audio between this active call session and another active call session.
+
+The bridge is a media-only operation. It creates separate internal bridge tracks for the two sessions and forwards audio packets between them. It does not replace the normal server-side track used by TTS/play/refer, and it does not send SIP signaling or hang up either call. Call lifecycle remains controlled by each call's own WebSocket client, SIP peer, or explicit `hangup` command.
+
+**Fields:**
+- `command` (string): Always "bridge"
+- `targetSessionId` (string): Session ID of the other active call
+
+```json
+{
+  "command": "bridge",
+  "targetSessionId": "session-b"
+}
+```
+
+**Notes:**
+- Send the command on either session's WebSocket after both sessions are established.
+- The target session must still be active and must not be the same session.
+- Re-sending `bridge` for the same pair replaces the existing bridge tracks for that pair.
+- If either call ends, its bridge track stops and the peer bridge task exits; the other call remains active until its own client or SIP peer ends it.
+
+#### Unbridge Command
+**Purpose:** Removes the audio bridge between this active call session and another active call session.
+
+`unbridge` removes the internal bridge tracks from both sessions when both sessions are active. If the target session has already ended, it removes the local bridge track only. It is safe to send after one side has already hung up.
+
+**Fields:**
+- `command` (string): Always "unbridge"
+- `targetSessionId` (string): Session ID of the other call
+
+```json
+{
+  "command": "unbridge",
+  "targetSessionId": "session-b"
 }
 ```
 
@@ -587,6 +656,7 @@ Commands are sent as JSON messages through the WebSocket connection. All timesta
 - `reason` (string, optional): Reason for hanging up
 - `initiator` (string, optional): Who initiated the hangup (user, system, etc.)
 - `headers` (object, optional): Additional SIP headers to include in the BYE request (SIP calls only)
+- `refer` (boolean, optional): If true, hangs up only the referred call instead of the main call
 
 ```json
 {
@@ -615,6 +685,33 @@ Commands are sent as JSON messages through the WebSocket connection. All timesta
 }
 ```
 
+### ICE Commands
+
+#### Add Ice Candidate Command
+**Purpose:** Trickle ICE - feeds a remote ICE candidate into an already-established WebRTC session, instead of waiting for the caller to gather all candidates before sending the offer.
+
+Client -> server only. The server always answers with a fully-gathered candidate set (server-side gathering is fast), so there's no matching server -> client event; this command exists purely so a WebRTC caller can send its offer immediately and stream candidates in as they're found.
+
+**Fields:**
+- `command` (string): Always "addIceCandidate"
+- `candidate` (string): ICE candidate string (as produced by `RTCIceCandidate.candidate` in the browser)
+- `sdpMid` (string, optional): Media stream identification
+- `sdpMLineIndex` (number, optional): Index of the media description this candidate is associated with
+
+```json
+{
+  "command": "addIceCandidate",
+  "candidate": "candidate:842163049 1 udp 1677729535 10.0.0.1 54321 typ host",
+  "sdpMid": "0",
+  "sdpMLineIndex": 0
+}
+```
+
+**Notes:**
+- Only meaningful once the initial offer/answer has already been exchanged (i.e. after `invite`/`accept`).
+- Applies to whichever track on the session is WebRTC-backed; a no-op on other track types.
+- A candidate sent before the PeerConnection exists is rejected with an error.
+
 ### CallOption Object Structure
 
 The `CallOption` object is used in `invite` and `accept` commands and contains the following fields:
@@ -622,6 +719,7 @@ The `CallOption` object is used in `invite` and `accept` commands and contains t
 ```json
 {
   "denoise": true,
+  "agc": {},
   "offer": "SDP offer string",
   "callee": "sip:callee@rustpbx.com",
   "caller": "sip:caller@rustpbx.com",
@@ -684,7 +782,17 @@ The `CallOption` object is used in `invite` and `accept` commands and contains t
   },
   "handshakeTimeout": 30,
   "enableIpv6": false,
+  "enableIceLite": false,
   "inactivityTimeout": 50,
+  "ambiance": {
+    "path": "./config/office.wav",
+    "duckLevel": 0.1,
+    "normalLevel": 0.3
+  },
+  "ringbackDetection": {
+    "enabled": true,
+    "confidenceThreshold": 0.8
+  },
   "sip": {
     "username": "user",
     "password": "password",
@@ -709,6 +817,7 @@ The `CallOption` object is used in `invite` and `accept` commands and contains t
 
 **CallOption Fields:**
 - `denoise` (boolean, optional): Enable noise reduction for audio processing
+- `agc` (AGCOption, optional): Enable Automatic Gain Control (AGC); use `{}` for defaults or specify fields
 - `offer` (string, optional): SDP offer string for WebRTC/SIP negotiation
 - `callee` (string, optional): Callee's SIP URI or phone number (e.g., "sip:bob@rustpbx.com")
 - `caller` (string, optional): Caller's SIP URI or phone number (e.g., "sip:alice@rustpbx.com")
@@ -717,7 +826,7 @@ The `CallOption` object is used in `invite` and `accept` commands and contains t
   - `samplerate` (number): Recording sample rate in Hz (default: 16000)
   - `ptime` (number): Packet time in milliseconds (default: 200)
 - `asr` (TranscriptionOption, optional): Automatic Speech Recognition configuration
-  - `provider` (string): ASR provider ("tencent", "aliyun", "voiceapi")
+  - `provider` (string): ASR provider ("tencent", "aliyun", "deepgram", "sensevoice")
   - `language` (string, optional): Language code (e.g., "zh-CN", "en-US")
   - `appId` (string, optional): Application ID for the ASR service
   - `secretId` (string, optional): Secret ID for authentication
@@ -728,6 +837,14 @@ The `CallOption` object is used in `invite` and `accept` commands and contains t
   - `endpoint` (string, optional): Custom ASR service endpoint URL
   - `extra` (object, optional): Additional provider-specific parameters
   - `startWhenAnswer` (boolean, optional): Start ASR when call is answered
+- `agc` (AGCOption, optional): Automatic Gain Control configuration (WebRTC AGC2); use `{}` for defaults. Requires `vad` to be configured upstream — AGC reads the per-frame speech probability written by the VAD.
+  - `headroomDb` (number, optional): Target headroom below 0 dBFS in dB (default: 5.0)
+  - `maxGainDb` (number, optional): Maximum gain in dB (default: 50.0)
+  - `initialGainDb` (number, optional): Initial gain in dB applied before the speech-level estimator is confident (default: 15.0)
+  - `maxGainChangeDbPerSecond` (number, optional): Maximum gain change in dB per second — controls both attack and release (default: 6.0)
+  - `maxOutputNoiseLevelDbfs` (number, optional): Noise floor cap in dBFS above which AGC will not amplify (default: -50.0)
+  - `adjacentSpeechFramesThreshold` (number, optional): Number of consecutive 10 ms speech sub-frames required before gain increase is allowed (default: 12, ≈120 ms)
+  - `enableLimiter` (boolean, optional): Run the soft-knee limiter after the adaptive gain stage (default: true)
 - `vad` (VADOption, optional): Voice Activity Detection configuration
   - `type` (string): VAD algorithm type ("silero")
   - `samplerate` (number): Audio sample rate for VAD processing (default: 16000)
@@ -742,7 +859,7 @@ The `CallOption` object is used in `invite` and `accept` commands and contains t
   - `secretId` (string, optional): Secret ID for VAD service authentication
 - `tts` (SynthesisOption, optional): Text-to-Speech configuration
   - `samplerate` (number, optional): TTS output sample rate in Hz
-  - `provider` (string, optional): TTS provider ("tencent", "aliyun", "deepgram", "supertonic"). Default: "aliyun" for Chinese (zh), "supertonic" for English (en).
+  - `provider` (string, optional): TTS provider ("tencent", "tencent_basic", "aliyun", "deepgram", "supertonic", "voiceapi"). Default: "aliyun" for Chinese (zh), "supertonic" for English (en).
   - `speed` (number, optional): Speech speed multiplier (default: 1.0)
   - `appId` (string, optional): Application ID for TTS service
   - `secretId` (string, optional): Secret ID for authentication
@@ -763,7 +880,23 @@ The `CallOption` object is used in `invite` and `accept` commands and contains t
 - `subscribe` (boolean, optional): Enable real-time audio subscription for non-WebSocket calls (SIP/WebRTC). If true, audio will be pushed via the control WebSocket using binary frames with a 1-byte track header (0x00 for caller, 0x01 for callee).
 - `handshakeTimeout` (number, optional): Timeout for connection handshake in seconds (e.g., 30)
 - `enableIpv6` (boolean, optional): Enable IPv6 support for networking
+- `enableIceLite` (boolean, optional): Enable ICE lite mode for WebRTC media
 - `inactivityTimeout` (number, optional): Timeout for audio inactivity in seconds
+- `ambiance` (AmbianceOption, optional): Background audio mixing configuration
+  - `path` (string): Path to background audio file
+  - `duckLevel` (number, optional): Volume reduction when AI speaks (default: 0.1)
+  - `normalLevel` (number, optional): Default background volume (default: 0.3)
+  - `transitionSpeed` (number, optional): Speed of volume transition (default: 0.01)
+- `ringbackDetection` (RingbackDetectionOption, optional): Ringback tone detection configuration
+  - `enabled` (boolean): Enable ringback detection
+  - `modelWeightsPath` (string, optional): Path to classifier weights (default: "./telcoclassifier_weights.bin")
+  - `confidenceThreshold` (number, optional): Detection confidence threshold (default: 0.5)
+- `realtime` (RealtimeOption, optional): Realtime API configuration for full-duplex streaming
+  - `provider` (string): Realtime provider ("openai", "azure")
+  - `model` (string, optional): Model name
+  - `apiKey` (string, optional): API key for the realtime provider
+  - `turnDetection` (object, optional): Turn detection configuration (passed through to provider)
+  - `tools` (array, optional): Function tools for the realtime session
 - `sip` (SipOption, optional): SIP protocol configuration
   - `username` (string): SIP username for authentication
   - `password` (string): SIP password for authentication
@@ -816,6 +949,7 @@ The `ReferOption` object is used in the `refer` command and contains the followi
 
 **Fields:**
 - `denoise` (boolean, optional): Enable noise reduction during transfer
+- `agc` (AGCOption, optional): Enable Automatic Gain Control (AGC); use `{}` for defaults or specify fields
 - `timeout` (number, optional): Transfer timeout in seconds
 - `moh` (string, optional): Music on hold URL to play during transfer
 - `asr` (TranscriptionOption, optional): Automatic Speech Recognition configuration
@@ -888,6 +1022,22 @@ Events are received as JSON messages from the server. All timestamps are in mill
 }
 ```
 
+#### MediaReady Event
+**Triggered when:** Media layer is ready for audio processing (after SDP negotiation completes).
+
+**Fields:**
+- `event` (string): Always "mediaReady"
+- `trackId` (string): **Unique identifier for the audio track.**
+- `timestamp` (number): Event timestamp in milliseconds since Unix epoch
+
+```json
+{
+  "event": "mediaReady",
+  "trackId": "track-abc123",
+  "timestamp": 1640995200000
+}
+```
+
 #### Ringing Event
 **Triggered when:** Call is ringing (SIP calls only).
 
@@ -946,6 +1096,36 @@ Events are received as JSON messages from the server. All timestamps are in mill
     "call_quality": "good",
     "network_type": "wifi"
   }
+}
+```
+
+### Media Processing Events
+
+#### RingbackState Event
+**Triggered when:** Ringback detection state changes.
+
+**Fields:**
+- `event` (string): Always "ringbackState"
+- `trackId` (string): **Unique identifier for the audio track.**
+- `timestamp` (number): Event timestamp in milliseconds since Unix epoch
+- `state` (string): Current ringback state
+- `stateIndex` (number): State sequence index
+- `confidence` (number): Detection confidence (0.0–1.0)
+- `prevState` (string, optional): Previous ringback state
+- `prevConfidence` (number, optional): Previous detection confidence
+- `isFinal` (boolean): Whether this is the final detection result
+
+```json
+{
+  "event": "ringbackState",
+  "trackId": "track-abc123",
+  "timestamp": 1640995200000,
+  "state": "ringing",
+  "stateIndex": 3,
+  "confidence": 0.92,
+  "prevState": "unknown",
+  "prevConfidence": 0.5,
+  "isFinal": false
 }
 ```
 
@@ -1182,6 +1362,48 @@ Events are received as JSON messages from the server. All timestamps are in mill
 }
 ```
 
+### Call Transfer Events
+
+#### TransferRequest Event
+**Triggered when:** An in-dialog SIP REFER (transfer) request is received.
+
+**Fields:**
+- `event` (string): Always "transferRequest"
+- `trackId` (string): **Unique identifier for the audio track.**
+- `timestamp` (number): Event timestamp in milliseconds since Unix epoch
+- `referTo` (string): SIP URI of the transfer target
+- `referredBy` (string, optional): SIP URI of the transfer initiator
+
+```json
+{
+  "event": "transferRequest",
+  "trackId": "track-abc123",
+  "timestamp": 1640995200000,
+  "referTo": "sip:operator@domain.com",
+  "referredBy": "sip:ivr@domain.com"
+}
+```
+
+#### Message Event (Inbound SIP MESSAGE)
+**Triggered when:** An in-dialog SIP MESSAGE is received during an active call.
+
+**Fields:**
+- `event` (string): Always "message"
+- `trackId` (string): **Unique identifier for the audio track.**
+- `timestamp` (number): Event timestamp in milliseconds since Unix epoch
+- `body` (string): Message body content
+- `contentType` (string, optional): MIME content type of the message
+
+```json
+{
+  "event": "message",
+  "trackId": "track-abc123",
+  "timestamp": 1640995200000,
+  "body": "customer_id=12345",
+  "contentType": "text/plain;charset=utf-8"
+}
+```
+
 ### System Events
 
 #### Ping Event
@@ -1321,6 +1543,27 @@ Events are received as JSON messages from the server. All timestamps are in mill
   "timestamp": 1640995200000,
   "speaker": "user",
   "text": "Hello, I need help with my account"
+}
+```
+
+#### Custom Event
+**Triggered when:** External systems send custom JSON data to the call session.
+
+**Fields:**
+- `event` (string): Always "custom"
+- `timestamp` (number): Event timestamp in milliseconds since Unix epoch
+- `sender` (string, optional): Component that generated the custom event
+- `data` (object): Custom JSON payload
+
+```json
+{
+  "event": "custom",
+  "timestamp": 1640995200000,
+  "sender": "external_service",
+  "data": {
+    "action": "update_context",
+    "value": "customer_premium"
+  }
 }
 ```
 
@@ -1654,6 +1897,42 @@ curl -X POST http://localhost:8080/api/playbook/run \
 **Usage:**
 ```bash
 curl http://localhost:8080/api/records
+```
+
+#### Precache TTS
+
+**Endpoint:** `POST /precache`
+
+**Description:** Pre-generates and caches TTS audio for a given text without requiring an active call session. Useful for warming the cache during off-peak hours.
+
+**Request Body (JSON):**
+```json
+{
+  "text": "Hello, welcome to our service!",
+  "speaker": "F1",
+  "option": {
+    "provider": "supertonic"
+  },
+  "cacheKey": "welcome-message-en"
+}
+```
+
+**Fields:**
+- `text` (string, required): Text to synthesize
+- `speaker` (string, optional): Speaker voice
+- `option` (object, optional): TTS provider options
+- `cacheKey` (string, optional): Custom cache key
+
+**Response:**
+```json
+{ "status": "cached", "key": "welcome-message-en" }
+```
+
+**Usage:**
+```bash
+curl -X POST http://localhost:8080/precache \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Hello!", "speaker": "F1", "cacheKey": "greeting"}'
 ```
 
 ## Error Handling

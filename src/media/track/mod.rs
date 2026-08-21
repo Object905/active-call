@@ -25,9 +25,6 @@ pub struct TrackConfig {
 impl Default for TrackConfig {
     fn default() -> Self {
         Self {
-            #[cfg(feature = "opus")]
-            codec: CodecType::Opus,
-            #[cfg(not(feature = "opus"))]
             codec: CodecType::G722,
             samplerate: 16000,
             channels: 1,
@@ -54,6 +51,7 @@ impl TrackConfig {
 }
 
 pub mod file;
+pub mod forwarding;
 pub mod media_pass;
 pub mod rtc;
 pub mod track_codec;
@@ -64,6 +62,12 @@ pub trait Track: Send + Sync {
     fn ssrc(&self) -> u32;
     fn id(&self) -> &TrackId;
     fn config(&self) -> &TrackConfig;
+    fn set_paused(&self, _paused: bool) -> bool {
+        false
+    }
+    fn is_paused(&self) -> bool {
+        false
+    }
     fn processor_chain(&mut self) -> &mut ProcessorChain;
     fn insert_processor(&mut self, processor: Box<dyn Processor>) {
         self.processor_chain().insert_processor(processor);
@@ -87,4 +91,14 @@ pub trait Track: Send + Sync {
         self.stop().await
     }
     async fn send_packet(&mut self, packet: &AudioFrame) -> Result<()>;
+    /// Feed a remotely-gathered ICE candidate into this track's PeerConnection.
+    /// Default no-op for track types that aren't backed by ICE (file/tts/websocket tracks).
+    fn add_ice_candidate(
+        &self,
+        _candidate: &str,
+        _sdp_mid: Option<&str>,
+        _sdp_mline_index: Option<u32>,
+    ) -> Result<()> {
+        Ok(())
+    }
 }

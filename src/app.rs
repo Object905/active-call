@@ -26,12 +26,17 @@ use chrono::{DateTime, Local};
 use futures::FutureExt;
 use humantime::parse_duration;
 use rsipstack::rsip::prelude::HeadersExt;
+use rsipstack::rsip::{Accept, Method, typed};
 use rsipstack::transaction::{
     Endpoint, TransactionReceiver,
     endpoint::{TargetLocator, TransportEventInspector},
 };
 use rsipstack::{dialog::dialog_layer::DialogLayer, transaction::endpoint::MessageInspector};
+use rsipstack::transport::transport_layer::DomainResolver;
+use rsipstack::{rsip::{Host, HostWithPort}, transport::SipAddr};
+use async_trait::async_trait;
 use std::future::pending;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -192,12 +197,11 @@ impl AppStateInner {
             },
         }
 
-        // Wait for registration to stop, if not stopped within 50 seconds,
-        // force stop it.
+        let total_secs = self.config.graceful_shutdown_timeout.unwrap_or(30);
         let timeout = self
             .config
             .graceful_shutdown
-            .map(|_| Duration::from_secs(10));
+            .map(|_| Duration::from_secs(total_secs));
 
         match self.stop_registration(timeout).await {
             Ok(_) => {
@@ -348,6 +352,7 @@ impl AppStateInner {
 
                     let dialog_id = dialog.id();
                     let dialog_id_str = dialog_id.to_string();
+                    let dialog_id_for_cleanup = dialog_id.clone();
                     let token = self.token.child_token();
                     let pending_dialog = PendingDialog {
                         token: token.clone(),
@@ -368,62 +373,152 @@ impl AppStateInner {
                         .and_then(|t| parse_duration(t).ok())
                         .unwrap_or_else(|| Duration::from_secs(60));
 
-                    let token_ref = token.clone();
-                    let guard_ref = guard.clone();
-                    crate::spawn(async move {
-                        select! {
-                            _ = token_ref.cancelled() => {}
-                            _ = tokio::time::sleep(accept_timeout) => {}
-                        }
-                        guard_ref.drop_async().await;
-                    });
-
                     let mut dialog_ref = dialog.clone();
-                    let token_ref = token.clone();
                     let routing_state = self.routing_state.clone();
                     let dialog_for_reject = dialog.clone();
-                    let guard_ref = guard.clone();
+                    let invitation_for_cleanup = self.invitation.clone();
                     crate::spawn(async move {
-                        let invite_loop = async {
-                            match invitation_handler
-                                .on_invite(
-                                    dialog_id_str.clone(),
-                                    token.clone(),
-                                    dialog.clone(),
-                                    routing_state,
-                                )
-                                .await
-                            {
-                                Ok(_) => (),
-                                Err(e) => {
-                                    // Webhook failed, reject the call immediately
-                                    info!(id = dialog_id_str, "error handling invite: {:?}", e);
-                                    let reason = format!("Failed to process invite: {}", e);
-                                    if let Err(reject_err) = dialog_for_reject.reject(
-                                        Some(rsipstack::rsip::StatusCode::ServiceUnavailable),
-                                        Some(reason),
+                        info!(id = dialog_id_str, "incoming invite task started");
+                        let _pending_guard = guard;
+                        let token_ref = token.clone();
+                        let accept_timeout_sleep = tokio::time::sleep(accept_timeout);
+                        let invite_handler = invitation_handler.on_invite(
+                            dialog_id_str.clone(),
+                            token.clone(),
+                            dialog.clone(),
+                            routing_state,
+                        );
+                        let dialog_handle = dialog_ref.handle(&mut tx);
+                        tokio::pin!(accept_timeout_sleep);
+                        tokio::pin!(invite_handler);
+                        tokio::pin!(dialog_handle);
+
+                        let mut cancel_done = false;
+                        let mut accept_timeout_done = false;
+                        let mut invite_done = false;
+                        loop {
+                            let mut reject_request = None;
+
+                            select! {
+                                _ = token_ref.cancelled(), if !cancel_done => {
+                                    cancel_done = true;
+                                    reject_request = Some((
+                                        rsipstack::rsip::StatusCode::ServiceUnavailable,
+                                        "invite cancelled".to_string(),
+                                        "cancelled",
+                                    ));
+                                }
+                                _ = &mut accept_timeout_sleep, if !accept_timeout_done
+                                    && dialog_for_reject.state().can_cancel() => {
+                                    accept_timeout_done = true;
+                                    reject_request = Some((
+                                        rsipstack::rsip::StatusCode::RequestTimeout,
+                                        "accept timeout".to_string(),
+                                        "accept timeout",
+                                    ));
+                                }
+                                result = &mut invite_handler, if !invite_done => {
+                                    invite_done = true;
+                                    match result {
+                                        Ok(_) => {
+                                            info!(id = dialog_id_str, "invite handler completed");
+                                        }
+                                        Err(e) => {
+                                            info!(id = dialog_id_str, "error handling invite: {:?}", e);
+                                            reject_request = Some((
+                                                rsipstack::rsip::StatusCode::ServiceUnavailable,
+                                                format!("Failed to process invite: {}", e),
+                                                "invite handler error",
+                                            ));
+                                        }
+                                    }
+                                }
+                                result = &mut dialog_handle => {
+                                    match result {
+                                        Ok(_) => {
+                                            info!(id = dialog_id_str, "dialog handling finished");
+                                        }
+                                        Err(e) => {
+                                            info!(
+                                                id = dialog_id_str,
+                                                "dialog handling ended with error: {:?}", e
+                                            );
+                                        }
+                                    }
+                                    if matches!(
+                                        dialog_for_reject.state(),
+                                        rsipstack::dialog::dialog::DialogState::Terminated(_, _)
                                     ) {
                                         info!(
                                             id = dialog_id_str,
-                                            "error rejecting call: {:?}", reject_err
+                                            "terminated invite dialog finished, cancelling invite token"
                                         );
+                                        token_ref.cancel();
                                     }
-                                    // Cancel token to stop dialog handling
-                                    token.cancel();
-                                    guard_ref.drop_async().await;
+                                    info!(id = dialog_id_str, "incoming invite task finished");
+                                    break;
                                 }
                             }
-                        };
-                        select! {
-                            _ = token_ref.cancelled() => {}
-                            _ = async {
-                                let (_,_ ) = tokio::join!(dialog_ref.handle(&mut tx), invite_loop);
-                             } => {}
+
+                            if let Some((code, reason, source)) = reject_request {
+                                if dialog_for_reject.state().can_cancel() {
+                                    info!(
+                                        id = dialog_id_str,
+                                        ?code,
+                                        %reason,
+                                        source,
+                                        "rejecting invite"
+                                    );
+                                    if let Err(e) =
+                                        dialog_for_reject.reject(Some(code), Some(reason))
+                                    {
+                                        info!(
+                                            id = dialog_id_str,
+                                            "error rejecting invite: {:?}", e
+                                        );
+                                    }
+                                    invitation_for_cleanup.get_pending_call(&dialog_id_for_cleanup);
+                                    invitation_for_cleanup
+                                        .dialog_layer
+                                        .remove_dialog(&dialog_id_for_cleanup);
+                                }
+                            }
                         }
                     });
                 }
                 rsipstack::rsip::Method::Options => {
-                    info!(?key, "ignoring out-of-dialog OPTIONS request");
+                    if self.config.enable_options_response.unwrap_or(true) {
+                        info!(?key, "responding to out-of-dialog OPTIONS request");
+                        let allow_header: rsipstack::rsip::Header =
+                            typed::Allow::from(Method::all()).into();
+                        let accept_header =
+                            rsipstack::rsip::Header::Accept(Accept::new("application/sdp"));
+                        match tx
+                            .reply_with(
+                                rsipstack::rsip::StatusCode::OK,
+                                vec![allow_header, accept_header],
+                                None,
+                            )
+                            .await
+                        {
+                            Ok(_) => (),
+                            Err(e) => {
+                                info!("error replying to OPTIONS: {:?}", e);
+                            }
+                        }
+                    } else {
+                        info!(?key, "ignoring out-of-dialog OPTIONS request");
+                    }
+                    continue;
+                }
+                rsipstack::rsip::Method::Refer => {
+                    info!(?key, "ignoring out-of-dialog REFER");
+                    match tx.reply(rsipstack::rsip::StatusCode::BadRequest).await {
+                        Ok(_) => (),
+                        Err(e) => {
+                            info!("error replying to out-of-dialog REFER: {:?}", e);
+                        }
+                    }
                     continue;
                 }
                 _ => {
@@ -448,20 +543,45 @@ impl AppStateInner {
         self.token.cancel();
     }
 
-    pub async fn graceful_stop(&self) -> Result<()> {
+    pub async fn graceful_stop(&self, total_timeout_secs: u64) -> Result<()> {
         if self.shutting_down.swap(true, Ordering::Relaxed) {
             return Ok(());
         }
 
         info!("graceful stopping, marking as shutting down");
-        let timeout = self
-            .config
-            .graceful_shutdown
-            .map(|_| Duration::from_secs(10));
+        let timeout = Duration::from_secs(total_timeout_secs);
 
-        self.stop_registration(timeout).await?;
+        let (reg_result, ()) = tokio::join!(
+            self.stop_registration(Some(timeout)),
+            self.wait_for_active_calls(timeout),
+        );
+        if let Err(e) = reg_result {
+            warn!("stop_registration error: {}", e);
+        }
         self.token.cancel();
         Ok(())
+    }
+
+    async fn wait_for_active_calls(&self, timeout: Duration) {
+        let active_calls = self.active_calls.clone();
+        let check_loop = async move {
+            let mut last_count = usize::MAX;
+            loop {
+                let count = active_calls.lock().unwrap().len();
+                if count == 0 {
+                    break;
+                }
+                if count != last_count {
+                    info!(active_calls = count, "waiting for active calls to finish");
+                    last_count = count;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        };
+        match tokio::time::timeout(timeout, check_loop).await {
+            Ok(()) => info!("all active calls finished"),
+            Err(_) => warn!("timed out waiting for active calls to finish, forcing shutdown"),
+        }
     }
 
     pub async fn start_registration(&self) -> Result<usize> {
@@ -525,7 +645,9 @@ impl AppStateInner {
                     rsipstack::rsip::Host::Domain(domain) => domain.to_string(),
                     rsipstack::rsip::Host::IpAddr(ip) => {
                         // Compare IP addresses
-                        if let rsipstack::rsip::Host::IpAddr(callee_ip) = &parsed_callee.host_with_port.host {
+                        if let rsipstack::rsip::Host::IpAddr(callee_ip) =
+                            &parsed_callee.host_with_port.host
+                        {
                             if ip == callee_ip {
                                 if let Some(cred) = &option.credential {
                                     info!(
@@ -572,7 +694,9 @@ impl AppStateInner {
                 }
 
                 if let Ok(parsed_server) = rsipstack::rsip::Uri::try_from(server.as_str()) {
-                    if let rsipstack::rsip::Host::IpAddr(server_ip) = &parsed_server.host_with_port.host {
+                    if let rsipstack::rsip::Host::IpAddr(server_ip) =
+                        &parsed_server.host_with_port.host
+                    {
                         if server_ip == callee_ip {
                             if let Some(cred) = &option.credential {
                                 info!(
@@ -766,6 +890,43 @@ impl Drop for AppStateInner {
     }
 }
 
+struct SimpleDomainResolver;
+
+#[async_trait]
+impl DomainResolver for SimpleDomainResolver {
+    async fn resolve(&self, target: &SipAddr) -> rsipstack::Result<SipAddr> {
+        match &target.addr.host {
+            Host::Domain(domain) => {
+                let port: u16 = target.addr.port.map(|p| p.value()).unwrap_or(5060);
+                let addr_str = format!("{}:{}", domain, port);
+                match tokio::net::lookup_host(&addr_str).await {
+                    Ok(mut addrs) => {
+                        if let Some(addr) = addrs.next() {
+                            Ok(SipAddr {
+                                r#type: target.r#type,
+                                addr: HostWithPort {
+                                    host: Host::IpAddr(addr.ip()),
+                                    port: Some(rsipstack::rsip::Port(addr.port())),
+                                },
+                            })
+                        } else {
+                            Err(rsipstack::Error::DnsResolutionError(format!(
+                                "no addresses found for {}",
+                                domain
+                            )))
+                        }
+                    }
+                    Err(e) => Err(rsipstack::Error::DnsResolutionError(format!(
+                        "DNS resolution failed for {}: {}",
+                        domain, e
+                    ))),
+                }
+            }
+            _ => Ok(target.clone()),
+        }
+    }
+}
+
 impl AppStateBuilder {
     pub fn new() -> Self {
         Self {
@@ -835,7 +996,18 @@ impl AppStateBuilder {
         } else {
             crate::net_tool::get_first_non_loopback_interface()?
         };
-        let transport_layer = rsipstack::transport::TransportLayer::new(token.clone());
+        let transport_layer = match catch_unwind(AssertUnwindSafe(|| {
+            rsipstack::transport::TransportLayer::new(token.clone())
+        })) {
+            Ok(tl) => tl,
+            Err(_) => {
+                warn!("failed to initialize default DNS resolver with hickory-resolver, falling back to simple resolver via tokio::net::lookup_host");
+                rsipstack::transport::TransportLayer::new_with_domain_resolver(
+                    token.clone(),
+                    Box::new(SimpleDomainResolver),
+                )
+            }
+        };
         let local_addr: SocketAddr = format!("{}:{}", local_ip, config.udp_port).parse()?;
 
         // Create UDP socket with SO_REUSEPORT for graceful restarts
@@ -915,10 +1087,6 @@ impl AppStateBuilder {
         // Optional SIP over TLS transport
         if let Some(tls_port) = config.tls_port {
             let tls_addr: std::net::SocketAddr = format!("{}:{}", local_ip, tls_port).parse()?;
-            let tls_sip_addr = rsipstack::transport::SipAddr {
-                r#type: Some(rsipstack::rsip::transport::Transport::Tls),
-                addr: tls_addr.into(),
-            };
             let mut tls_cfg = rsipstack::transport::tls::TlsConfig::default();
             if let Some(ref cert_path) = config.tls_cert_file {
                 tls_cfg.cert = Some(
@@ -936,7 +1104,7 @@ impl AppStateBuilder {
                 .as_ref()
                 .and_then(|ip| format!("{}:{}", ip, tls_port).parse().ok());
             match rsipstack::transport::tls::TlsListenerConnection::new(
-                tls_sip_addr,
+                tls_addr,
                 external_tls_addr,
                 tls_cfg,
             )
