@@ -4,7 +4,7 @@ use crate::media::{AudioFrame, PcmBuf, Samples, TrackId};
 use crate::media::track::{Track, TrackConfig, TrackPacketSender};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use audio_codec::Resampler;
+use audio_codec::BoxedResampler;
 use hound::WavReader;
 use std::cmp::min;
 use std::fs::File;
@@ -77,7 +77,7 @@ struct DecodedAudioReader {
     sample_rate: u32,
     position: usize,
     target_sample_rate: u32,
-    resampler: Option<Resampler>,
+    resampler: Option<BoxedResampler>,
 }
 
 impl DecodedAudioReader {
@@ -157,8 +157,11 @@ impl AudioReader for DecodedAudioReader {
         if let Some(resampler) = &mut self.resampler {
             resampler.resample(chunk)
         } else {
-            let mut new_resampler =
-                Resampler::new(self.sample_rate as usize, self.target_sample_rate as usize);
+            let mut new_resampler = BoxedResampler::new(
+                self.sample_rate as usize,
+                self.target_sample_rate as usize,
+            )
+            .expect("invalid sample rate");
             let result = new_resampler.resample(chunk);
             self.resampler = Some(new_resampler);
             result

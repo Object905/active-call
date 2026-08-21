@@ -1,6 +1,6 @@
 use crate::media::cache;
 use anyhow::{Result, anyhow};
-use audio_codec::Resampler;
+use audio_codec::BoxedResampler;
 use audio_codec::opus::OpusDecoder;
 use hound::WavReader;
 use ogg::reading::PacketReader;
@@ -145,7 +145,8 @@ fn decode_opus_ogg(file: File, channels: u16, target_sample_rate: u32) -> Result
     );
 
     if target_sample_rate != 48000 {
-        let mut resampler = Resampler::new(48000, target_sample_rate as usize);
+        let mut resampler =
+            BoxedResampler::new(48000, target_sample_rate as usize).map_err(anyhow::Error::from)?;
         all_samples = resampler.resample(&all_samples);
     }
 
@@ -230,7 +231,9 @@ pub fn decode_wav(file: File, target_sample_rate: u32) -> Result<Vec<i16>> {
     }
 
     if sample_rate != target_sample_rate && sample_rate > 0 {
-        let mut resampler = Resampler::new(sample_rate as usize, target_sample_rate as usize);
+        let mut resampler =
+            BoxedResampler::new(sample_rate as usize, target_sample_rate as usize)
+                .map_err(anyhow::Error::from)?;
         all_samples = resampler.resample(&all_samples);
     }
 
@@ -347,7 +350,9 @@ pub fn decode_audio(
     }
 
     if sample_rate != target_sample_rate && sample_rate > 0 {
-        let mut resampler = Resampler::new(sample_rate as usize, target_sample_rate as usize);
+        let mut resampler =
+            BoxedResampler::new(sample_rate as usize, target_sample_rate as usize)
+                .map_err(anyhow::Error::from)?;
         all_samples = resampler.resample(&all_samples);
     }
 

@@ -7,7 +7,7 @@ use crate::offline::get_offline_models;
 use crate::offline::sensevoice::{FeaturePipeline, FrontendConfig, language_id_from_code};
 use crate::transcription::{TranscriptionClient, TranscriptionOption};
 use anyhow::{Result, anyhow};
-use audio_codec::Resampler;
+use audio_codec::BoxedResampler;
 use std::{future::Future, pin::Pin, sync::Arc};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -133,7 +133,7 @@ async fn process_stream(
 
     // Resampler setup
     let mut resampler = if input_rate != sample_rate as u32 {
-        Some(Resampler::new(input_rate as usize, sample_rate))
+        BoxedResampler::new(input_rate as usize, sample_rate).ok()
     } else {
         None
     };

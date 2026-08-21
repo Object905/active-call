@@ -4,7 +4,7 @@ use audio_codec::{
     g722::{G722Decoder, G722Encoder},
     pcma::{PcmaDecoder, PcmaEncoder},
     pcmu::{PcmuDecoder, PcmuEncoder},
-    samples_to_bytes, CodecType, Decoder, Encoder, Resampler,
+    samples_to_bytes, BoxedResampler, CodecType, Decoder, Encoder,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -27,7 +27,7 @@ pub struct TrackCodec {
     opus_encoder: Option<OpusEncoder>,
     opus_decoder: Option<OpusDecoder>,
 
-    resampler: Option<Resampler>,
+    resampler: Option<BoxedResampler>,
     resampler_in_rate: u32,
     resampler_out_rate: u32,
     pub payload_type_map: Arc<RwLock<HashMap<u8, CodecType>>>,
@@ -165,7 +165,10 @@ impl TrackCodec {
             || self.resampler_in_rate != in_rate
             || self.resampler_out_rate != out_rate
         {
-            self.resampler = Some(Resampler::new(in_rate as usize, out_rate as usize));
+            self.resampler = Some(
+                BoxedResampler::new(in_rate as usize, out_rate as usize)
+                    .expect("invalid sample rate"),
+            );
             self.resampler_in_rate = in_rate;
             self.resampler_out_rate = out_rate;
         }
@@ -189,10 +192,13 @@ impl TrackCodec {
                         || self.resampler_in_rate != frame.sample_rate
                         || self.resampler_out_rate != target_samplerate
                     {
-                        self.resampler = Some(Resampler::new(
-                            frame.sample_rate as usize,
-                            target_samplerate as usize,
-                        ));
+                        self.resampler = Some(
+                            BoxedResampler::new(
+                                frame.sample_rate as usize,
+                                target_samplerate as usize,
+                            )
+                            .expect("invalid sample rate"),
+                        );
                         self.resampler_in_rate = frame.sample_rate;
                         self.resampler_out_rate = target_samplerate;
                     }
