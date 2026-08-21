@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+pub mod agc;
 pub mod ambiance;
 pub mod asr_processor;
 pub mod cache;
@@ -8,7 +9,6 @@ pub mod dtmf;
 pub mod engine;
 pub mod inactivity;
 pub mod loader;
-pub mod agc;
 pub mod negotiate;
 pub mod processor;
 pub mod realtime_processor;

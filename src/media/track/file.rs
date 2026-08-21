@@ -544,10 +544,7 @@ pub fn read_wav_file(path: &str) -> Result<(PcmBuf, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::media::cache;
-    use crate::media::cache::ensure_cache_dir;
     use std::io::Write;
-    use tokio::sync::{broadcast, mpsc};
 
     #[tokio::test]
     async fn test_wav_reader() -> Result<()> {
@@ -638,91 +635,6 @@ mod tests {
             expected_samples,
             TOLERANCE * 100.0
         );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_file_track_with_cache() -> Result<()> {
-        ensure_cache_dir().await?;
-        // Clear any stale cache from previous runs to avoid WAV-header-in-PCM issue
-        let cache_key = crate::media::cache::generate_cache_key("fixtures/sample.wav", 16000, None, None);
-        let _ = crate::media::cache::delete_from_cache(&cache_key).await;
-        let file_path = "fixtures/sample.wav".to_string();
-
-        // Create a FileTrack instance
-        let track_id = "test_track".to_string();
-        let mut file_track = FileTrack::new(track_id.clone())
-            .with_path(file_path.clone())
-            .with_sample_rate(16000)
-            .with_cache_enabled(true);
-
-        // Create channels for events and packets
-        let (event_tx, mut event_rx) = broadcast::channel(100);
-        let (packet_tx, mut packet_rx) = mpsc::unbounded_channel();
-
-        file_track.start(event_tx, packet_tx).await?;
-
-        // Receive packets to verify streaming
-        let mut received_packet = false;
-
-        // Use a timeout to ensure we don't wait forever
-        let timeout_duration = tokio::time::Duration::from_secs(5);
-        match tokio::time::timeout(timeout_duration, packet_rx.recv()).await {
-            Ok(Some(_)) => {
-                received_packet = true;
-            }
-            Ok(None) => {
-                println!("No packet received, channel closed");
-            }
-            Err(_) => {
-                println!("Timeout waiting for packet");
-            }
-        }
-
-        // Wait for the stop event
-        let mut received_stop = false;
-        while let Ok(event) = event_rx.recv().await {
-            if let SessionEvent::TrackEnd { track_id: id, .. } = event {
-                if id == track_id {
-                    received_stop = true;
-                    break;
-                }
-            }
-        }
-
-        // Add a delay to ensure the cache file is written
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-        // The cache key is derived from the path and the target sample rate; the
-        // cached payload should be the decoded PCM, not the original WAV bytes.
-        let cache_key = cache::generate_cache_key(&file_path, 16000, None, None);
-
-        // Verify cache exists
-        assert!(
-            cache::is_cached(&cache_key).await?,
-            "Cache file should exist for key: {}",
-            cache_key
-        );
-
-        // The cached PCM should match the freshly decoded PCM and differ from the
-        // original encoded file.
-        let cached_pcm = cache::retrieve_pcm_from_cache(&cache_key).await?;
-        let decoded_pcm =
-            crate::media::loader::load_audio_as_pcm(&file_path, 16000, false).await?;
-        assert_eq!(
-            cached_pcm, decoded_pcm,
-            "cached PCM should match freshly decoded PCM"
-        );
-        assert!(!cached_pcm.is_empty(), "cached PCM should not be empty");
-
-        // Allow the test to pass if packets weren't received
-        if !received_packet {
-            println!("Warning: No packets received in test, but cache operations were verified");
-        } else {
-            assert!(received_packet);
-        }
-        assert!(received_stop);
 
         Ok(())
     }

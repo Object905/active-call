@@ -4,7 +4,7 @@ use crate::{
     event::{EventReceiver, EventSender, SessionEvent},
     media::{
         TrackId,
-        ambiance::AmbianceProcessor,
+        ambiance::SharedAmbianceProcessor,
         engine::StreamEngine,
         negotiate::strip_ipv6_candidates,
         processor::SubscribeProcessor,
@@ -580,21 +580,21 @@ pub struct CallParams {
     #[serde(rename = "ping")]
     pub ping_interval: Option<u32>,
     pub server_side_track: Option<String>,
-    /// Set when this connection is a peer-forward/find attempt coming from
-    /// another active-call node. A node receiving such a request must NOT create
-    /// a new call when the session id is absent locally; it must respond 404 so
-    /// the upstream node can try the next peer.
+    /// Set when this connection is a one-hop find from another node.
+    /// Only an empty `forward` may be forwarded. A present value is answered
+    /// locally only and must never hop again. `forward=true` must 404 if the
+    /// session is absent (do not create a new call).
     #[serde(default)]
     pub forward: Option<bool>,
-    /// Comma-separated list of node http addrs already tried while forwarding,
-    /// used to break forwarding loops.
+    /// Ignored. Kept so older nodes that still send `visited=` can deserialize.
     #[serde(default)]
     pub visited: Option<String>,
 }
 
 impl CallParams {
     /// Build the query string used when forwarding this request to a peer.
-    pub fn to_forward_query(&self, visited: &str) -> String {
+    /// Sets `forward=true` so the peer will not hop (`forward` is no longer empty).
+    pub fn to_forward_query(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
         if let Some(id) = &self.id {
             parts.push(format!("id={}", urlencoding::encode(id)));
@@ -606,27 +606,10 @@ impl CallParams {
             parts.push(format!("ping={}", ping));
         }
         if let Some(track) = &self.server_side_track {
-            parts.push(format!(
-                "server_side_track={}",
-                urlencoding::encode(track)
-            ));
+            parts.push(format!("server_side_track={}", urlencoding::encode(track)));
         }
         parts.push("forward=true".to_string());
-        parts.push(format!("visited={}", urlencoding::encode(visited)));
         parts.join("&")
-    }
-
-    /// Comma-separated addresses already visited while forwarding.
-    pub fn visited_list(&self) -> Vec<String> {
-        self.visited
-            .as_deref()
-            .map(|v| {
-                v.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default()
     }
 }
 
@@ -1274,6 +1257,7 @@ impl ActiveCall {
         if let Some(opt) = self.build_record_option(&option) {
             self.media_stream.update_recorder_option(opt).await;
         }
+        self.ensure_call_ambiance(&option).await;
 
         if let Some(opt) = &option.media_pass {
             let track_id = self.server_side_track_id.clone();
@@ -1360,6 +1344,7 @@ impl ActiveCall {
                 self.media_stream.update_recorder_option(opt).await;
             }
             self.call_state.write().await.option = Some(option.clone());
+            self.ensure_call_ambiance(&option).await;
         }
         info!(session_id = self.session_id, ?option, "accepting call");
         let ready = self.call_state.write().await.ready_to_answer.take();
@@ -2597,6 +2582,7 @@ impl ActiveCall {
         option: &CallOption,
         pending_track: PendingCallerTrack,
     ) -> Result<()> {
+        self.ensure_call_ambiance(option).await;
         match pending_track {
             PendingCallerTrack::NotStarted(track) => {
                 self.setup_track_with_stream(option, track).await?;
@@ -2711,15 +2697,23 @@ impl ActiveCall {
 
             (opt, subscribe)
         };
-        if track.id() == &self.server_side_track_id && ambiance_opt.path.is_some() {
-            match AmbianceProcessor::new(ambiance_opt).await {
-                Ok(ambiance) => {
-                    info!(session_id = self.session_id, "loaded ambiance processor");
-                    track.append_processor(Box::new(ambiance));
-                }
-                Err(e) => {
-                    tracing::error!("failed to load ambiance wav {}", e);
-                }
+
+        let shared_ambiance = match self
+            .media_stream
+            .ensure_ambiance(ambiance_opt, self.server_side_track_id.clone())
+            .await
+        {
+            Ok(shared) => shared,
+            Err(e) => {
+                tracing::error!("failed to load ambiance wav {}", e);
+                None
+            }
+        };
+
+        if track.id() == &self.server_side_track_id {
+            if let Some(shared) = shared_ambiance {
+                info!(session_id = self.session_id, "loaded ambiance processor");
+                track.append_processor(Box::new(SharedAmbianceProcessor::new(shared)));
             }
         }
 
@@ -2736,6 +2730,24 @@ impl ActiveCall {
 
         self.call_state.write().await.current_play_id = play_id.clone();
         self.media_stream.update_track(track, play_id).await;
+    }
+
+    async fn ensure_call_ambiance(&self, option: &CallOption) {
+        let mut opt = option.ambiance.clone().unwrap_or_default();
+        if let Some(global) = &self.app_state.config.ambiance {
+            opt.merge(global);
+        }
+        if let Err(e) = self
+            .media_stream
+            .ensure_ambiance(opt, self.server_side_track_id.clone())
+            .await
+        {
+            tracing::error!(
+                session_id = self.session_id,
+                "failed to load ambiance wav {}",
+                e
+            );
+        }
     }
 
     pub async fn create_websocket_track(

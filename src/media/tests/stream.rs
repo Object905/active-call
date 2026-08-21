@@ -100,6 +100,61 @@ impl Track for TestTrack {
     }
 }
 
+/// Sink track that only records forwarded packets (no echo back into the stream).
+struct CollectTrack {
+    id: TrackId,
+    config: TrackConfig,
+    processor_chain: ProcessorChain,
+    received: Arc<Mutex<Vec<AudioFrame>>>,
+}
+
+impl CollectTrack {
+    fn new(id: TrackId, received: Arc<Mutex<Vec<AudioFrame>>>) -> Self {
+        Self {
+            id,
+            config: TrackConfig::default(),
+            processor_chain: ProcessorChain::new(16000),
+            received,
+        }
+    }
+}
+
+#[async_trait]
+impl Track for CollectTrack {
+    fn ssrc(&self) -> u32 {
+        0
+    }
+    fn id(&self) -> &TrackId {
+        &self.id
+    }
+    fn config(&self) -> &TrackConfig {
+        &self.config
+    }
+    fn processor_chain(&mut self) -> &mut ProcessorChain {
+        &mut self.processor_chain
+    }
+    async fn handshake(&mut self, _offer: String, _timeout: Option<Duration>) -> Result<String> {
+        Ok("".to_string())
+    }
+    async fn update_remote_description(&mut self, _answer: &String) -> Result<()> {
+        Ok(())
+    }
+    async fn start(
+        &mut self,
+        _event_sender: EventSender,
+        _packet_sender: TrackPacketSender,
+    ) -> Result<()> {
+        Ok(())
+    }
+    async fn stop(&self) -> Result<()> {
+        Ok(())
+    }
+    async fn send_packet(&mut self, packet: &AudioFrame) -> Result<()> {
+        self.received.lock().await.push(packet.clone());
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -623,6 +678,477 @@ async fn test_cleanup_is_idempotent() -> Result<()> {
     // Second cleanup should be safe (no panic, no tracks to drain)
     stream.cleanup().await.unwrap();
     assert_eq!(stream.track_count().await, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_ambiance_idle_fills_without_tts() -> Result<()> {
+    use crate::media::INTERNAL_SAMPLERATE;
+    use crate::media::ambiance::AmbianceOption;
+    use crate::media::stream::SERVER_SIDE_TRACK_ID;
+    use hound::{WavSpec, WavWriter};
+
+    // Loud square wave so energy assertions are unambiguous.
+    let dir = tempdir()?;
+    let wav_path = dir.path().join("ambiance.wav");
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate: INTERNAL_SAMPLERATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = WavWriter::create(&wav_path, spec)?;
+    for i in 0..INTERNAL_SAMPLERATE {
+        writer.write_sample(if i % 2 == 0 { 8000i16 } else { -8000i16 })?;
+    }
+    writer.finalize()?;
+
+    let event_sender = crate::event::create_event_sender();
+    let stream = Arc::new(MediaStreamBuilder::new(event_sender).build());
+
+    // Production order: serve first, then user track, then ambiance. Never create TTS.
+    let serve_stream = stream.clone();
+    let handle = tokio::spawn(async move {
+        serve_stream.serve().await.ok();
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let received = Arc::new(Mutex::new(Vec::new()));
+    stream
+        .update_track(
+            Box::new(CollectTrack::new("user".to_string(), received.clone())),
+            None,
+        )
+        .await;
+
+    let option = AmbianceOption {
+        path: Some(wav_path.to_string_lossy().to_string()),
+        duck_level: Some(0.5),
+        normal_level: Some(1.0),
+        transition_speed: Some(1.0),
+        enabled: Some(true),
+    };
+    stream
+        .ensure_ambiance(option, SERVER_SIDE_TRACK_ID.to_string())
+        .await?
+        .expect("ambiance should load");
+
+    tokio::time::sleep(Duration::from_millis(220)).await;
+    stream.stop(None, None);
+    handle.abort();
+
+    let packets = received.lock().await;
+    let pcm_packets: Vec<_> = packets
+        .iter()
+        .filter_map(|p| match &p.samples {
+            Samples::PCM { samples } if samples.iter().any(|s| s.abs() > 1000) => Some(samples),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        pcm_packets.len() >= 8,
+        "no-TTS idle should keep playing ambiance (~20ms); got {} energetic frames",
+        pcm_packets.len()
+    );
+    for samples in &pcm_packets {
+        assert_eq!(
+            samples.len(),
+            320,
+            "idle ambiance frames must be 20ms @ 16kHz"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_ambiance_idle_resumes_after_tts_stops() -> Result<()> {
+    use crate::media::INTERNAL_SAMPLERATE;
+    use crate::media::ambiance::AmbianceOption;
+    use crate::media::stream::SERVER_SIDE_TRACK_ID;
+    use hound::{WavSpec, WavWriter};
+
+    let dir = tempdir()?;
+    let wav_path = dir.path().join("ambiance.wav");
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate: INTERNAL_SAMPLERATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = WavWriter::create(&wav_path, spec)?;
+    for i in 0..INTERNAL_SAMPLERATE {
+        writer.write_sample(if i % 2 == 0 { 8000i16 } else { -8000i16 })?;
+    }
+    writer.finalize()?;
+
+    let event_sender = crate::event::create_event_sender();
+    let stream = Arc::new(MediaStreamBuilder::new(event_sender).build());
+    let serve_stream = stream.clone();
+    let handle = tokio::spawn(async move {
+        serve_stream.serve().await.ok();
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let received = Arc::new(Mutex::new(Vec::new()));
+    stream
+        .update_track(
+            Box::new(CollectTrack::new("user".to_string(), received.clone())),
+            None,
+        )
+        .await;
+    stream
+        .ensure_ambiance(
+            AmbianceOption {
+                path: Some(wav_path.to_string_lossy().to_string()),
+                duck_level: Some(0.5),
+                normal_level: Some(1.0),
+                transition_speed: Some(1.0),
+                enabled: Some(true),
+            },
+            SERVER_SIDE_TRACK_ID.to_string(),
+        )
+        .await?
+        .expect("ambiance should load");
+
+    // Let idle run, then simulate TTS frames on the server-side track.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    {
+        received.lock().await.clear();
+    }
+
+    for _ in 0..5 {
+        stream.packet_sender.send(AudioFrame {
+            track_id: SERVER_SIDE_TRACK_ID.to_string(),
+            samples: Samples::PCM {
+                samples: vec![100; 320],
+            },
+            timestamp: crate::media::get_timestamp(),
+            sample_rate: INTERNAL_SAMPLERATE,
+            channels: 1,
+            ..Default::default()
+        })?;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // During TTS, idle filler must not keep pumping 8000-level ambiance alone.
+    let during_tts = {
+        let packets = received.lock().await;
+        packets
+            .iter()
+            .filter(|p| match &p.samples {
+                Samples::PCM { samples } => samples.iter().any(|s| s.abs() > 1000),
+                _ => false,
+            })
+            .count()
+    };
+    assert!(
+        during_tts <= 2,
+        "idle ambiance should pause while TTS frames are flowing, got {} loud frames",
+        during_tts
+    );
+
+    received.lock().await.clear();
+    // After TTS stops, idle ambiance must resume on its own.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    stream.stop(None, None);
+    handle.abort();
+
+    let resumed = {
+        let packets = received.lock().await;
+        packets
+            .iter()
+            .filter(|p| match &p.samples {
+                Samples::PCM { samples } => samples.iter().any(|s| s.abs() > 1000),
+                _ => false,
+            })
+            .count()
+    };
+    assert!(
+        resumed >= 3,
+        "after TTS stops, idle ambiance must resume; got {} energetic frames",
+        resumed
+    );
+
+    Ok(())
+}
+
+async fn write_loud_ambiance_wav() -> Result<std::path::PathBuf> {
+    use crate::media::INTERNAL_SAMPLERATE;
+    use hound::{WavSpec, WavWriter};
+
+    let dir = tempdir()?;
+    let wav_path = dir.path().join("ambiance.wav");
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate: INTERNAL_SAMPLERATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = WavWriter::create(&wav_path, spec)?;
+    for i in 0..INTERNAL_SAMPLERATE {
+        writer.write_sample(if i % 2 == 0 { 8000i16 } else { -8000i16 })?;
+    }
+    writer.finalize()?;
+    // Persist the temp dir so the wav outlives this helper.
+    Ok(dir.keep().join("ambiance.wav"))
+}
+
+fn ambiance_option(path: &str) -> crate::media::ambiance::AmbianceOption {
+    crate::media::ambiance::AmbianceOption {
+        path: Some(path.to_string()),
+        duck_level: Some(0.5),
+        normal_level: Some(1.0),
+        transition_speed: Some(1.0),
+        enabled: Some(true),
+    }
+}
+
+#[tokio::test]
+async fn test_ensure_ambiance_disabled_returns_none_and_stays_silent() -> Result<()> {
+    use crate::media::stream::SERVER_SIDE_TRACK_ID;
+
+    let wav_path = write_loud_ambiance_wav().await?;
+
+    let event_sender = crate::event::create_event_sender();
+    let stream = Arc::new(MediaStreamBuilder::new(event_sender).build());
+    let serve_stream = stream.clone();
+    let handle = tokio::spawn(async move {
+        serve_stream.serve().await.ok();
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let received = Arc::new(Mutex::new(Vec::new()));
+    stream
+        .update_track(
+            Box::new(CollectTrack::new("user".to_string(), received.clone())),
+            None,
+        )
+        .await;
+
+    // Explicitly disabled.
+    let mut option = ambiance_option(wav_path.to_str().unwrap());
+    option.enabled = Some(false);
+    assert!(
+        stream
+            .ensure_ambiance(option, SERVER_SIDE_TRACK_ID.to_string())
+            .await?
+            .is_none()
+    );
+
+    // No path at all.
+    assert!(
+        stream
+            .ensure_ambiance(
+                crate::media::ambiance::AmbianceOption::default(),
+                SERVER_SIDE_TRACK_ID.to_string()
+            )
+            .await?
+            .is_none()
+    );
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    stream.stop(None, None);
+    handle.abort();
+
+    let packets = received.lock().await;
+    assert!(
+        packets.is_empty(),
+        "disabled ambiance must not emit any frame, got {}",
+        packets.len()
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_ensure_ambiance_is_idempotent() -> Result<()> {
+    use crate::media::stream::SERVER_SIDE_TRACK_ID;
+
+    let wav_path = write_loud_ambiance_wav().await?;
+
+    let event_sender = crate::event::create_event_sender();
+    let stream = Arc::new(MediaStreamBuilder::new(event_sender).build());
+    let serve_stream = stream.clone();
+    let handle = tokio::spawn(async move {
+        serve_stream.serve().await.ok();
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let received = Arc::new(Mutex::new(Vec::new()));
+    stream
+        .update_track(
+            Box::new(CollectTrack::new("user".to_string(), received.clone())),
+            None,
+        )
+        .await;
+
+    let first = stream
+        .ensure_ambiance(
+            ambiance_option(wav_path.to_str().unwrap()),
+            SERVER_SIDE_TRACK_ID.to_string(),
+        )
+        .await?
+        .expect("first call loads");
+    let second = stream
+        .ensure_ambiance(
+            ambiance_option(wav_path.to_str().unwrap()),
+            SERVER_SIDE_TRACK_ID.to_string(),
+        )
+        .await?
+        .expect("second call returns existing");
+
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "ensure_ambiance must reuse the loaded processor"
+    );
+
+    // Exactly one idle loop: ~50 fps for 200ms → at most ~15 frames (generous),
+    // two loops would produce ~20+.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    stream.stop(None, None);
+    handle.abort();
+
+    let packets = received.lock().await;
+    let frame_count = packets.len();
+    assert!(
+        (4..=15).contains(&frame_count),
+        "single idle loop expected (~10 frames in 200ms), got {}",
+        frame_count
+    );
+
+    Ok(())
+}
+
+/// Forward-path throughput with the ambiance idle loop running vs not.
+/// Follows the repo convention: skipped in debug builds (see perf_analysis.rs).
+#[tokio::test]
+async fn perf_forward_fanout_ambiance_on_vs_off() -> Result<()> {
+    if cfg!(debug_assertions) {
+        println!("Skipping forward fanout perf test in debug mode.");
+        return Ok(());
+    }
+    use crate::media::INTERNAL_SAMPLERATE;
+    use crate::media::stream::SERVER_SIDE_TRACK_ID;
+    use std::time::Instant;
+
+    const PACKETS: usize = 3000; // 60s of 20ms frames
+    const PER_PACKET_BUDGET: Duration = Duration::from_micros(200);
+
+    let wav_path = write_loud_ambiance_wav().await?;
+    let event_sender = crate::event::create_event_sender();
+    let stream = Arc::new(MediaStreamBuilder::new(event_sender).build());
+    let serve_stream = stream.clone();
+    let handle = tokio::spawn(async move {
+        serve_stream.serve().await.ok();
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let received_a = Arc::new(Mutex::new(Vec::new()));
+    let received_b = Arc::new(Mutex::new(Vec::new()));
+    stream
+        .update_track(
+            Box::new(CollectTrack::new("user-a".to_string(), received_a.clone())),
+            None,
+        )
+        .await;
+    stream
+        .update_track(
+            Box::new(CollectTrack::new("user-b".to_string(), received_b.clone())),
+            None,
+        )
+        .await;
+
+    let make_frame = |i: usize| AudioFrame {
+        track_id: SERVER_SIDE_TRACK_ID.to_string(),
+        samples: Samples::PCM {
+            samples: vec![(i % 100) as i16; 320],
+        },
+        timestamp: crate::media::get_timestamp(),
+        sample_rate: INTERNAL_SAMPLERATE,
+        channels: 1,
+        ..Default::default()
+    };
+
+    // Wait until `target` frames from the TTS source arrived at track `sink`.
+    async fn drain(sink: Arc<Mutex<Vec<AudioFrame>>>, label: &str) -> std::time::Duration {
+        let deadline = tokio::time::Duration::from_secs(30);
+        let start = Instant::now();
+        loop {
+            let done = {
+                let packets = sink.lock().await;
+                packets
+                    .iter()
+                    .filter(|p| p.track_id == SERVER_SIDE_TRACK_ID)
+                    .count()
+                    >= PACKETS
+            };
+            if done {
+                return start.elapsed();
+            }
+            if start.elapsed() > deadline {
+                panic!("drain timeout for {}", label);
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    // Phase 1: ambiance off (regression baseline).
+    for i in 0..PACKETS {
+        stream.packet_sender.send(make_frame(i))?;
+    }
+    let off = drain(received_a.clone(), "ambiance-off").await;
+    // Phase 2: ambiance idle loop running while TTS keeps pumping.
+    stream
+        .ensure_ambiance(
+            ambiance_option(wav_path.to_str().unwrap()),
+            SERVER_SIDE_TRACK_ID.to_string(),
+        )
+        .await?
+        .expect("ambiance loads");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    received_a.lock().await.clear();
+    received_b.lock().await.clear();
+    for i in 0..PACKETS {
+        stream.packet_sender.send(make_frame(i))?;
+    }
+    let on = drain(received_a.clone(), "ambiance-on").await;
+
+    let idle_frames_b = {
+        let packets = received_b.lock().await;
+        packets
+            .iter()
+            .filter(|p| p.track_id != SERVER_SIDE_TRACK_ID)
+            .count()
+    };
+
+    stream.stop(None, None);
+    handle.abort();
+
+    let off_per = off.as_micros() as f64 / PACKETS as f64;
+    let on_per = on.as_micros() as f64 / PACKETS as f64;
+    println!(
+        "forward fanout (2 sinks): ambiance-off {:.1} µs/packet, ambiance-on {:.1} µs/packet ({:.2}x), interleaved idle frames at second sink: {}",
+        off_per,
+        on_per,
+        on.as_secs_f64() / off.as_secs_f64(),
+        idle_frames_b
+    );
+
+    assert!(
+        Duration::from_micros(on_per as u64) < PER_PACKET_BUDGET,
+        "ambiance-on forward path {:.1} µs/packet exceeds {:.1} µs budget",
+        on_per,
+        PER_PACKET_BUDGET.as_micros() as f64
+    );
+    // TTS packets must fully suppress idle fill while flowing.
+    assert!(
+        idle_frames_b <= PACKETS / 100,
+        "idle ambiance leaked {} frames while TTS was pumping",
+        idle_frames_b
+    );
 
     Ok(())
 }

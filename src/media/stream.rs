@@ -1,7 +1,8 @@
 use crate::event::{EventSender, SessionEvent};
+use crate::media::ambiance::{AmbianceOption, AmbianceProcessor};
 use crate::media::dtmf::DtmfDetector;
 use crate::media::volume_control::HoldProcessor;
-use crate::media::{AudioFrame, Samples, TrackId};
+use crate::media::{AudioFrame, INTERNAL_SAMPLERATE, Samples, TrackId};
 use crate::media::{
     processor::Processor,
     recorder::{Recorder, RecorderOption},
@@ -10,6 +11,10 @@ use crate::media::{
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::{
+    Arc, Mutex as StdMutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::{
@@ -35,11 +40,19 @@ pub struct MediaStream {
     recorder_sender: mpsc::UnboundedSender<AudioFrame>,
     recorder_receiver: Mutex<Option<mpsc::UnboundedReceiver<AudioFrame>>>,
     recorder_handle: Mutex<Option<JoinHandle<()>>>,
+    ambiance: Mutex<Option<Arc<StdMutex<AmbianceProcessor>>>>,
+    ambiance_source_id: StdMutex<Option<TrackId>>,
+    last_server_packet_ts: Arc<AtomicU64>,
+    ambiance_idle_started: AtomicBool,
 }
 
 const CALLEE_TRACK_ID: &str = "callee-track";
 const QUEUE_HOLD_TRACK_ID: &str = "queue-hold-track";
 pub const SERVER_SIDE_TRACK_ID: &str = "server-side-track";
+const AMBIANCE_IDLE_TRACK_ID: &str = "ambiance-track";
+const AMBIANCE_IDLE_PTIME: Duration = Duration::from_millis(20);
+// Skip idle fill if server-side audio arrived within this window (TTS ptime is 20ms).
+const AMBIANCE_IDLE_GAP_MS: u64 = 25;
 
 pub struct MediaStreamBuilder {
     cancel_token: Option<CancellationToken>,
@@ -92,6 +105,10 @@ impl MediaStreamBuilder {
             recorder_sender,
             recorder_receiver: Mutex::new(Some(recorder_receiver)),
             recorder_handle: Mutex::new(None),
+            ambiance: Mutex::new(None),
+            ambiance_source_id: StdMutex::new(None),
+            last_server_packet_ts: Arc::new(AtomicU64::new(0)),
+            ambiance_idle_started: AtomicBool::new(false),
         }
     }
 }
@@ -117,6 +134,86 @@ impl MediaStream {
             }
         }
         Ok(())
+    }
+
+    /// Load ambiance once per call and keep mixing it while TTS/file playback is silent.
+    pub async fn ensure_ambiance(
+        &self,
+        option: AmbianceOption,
+        source_track_id: TrackId,
+    ) -> Result<Option<Arc<StdMutex<AmbianceProcessor>>>> {
+        let mut slot = self.ambiance.lock().await;
+        if let Some(existing) = slot.as_ref() {
+            return Ok(Some(existing.clone()));
+        }
+
+        if option.path.is_none() || option.enabled == Some(false) {
+            return Ok(None);
+        }
+
+        let processor = AmbianceProcessor::new(option).await?;
+        let shared = Arc::new(StdMutex::new(processor));
+        *slot = Some(shared.clone());
+        drop(slot);
+
+        *self.ambiance_source_id.lock().unwrap() = Some(source_track_id);
+        self.start_ambiance_idle_loop(shared.clone());
+        info!(session_id = self.id, "ambiance idle mixer started");
+        Ok(Some(shared))
+    }
+
+    fn start_ambiance_idle_loop(&self, processor: Arc<StdMutex<AmbianceProcessor>>) {
+        if self.ambiance_idle_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        let cancel_token = self.cancel_token.clone();
+        let packet_sender = self.packet_sender.clone();
+        let last_server_packet_ts = self.last_server_packet_ts.clone();
+        let session_id = self.id.clone();
+
+        crate::spawn(async move {
+            let mut ticker = tokio::time::interval(AMBIANCE_IDLE_PTIME);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = cancel_token.cancelled() => break,
+                    _ = ticker.tick() => {
+                        let now = crate::media::get_timestamp();
+                        let last = last_server_packet_ts.load(Ordering::Relaxed);
+                        if last != 0 && now.saturating_sub(last) < AMBIANCE_IDLE_GAP_MS {
+                            continue;
+                        }
+
+                        let mut frame = AudioFrame {
+                            track_id: AMBIANCE_IDLE_TRACK_ID.to_string(),
+                            samples: Samples::Empty,
+                            timestamp: now,
+                            sample_rate: INTERNAL_SAMPLERATE,
+                            channels: 1,
+                            ..Default::default()
+                        };
+                        {
+                            let mut ambiance = match processor.lock() {
+                                Ok(guard) => guard,
+                                Err(_) => break,
+                            };
+                            if let Err(e) = ambiance.process_frame(&mut frame) {
+                                warn!(session_id, "ambiance idle mix failed: {}", e);
+                                continue;
+                            }
+                        }
+                        if matches!(frame.samples, Samples::Empty) {
+                            continue;
+                        }
+                        if packet_sender.send(frame).is_err() {
+                            debug!(session_id, "ambiance idle sender closed");
+                            break;
+                        }
+                    }
+                }
+            }
+        });
     }
 
     pub fn stop(&self, _reason: Option<String>, _initiator: Option<String>) {
@@ -504,6 +601,18 @@ impl MediaStream {
     async fn handle_forward_track(&self, mut packet_receiver: TrackPacketReceiver) {
         let event_sender = self.event_sender.clone();
         while let Some(packet) = packet_receiver.recv().await {
+            if self
+                .ambiance_source_id
+                .lock()
+                .ok()
+                .and_then(|id| id.clone())
+                .as_ref()
+                == Some(&packet.track_id)
+            {
+                self.last_server_packet_ts
+                    .store(crate::media::get_timestamp(), Ordering::Relaxed);
+            }
+
             let suppressed = {
                 self.suppressed_sources
                     .lock()

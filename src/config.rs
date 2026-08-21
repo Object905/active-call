@@ -346,8 +346,9 @@ pub struct Config {
     /// Peer active-call nodes ("ip:port" of their HTTP/WS endpoint).
     ///
     /// When a websocket client connects with a session id that is not hosted on
-    /// this node, the node polls each peer and tunnels the websocket to the peer
-    /// that hosts the call. See [`Config::peers`].
+    /// this node, the originator (empty `forward`) polls each peer once
+    /// (`forward=true`) and tunnels the websocket to the peer that hosts the
+    /// call. Any request whose `forward` is set must not hop further.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<String>,
 

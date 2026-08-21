@@ -28,10 +28,11 @@ media_cache_path = "./config/mediacache"
 
 # Other active-call nodes in the cluster ("ip:port" of their HTTP/WS endpoint).
 # When a websocket client connects to /call with a session id that is NOT hosted
-# on this node, the node polls every peer and transparently tunnels the websocket
-# to the first peer that hosts the call. If no peer hosts it and the request is a
-# normal (non-forwarded) client connection, this node falls back to creating the
-# call locally as usual.
+# on this node, the node polls every peer (one hop, marked forward=true) and
+# tunnels the websocket to the first peer that hosts the call. A node that
+# receives forward=true answers locally only and never forwards again.
+# If no peer hosts it and the request is a normal (non-forwarded) client
+# connection, this node falls back to creating the call locally as usual.
 # peers = ["10.0.0.2:8080", "10.0.0.3:8080"]
 
 # external IP address for SIP signaling and media

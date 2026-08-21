@@ -2,6 +2,7 @@ use super::processor::Processor;
 use crate::media::{AudioFrame, INTERNAL_SAMPLERATE, Samples};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
 use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -185,5 +186,130 @@ impl Processor for AmbianceProcessor {
         }
 
         Ok(())
+    }
+}
+
+/// Share one loaded wav / playhead across the TTS mixer and the idle filler.
+#[derive(Clone)]
+pub struct SharedAmbianceProcessor {
+    inner: Arc<Mutex<AmbianceProcessor>>,
+}
+
+impl SharedAmbianceProcessor {
+    pub fn new(inner: Arc<Mutex<AmbianceProcessor>>) -> Self {
+        Self { inner }
+    }
+
+    pub fn inner(&self) -> Arc<Mutex<AmbianceProcessor>> {
+        self.inner.clone()
+    }
+}
+
+impl Processor for SharedAmbianceProcessor {
+    fn process_frame(&mut self, frame: &mut AudioFrame) -> Result<()> {
+        self.inner.lock().unwrap().process_frame(frame)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::media::AudioFrame;
+
+    fn loud_processor() -> AmbianceProcessor {
+        AmbianceProcessor {
+            samples: vec![8000i16; INTERNAL_SAMPLERATE as usize],
+            cursor: 0,
+            duck_level: 0.5,
+            normal_level: 1.0,
+            enabled: true,
+            current_level: 1.0,
+            transition_speed: 1.0,
+            resample_phase: 0,
+            resample_step: 1 << 16,
+        }
+    }
+
+    #[test]
+    fn empty_frame_becomes_ambiance_pcm() {
+        let mut processor = loud_processor();
+        let mut frame = AudioFrame {
+            track_id: "server-side-track".to_string(),
+            samples: Samples::Empty,
+            timestamp: 0,
+            sample_rate: INTERNAL_SAMPLERATE,
+            channels: 1,
+            ..Default::default()
+        };
+        processor.process_frame(&mut frame).unwrap();
+        match frame.samples {
+            Samples::PCM { samples } => {
+                assert_eq!(samples.len(), 320);
+                assert!(
+                    samples.iter().any(|s| *s != 0),
+                    "idle frame should carry ambiance"
+                );
+            }
+            other => panic!("expected PCM, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pcm_frame_is_mixed() {
+        let mut processor = loud_processor();
+        let mut frame = AudioFrame {
+            track_id: "server-side-track".to_string(),
+            samples: Samples::PCM {
+                samples: vec![1000; 320],
+            },
+            timestamp: 0,
+            sample_rate: INTERNAL_SAMPLERATE,
+            channels: 1,
+            ..Default::default()
+        };
+        processor.process_frame(&mut frame).unwrap();
+        match frame.samples {
+            Samples::PCM { samples } => {
+                assert!(
+                    samples.iter().any(|s| *s != 1000),
+                    "tts frame should mix ambiance"
+                );
+            }
+            other => panic!("expected PCM, got {:?}", other),
+        }
+    }
+
+    /// Cost of one idle tick (20ms frame mix) — the idle loop runs this 50x/s
+    /// per call. Skipped in debug builds (repo convention, see perf_analysis.rs).
+    #[test]
+    fn perf_idle_mix_cost() {
+        if cfg!(debug_assertions) {
+            println!("Skipping ambiance idle mix perf test in debug mode.");
+            return;
+        }
+        let mut processor = loud_processor();
+        let budget_us = 100.0;
+        let iterations = 10_000u32;
+
+        let start = std::time::Instant::now();
+        for i in 0..iterations {
+            let mut frame = AudioFrame {
+                track_id: "server-side-track".to_string(),
+                samples: Samples::Empty,
+                timestamp: i as u64,
+                sample_rate: INTERNAL_SAMPLERATE,
+                channels: 1,
+                ..Default::default()
+            };
+            processor.process_frame(&mut frame).unwrap();
+        }
+        let per_call_us = start.elapsed().as_micros() as f64 / iterations as f64;
+        println!("ambiance idle mix: {:.2} µs per 20ms frame", per_call_us);
+        assert!(
+            per_call_us < budget_us,
+            "idle mix {:.2} µs/frame exceeds {:.0} µs budget",
+            per_call_us,
+            budget_us
+        );
     }
 }

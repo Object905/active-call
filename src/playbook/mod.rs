@@ -3,7 +3,9 @@ use crate::media::recorder::RecorderOption;
 use crate::media::vad::VADOption;
 use crate::synthesis::SynthesisOption;
 use crate::transcription::TranscriptionOption;
-use crate::{EouOption, RealtimeOption, RingbackDetectionOption, SipOption, media::ambiance::AmbianceOption};
+use crate::{
+    EouOption, RealtimeOption, RingbackDetectionOption, SipOption, media::ambiance::AmbianceOption,
+};
 use anyhow::{Result, anyhow};
 use minijinja::Environment;
 use serde::{Deserialize, Serialize};

@@ -8,16 +8,12 @@ use active_call::{
     handler::peer::{try_forward, tunnel},
 };
 use axum::{
-    Router,
-    extract::WebSocketUpgrade,
-    http::StatusCode,
-    response::IntoResponse,
-    routing::get,
+    Router, extract::WebSocketUpgrade, http::StatusCode, response::IntoResponse, routing::get,
 };
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
-use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
 
 /// Start an axum server with `app`, return (join handle, bound port). The
 /// listener is bound before spawning so the port is guaranteed ready.
@@ -42,12 +38,9 @@ fn echo_peer_app() -> Router {
                     .await;
                 while let Some(Ok(msg)) = socket.next().await {
                     let reply = match msg {
-                        axum::extract::ws::Message::Text(t) => {
-                            Some(axum::extract::ws::Message::text(format!(
-                                "echo:{}",
-                                t.as_str()
-                            )))
-                        }
+                        axum::extract::ws::Message::Text(t) => Some(
+                            axum::extract::ws::Message::text(format!("echo:{}", t.as_str())),
+                        ),
                         axum::extract::ws::Message::Binary(b) => {
                             Some(axum::extract::ws::Message::binary(b))
                         }
@@ -124,7 +117,11 @@ async fn tunnel_relays_frames_bidirectionally() {
         .send(Message::Binary(vec![1, 2, 3, 4].into()))
         .await
         .unwrap();
-    let bin = client.next().await.expect("expected binary echo").expect("ok");
+    let bin = client
+        .next()
+        .await
+        .expect("expected binary echo")
+        .expect("ok");
     assert_eq!(bin, Message::Binary(vec![1, 2, 3, 4].into()));
 
     client.close(None).await.unwrap();
@@ -196,4 +193,109 @@ async fn try_forward_returns_none_when_all_peers_reject() {
         try_forward(&app_state, "sess-2", &params).await.is_none(),
         "expected None when no peer hosts the call"
     );
+}
+
+/// `forward` must be empty to hop. Any present value (`true` or `false`) is
+/// local-only, even when a peer would accept the websocket.
+#[tokio::test]
+async fn try_forward_only_when_forward_is_empty() {
+    let (_host_task, port_host) = spawn_axum(echo_peer_app()).await;
+
+    let mut config = Config::default();
+    config.addr = "127.0.0.1".to_string();
+    config.udp_port = 0;
+    config.http_addr = "0.0.0.0:8080".to_string();
+    config.media_cache_path = "./target/tmp_media_test".to_string();
+    config.peers = vec![format!("127.0.0.1:{port_host}")];
+    let app_state = AppStateBuilder::new()
+        .with_config(config)
+        .build()
+        .await
+        .expect("failed to build app state");
+
+    for forward in [Some(true), Some(false)] {
+        let params = CallParams {
+            id: Some("sess-nested".to_string()),
+            dump_events: None,
+            ping_interval: None,
+            server_side_track: None,
+            forward,
+            visited: None,
+        };
+        assert!(
+            try_forward(&app_state, "sess-nested", &params)
+                .await
+                .is_none(),
+            "forward={forward:?} must not hop to another peer"
+        );
+    }
+}
+
+/// Helper: build a full AppState-backed call router with no peers configured.
+async fn local_node_app_state() -> active_call::app::AppState {
+    let mut config = Config::default();
+    config.addr = "127.0.0.1".to_string();
+    config.udp_port = 0;
+    config.http_addr = "0.0.0.0:8080".to_string();
+    config.media_cache_path = "./target/tmp_media_test".to_string();
+    AppStateBuilder::new()
+        .with_config(config)
+        .build()
+        .await
+        .expect("failed to build app state")
+}
+
+/// A node receiving `forward=true` for a session it does not host must answer
+/// 404 (so the originator polls its next peer) and must NOT create the call.
+#[tokio::test]
+async fn forward_true_gets_404_and_does_not_create_call() {
+    let app_state = local_node_app_state().await;
+    let router = active_call::handler::call_router().with_state(app_state.clone());
+    let (_task, port) = spawn_axum(router).await;
+
+    let url = format!("ws://127.0.0.1:{port}/call?id=missing-session&forward=true");
+    let err = connect_async(url)
+        .await
+        .expect_err("forward=true with absent session must fail the handshake");
+
+    let status = match &err {
+        tokio_tungstenite::tungstenite::Error::Http(resp) => resp.status(),
+        other => panic!("expected HTTP error, got {other:?}"),
+    };
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    assert!(
+        app_state.active_calls.lock().unwrap().is_empty(),
+        "forward=true must not create a call locally"
+    );
+}
+
+/// Without any `forward` param and no peers configured, the node must fall
+/// back to creating the call locally (pre-forwarding behaviour preserved).
+#[tokio::test]
+async fn no_forward_creates_call_locally_when_no_peers() {
+    let app_state = local_node_app_state().await;
+    let router = active_call::handler::call_router().with_state(app_state.clone());
+    let (_task, port) = spawn_axum(router).await;
+
+    let url = format!("ws://127.0.0.1:{port}/call?id=local-session");
+    let (_ws, _resp) = connect_async(url)
+        .await
+        .expect("local call must be created");
+
+    // The call must be registered once the upgrade succeeded.
+    let mut registered = false;
+    for _ in 0..50 {
+        if app_state
+            .active_calls
+            .lock()
+            .unwrap()
+            .contains_key("local-session")
+        {
+            registered = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(registered, "call must be registered in active_calls");
 }

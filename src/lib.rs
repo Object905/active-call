@@ -6,11 +6,8 @@ use std::collections::HashMap;
 
 use crate::{
     media::{
-        agc::AGCOption,
-        ambiance::AmbianceOption,
-        recorder::RecorderOption,
-        track::media_pass::MediaPassOption,
-        vad::VADOption,
+        agc::AGCOption, ambiance::AmbianceOption, recorder::RecorderOption,
+        track::media_pass::MediaPassOption, vad::VADOption,
     },
     synthesis::SynthesisOption,
     transcription::TranscriptionOption,
@@ -23,9 +20,9 @@ pub mod config;
 pub mod event;
 pub mod handler;
 pub mod locator;
+pub mod main_builder;
 pub mod media;
 pub mod net_tool;
-pub mod main_builder;
 
 #[cfg(feature = "offline")]
 pub mod offline;

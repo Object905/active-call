@@ -1860,7 +1860,9 @@ impl LlmHandler {
                     .map(|text| text.trim().is_empty())
                     .unwrap_or(true)
             {
-                warn!("Reached RAG iteration limit with tool-only response; suppressing raw tool JSON");
+                warn!(
+                    "Reached RAG iteration limit with tool-only response; suppressing raw tool JSON"
+                );
                 break None;
             }
 
