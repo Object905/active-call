@@ -4,6 +4,7 @@ Cargo.lock
 /config/cdr
 /config/recorders
 /config/playbook
+__pycache__
 .env
 *.decoded
 *.encoded

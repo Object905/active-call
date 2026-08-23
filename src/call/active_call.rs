@@ -789,7 +789,10 @@ impl ActiveCall {
                     cmd = cmd_receiver.recv() => {
                         match cmd {
                             Ok(command) => {
-                                if let Err(e) = me.dispatch(&mut runtime, command).await {
+                                // Box::pin keeps the deep do_* future tree off
+                                // the select's stack frame (debug builds overflow
+                                // otherwise).
+                                if let Err(e) = Box::pin(me.dispatch(&mut runtime, command)).await {
                                     warn!(session_id = me.session_id, "{}", e);
                                     me.event_sender
                                         .send(SessionEvent::Error {
@@ -811,7 +814,7 @@ impl ActiveCall {
                     }
                     ev = event_receiver.recv() => {
                         match ev {
-                            Ok(event) => me.handle_event(&mut runtime, event).await,
+                            Ok(event) => Box::pin(me.handle_event(&mut runtime, event)).await,
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                             Err(_) => {
                                 info!(session_id = me.session_id, "event loop done");
@@ -820,7 +823,7 @@ impl ActiveCall {
                         }
                     }
                     Some(msg) = actor_rx.recv() => {
-                        if let Err(e) = me.handle_actor_msg(msg).await {
+                        if let Err(e) = Box::pin(me.handle_actor_msg(msg)).await {
                             warn!(session_id = me.session_id, "{}", e);
                             me.event_sender
                                 .send(SessionEvent::Error {
@@ -834,7 +837,7 @@ impl ActiveCall {
                         }
                     }
                     _ = ticker.tick() => {
-                        me.check_input_timeout(&mut runtime).await;
+                        Box::pin(me.check_input_timeout(&mut runtime)).await;
                     }
                     _ = &mut media_serve => {
                         info!(session_id = me.session_id, "media stream loop done");
