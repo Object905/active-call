@@ -1,4 +1,5 @@
 use crate::{
+    callrecord::CallRecordHangupReason,
     event::{EventSender, SessionEvent},
     media::{
         AudioFrame, Samples, cache,
@@ -87,6 +88,10 @@ struct TtsTask {
     cache_enabled: bool,
     sample_rate: u32,
     ptime: Duration,
+    /// Hangup intent carried by this track; armed via the initial track config
+    /// or a command with `auto_hangup: Some(true)`. Reported on natural
+    /// completion only (a cancelled track was interrupted, so the intent is void).
+    hangup_reason: Option<CallRecordHangupReason>,
     cache_buffer: BytesMut,
     emit_q: VecDeque<EmitEntry>,
     // metadatas for each tts command
@@ -131,6 +136,7 @@ impl TtsTask {
                         duration: crate::media::get_timestamp() - start_time,
                         ssrc: self.ssrc,
                         play_id: self.play_id.clone(),
+                        auto_hangup: self.hangup_reason.clone(),
                     })
                     .ok();
                 return Err(e);
@@ -424,6 +430,9 @@ impl TtsTask {
                         if cmd.option.session_id.is_none() {
                             cmd.option.session_id = Some(self.session_id.clone());
                         }
+                        if cmd.auto_hangup == Some(true) {
+                            self.hangup_reason = Some(CallRecordHangupReason::BySystem);
+                        }
                         self.handle_cmd(cmd, cmd_seq).await;
                         cmd_seq.as_mut().map(|seq| *seq += 1);
                     }
@@ -489,6 +498,11 @@ impl TtsTask {
                 duration: crate::media::get_timestamp() - start_time,
                 ssrc: self.ssrc,
                 play_id: self.play_id.clone(),
+                auto_hangup: if cancel_received {
+                    None
+                } else {
+                    self.hangup_reason.clone()
+                },
             })
             .inspect_err(|e| {
                 tracing::warn!(
@@ -889,6 +903,8 @@ pub struct TtsTrack {
     command_rx: Mutex<Option<SynthesisCommandReceiver>>,
     client: Mutex<Option<Box<dyn SynthesisClient>>>,
     ssrc: u32,
+    /// Initial hangup intent for the track (first command's `auto_hangup`).
+    hangup_reason: Option<CallRecordHangupReason>,
     graceful: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     min_buffer_duration: Duration,
@@ -936,15 +952,25 @@ impl TtsTrack {
             command_rx: Mutex::new(Some(command_rx)),
             use_cache: true,
             client: Mutex::new(Some(client)),
+            ssrc: 0,
+            hangup_reason: None,
             graceful: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
-            ssrc: 0,
             min_buffer_duration: Duration::from_millis(200), // Default 200ms
             max_buffer_wait: Duration::from_millis(500),     // Default 500ms
         }
     }
     pub fn with_ssrc(mut self, ssrc: u32) -> Self {
         self.ssrc = ssrc;
+        self
+    }
+    /// Arm the hangup intent from the first command's `auto_hangup` flag.
+    pub fn with_auto_hangup(mut self, auto_hangup: Option<bool>) -> Self {
+        self.hangup_reason = if auto_hangup == Some(true) {
+            Some(CallRecordHangupReason::BySystem)
+        } else {
+            None
+        };
         self
     }
     pub fn with_config(mut self, config: TrackConfig) -> Self {
@@ -1048,6 +1074,7 @@ impl Track for TtsTrack {
             graceful: self.graceful.clone(),
             paused: self.paused.clone(),
             ssrc: self.ssrc,
+            hangup_reason: self.hangup_reason.clone(),
             buffering_state: Some(Instant::now()),
             min_buffer_size: (self.config.samplerate as usize
                 * 2
@@ -1166,6 +1193,7 @@ mod tests {
             graceful: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
             ssrc: 1234,
+            hangup_reason: None,
             buffering_state: Some(Instant::now()),
             min_buffer_size,
             max_buffer_wait: Duration::from_secs(10),
@@ -1272,6 +1300,7 @@ mod tests {
             graceful: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
             ssrc: 5678,
+            hangup_reason: None,
             buffering_state: Some(Instant::now()),
             min_buffer_size,
             max_buffer_wait: Duration::from_secs(10),
@@ -1353,6 +1382,7 @@ mod tests {
             graceful: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
             ssrc: 9999,
+            hangup_reason: None,
             buffering_state: Some(Instant::now()),
             min_buffer_size,
             max_buffer_wait: Duration::from_secs(10),
@@ -1443,6 +1473,7 @@ mod tests {
             graceful: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
             ssrc: 1111,
+            hangup_reason: None,
             buffering_state: Some(Instant::now()),
             min_buffer_size,
             max_buffer_wait: Duration::from_secs(10),
@@ -1537,6 +1568,7 @@ mod tests {
             graceful: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
             ssrc: 7777,
+            hangup_reason: None,
             buffering_state: Some(Instant::now()), // Initial buffering
             min_buffer_size,
             max_buffer_wait: Duration::from_millis(500),
@@ -1558,6 +1590,7 @@ mod tests {
                 base64: false,
                 end_of_stream: false,
                 cache_key: None,
+                auto_hangup: None,
                 option: crate::synthesis::SynthesisOption::default(),
             })
             .unwrap();
@@ -1611,6 +1644,7 @@ mod tests {
                 base64: false,
                 end_of_stream: false,
                 cache_key: None,
+                auto_hangup: None,
                 option: crate::synthesis::SynthesisOption::default(),
             })
             .unwrap();
@@ -1670,6 +1704,7 @@ mod tests {
                 base64: false,
                 end_of_stream: false,
                 cache_key: None,
+                auto_hangup: None,
                 option: crate::synthesis::SynthesisOption::default(),
             })
             .unwrap();
@@ -1752,6 +1787,7 @@ mod tests {
             graceful: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
             ssrc: 8888,
+            hangup_reason: None,
             buffering_state: Some(Instant::now()),
             min_buffer_size,
             max_buffer_wait: Duration::from_millis(500),
@@ -1771,6 +1807,7 @@ mod tests {
                 base64: false,
                 end_of_stream: false,
                 cache_key: None,
+                auto_hangup: None,
                 option: crate::synthesis::SynthesisOption::default(),
             })
             .unwrap();
@@ -1869,6 +1906,7 @@ mod tests {
             graceful: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
             ssrc: 9999,
+            hangup_reason: None,
             buffering_state: Some(Instant::now()),
             min_buffer_size,
             max_buffer_wait: Duration::from_millis(500),
@@ -1984,6 +2022,7 @@ mod tests {
             graceful: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
             ssrc: 1010,
+            hangup_reason: None,
             buffering_state: Some(Instant::now()),
             min_buffer_size,
             max_buffer_wait: Duration::from_millis(500),
@@ -2004,6 +2043,7 @@ mod tests {
                 base64: false,
                 end_of_stream: false,
                 cache_key: None,
+                auto_hangup: None,
                 option: crate::synthesis::SynthesisOption::default(),
             })
             .unwrap();
@@ -2044,6 +2084,7 @@ mod tests {
                 base64: false,
                 end_of_stream: false,
                 cache_key: None,
+                auto_hangup: None,
                 option: crate::synthesis::SynthesisOption::default(),
             })
             .unwrap();

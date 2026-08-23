@@ -340,6 +340,7 @@ impl Track for MediaPassTrack {
                     duration,
                     ssrc,
                     play_id: None,
+                    auto_hangup: None,
                 })
                 .ok();
         });

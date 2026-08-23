@@ -161,6 +161,9 @@ pub enum SessionEvent {
         duration: u64,
         ssrc: u32,
         play_id: Option<String>,
+        /// Hangup intent carried by the track itself; when set, the call
+        /// should hang up with this reason once the track ends.
+        auto_hangup: Option<crate::callrecord::CallRecordHangupReason>,
     },
     Interruption {
         track_id: String,

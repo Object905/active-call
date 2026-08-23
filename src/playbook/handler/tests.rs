@@ -595,6 +595,7 @@ async fn test_follow_up_logic() -> Result<()> {
         play_id: None,
         duration: 100,
         ssrc: 0,
+        auto_hangup: None,
     };
     handler.on_event(&event).await?;
     assert!(
@@ -626,6 +627,7 @@ async fn test_follow_up_logic() -> Result<()> {
         play_id: None,
         duration: 100,
         ssrc: 0,
+        auto_hangup: None,
     };
     handler.on_event(&event).await?;
 

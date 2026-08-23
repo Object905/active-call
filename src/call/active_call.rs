@@ -53,7 +53,6 @@ pub enum PendingCallerTrack {
 mod tests {
     use super::*;
     use crate::app::AppStateBuilder;
-    use crate::callrecord::CallRecordHangupReason;
     use crate::config::Config;
     use crate::media::track::tts::SynthesisHandle;
     use crate::synthesis::SynthesisCommand;
@@ -115,21 +114,10 @@ mod tests {
             })
             .await?;
 
-        // 3. Verify auto_hangup state uses the EXISTING SSRC
-        {
-            let auto_hangup = active_call.auto_hangup_value();
-            assert!(auto_hangup.is_some());
-            let (h_ssrc, reason) = auto_hangup.unwrap();
-            assert_eq!(
-                h_ssrc, initial_ssrc,
-                "SSRC should be reused from existing handle"
-            );
-            assert_eq!(reason, CallRecordHangupReason::BySystem);
-        }
-
-        // 4. Verify command was sent to existing channel
+        // 3. Verify the hangup intent rides on the command sent to the existing track
         let cmd = rx.try_recv().expect("Should have received tts command");
         assert_eq!(cmd.text, "hangup now");
+        assert_eq!(cmd.auto_hangup, Some(true));
 
         Ok(())
     }
@@ -165,11 +153,14 @@ mod tests {
             })
             .await?;
 
-        // Verify auto_hangup uses a NEW SSRC (because it should interrupt and start fresh)
+        // Verify a NEW track was started (new handle with a different ssrc,
+        // because a different play_id interrupts and starts fresh)
         {
-            let (h_ssrc, _) = active_call.auto_hangup_value().unwrap();
+            let handle = active_call.tts_handle.load_full();
+            assert!(handle.is_some(), "new tts handle should be stored");
+            let handle = handle.unwrap();
             assert_ne!(
-                h_ssrc, initial_ssrc,
+                handle.ssrc, initial_ssrc,
                 "Should use a new SSRC for different play_id"
             );
         }
@@ -553,8 +544,6 @@ pub struct ActiveCall {
     pub current_play_id: ArcSwapOption<String>,
     /// Live TTS handle (shared so spawned tasks and post-serve cleanup can drop it).
     pub tts_handle: ArcSwapOption<SynthesisHandle>,
-    /// (ssrc, reason) — hang up automatically when that track ends.
-    pub auto_hangup: ArcSwapOption<(u32, CallRecordHangupReason)>,
     /// Shared state of the refer leg, when one is active.
     pub refer_leg: ArcSwapOption<LegShared>,
     /// Answer prepared during ringing (SDP + running track + dialog); taken
@@ -604,14 +593,6 @@ impl ActiveCall {
 
     pub fn set_current_play(&self, v: Option<String>) {
         self.current_play_id.store(v.map(Arc::new));
-    }
-
-    pub fn auto_hangup_value(&self) -> Option<(u32, CallRecordHangupReason)> {
-        self.auto_hangup.load_full().map(|v| (*v).clone())
-    }
-
-    pub fn set_auto_hangup(&self, v: Option<(u32, CallRecordHangupReason)>) {
-        self.auto_hangup.store(v.map(Arc::new));
     }
 
     pub fn refer_leg_value(&self) -> Option<LegShared> {
@@ -815,7 +796,6 @@ impl ActiveCall {
             moh: ArcSwapOption::new(None),
             current_play_id: ArcSwapOption::new(None),
             tts_handle: ArcSwapOption::new(None),
-            auto_hangup: ArcSwapOption::new(None),
             refer_leg: ArcSwapOption::new(None),
             ready_to_answer: ArcSwapOption::new(None),
             refer_call_token: ArcSwapOption::new(None),
@@ -982,6 +962,7 @@ impl ActiveCall {
                 track_id,
                 play_id,
                 ssrc,
+                auto_hangup,
                 ..
             } => {
                 if track_id != self.server_side_track_id {
@@ -999,7 +980,6 @@ impl ActiveCall {
                 }
                 self.set_current_play(None);
                 let moh_path = self.moh_path();
-                let auto_hangup = self.auto_hangup_value();
                 let wait_timeout_val = self.take_wait_input_timeout();
 
                 if let Some(path) = moh_path {
@@ -1011,16 +991,14 @@ impl ActiveCall {
                     return;
                 }
 
-                if let Some((hangup_ssrc, hangup_reason)) = auto_hangup {
-                    if hangup_ssrc == ssrc {
-                        info!(
-                            session_id = self.session_id,
-                            ssrc, "auto hangup when track end track_id:{}", track_id
-                        );
-                        self.do_hangup(Some(hangup_reason), None, None, None)
-                            .await
-                            .ok();
-                    }
+                if let Some(hangup_reason) = auto_hangup {
+                    info!(
+                        session_id = self.session_id,
+                        ssrc, "auto hangup when track end track_id:{}", track_id
+                    );
+                    self.do_hangup(Some(hangup_reason), None, None, None)
+                        .await
+                        .ok();
                 }
 
                 if let Some(timeout) = wait_timeout_val {
@@ -1571,6 +1549,7 @@ impl ActiveCall {
             option: tts_option,
             base64,
             cache_key,
+            auto_hangup,
         };
         info!(
             session_id = self.session_id,
@@ -1614,21 +1593,8 @@ impl ActiveCall {
             let _ = self.do_interrupt(false).await;
         }
 
-        // Set auto_hangup AFTER potential interrupt to avoid it being cleared by do_interrupt().
-        // Only preserve auto_hangup when reusing the same handle (same play_id).
-        // When starting a new track or interrupting, clear stale auto_hangup.
-        {
-            let has_handle = self.tts_handle.load_full().is_some();
-            let preserved = if has_handle && !should_interrupt {
-                self.auto_hangup_value()
-            } else {
-                None
-            };
-            self.set_auto_hangup(match auto_hangup {
-                Some(true) => Some((picked_ssrc, CallRecordHangupReason::BySystem)),
-                _ => preserved,
-            });
-        }
+        // auto_hangup rides on the track: armed via `with_auto_hangup` when a
+        // new track is created, or by the command itself for an existing track.
 
         let existing_handle = self.tts_handle.load_full();
         if let Some(tts_handle) = existing_handle {
@@ -1649,6 +1615,7 @@ impl ActiveCall {
             play_id.clone(),
             streaming,
             &play_command.option,
+            play_command.auto_hangup,
         )
         .await?;
 
@@ -1680,7 +1647,8 @@ impl ActiveCall {
         // make_file_track uses the path as play_id; honor an explicit play_id here.
         let mut file_track = self
             .make_file_track(url, ssrc)
-            .with_play_id(play_id.clone());
+            .with_play_id(play_id.clone())
+            .with_auto_hangup(auto_hangup);
 
         if let Some(offset) = offset_ms {
             file_track = file_track.with_offset_ms(offset);
@@ -1688,10 +1656,6 @@ impl ActiveCall {
 
         {
             self.tts_handle.store(None);
-            self.set_auto_hangup(match auto_hangup {
-                Some(true) => Some((ssrc, CallRecordHangupReason::BySystem)),
-                _ => None,
-            });
             self.set_wait_input_timeout(wait_input_timeout);
         }
 
@@ -1727,7 +1691,6 @@ impl ActiveCall {
         {
             self.tts_handle.store(None);
             self.set_moh(None);
-            self.set_auto_hangup(None);
         }
         self.media_stream
             .remove_track(&self.server_side_track_id, graceful)
@@ -1963,11 +1926,7 @@ impl ActiveCall {
             .and_then(|o| o.auto_hangup)
             .unwrap_or(true);
 
-        self.set_auto_hangup(if auto_hangup_requested {
-            Some((ssrc, CallRecordHangupReason::ByRefer))
-        } else {
-            None
-        });
+        // auto_hangup rides on the refer leg's TrackEnd (InviteDialogStates).
 
         // Setup ASR resume after refer ends (if not auto_hangup and ASR was paused)
         if !auto_hangup_requested && pause_parent_asr && original_asr_option.is_some() {
@@ -2011,6 +1970,7 @@ impl ActiveCall {
                 invite_option,
                 call_option,
                 moh,
+                auto_hangup: auto_hangup_requested,
             };
             let result = match tokio::time::timeout(
                 Duration::from_secs(timeout_secs as u64),

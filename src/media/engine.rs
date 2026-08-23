@@ -260,6 +260,7 @@ impl StreamEngine {
         play_id: Option<String>,
         streaming: bool,
         tts_option: &SynthesisOption,
+        auto_hangup: Option<bool>,
     ) -> Result<(SynthesisHandle, Box<dyn Track>)> {
         let (tx, rx) = mpsc::unbounded_channel();
         let new_handle = SynthesisHandle::new(tx, play_id.clone(), ssrc);
@@ -267,6 +268,7 @@ impl StreamEngine {
         let sample_rate = tts_option.samplerate.unwrap_or(16000) as u32;
         let tts_track = TtsTrack::new(track_id, session_id, streaming, play_id, rx, tts_client)
             .with_ssrc(ssrc)
+            .with_auto_hangup(auto_hangup)
             .with_sample_rate(sample_rate)
             .with_cancel_token(cancel_token);
         Ok((new_handle, Box::new(tts_track) as Box<dyn Track>))

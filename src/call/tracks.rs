@@ -45,6 +45,8 @@ pub(super) struct OutgoingLeg {
     pub call_option: CallOption,
     /// Music-on-hold path to play while the INVITE is in flight.
     pub moh: Option<String>,
+    /// Refer legs with `auto_hangup`: hang up the parent call when this leg ends.
+    pub auto_hangup: bool,
 }
 
 impl ActiveCall {
@@ -356,6 +358,7 @@ impl ActiveCall {
                     invite_option,
                     call_option: option.clone(),
                     moh: None,
+                    auto_hangup: false,
                 };
                 match self.create_outgoing_sip_track(out).await {
                     Ok(answer) => {
@@ -670,6 +673,7 @@ impl ActiveCall {
             self.media_stream.clone(),
             out.leg.clone(),
             out.cancel_token.clone(),
+            out.auto_hangup.then_some(crate::callrecord::CallRecordHangupReason::ByRefer),
         );
 
         let hangup_headers = out
@@ -805,6 +809,7 @@ impl ActiveCall {
             self.media_stream.clone(),
             self.leg(),
             self.cancel_token.clone(),
+            None,
         );
 
         let initial_request = pending_dialog.dialog.initial_request();

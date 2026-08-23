@@ -1,18 +1,3 @@
-//! Lock-free call state.
-//!
-//! The call state is split by access pattern instead of living behind one big
-//! `Arc<RwLock<ActiveCallState>>`:
-//!
-//! * [`CallProgress`] — lifecycle snapshot of one call leg (main or refer),
-//!   shared as `Arc<ArcSwap<_>>`. Low-frequency writes at transition points,
-//!   lock-free snapshot reads from any context (including synchronous `Drop`).
-//! * [`Extras`] — playbook/session variables, shared as `Arc<ArcSwap<_>>` for
-//!   high-frequency small updates (`set_var`) and lock-free reads.
-//! * [`LegShared`] — bundle of the immutable per-leg bits (`ssrc`, `is_refer`)
-//!   plus the leg's progress/extras, handed to the dialog event loop.
-//! * [`CallRuntime`] — remaining mutable state owned exclusively by the call's
-//!   actor task (`serve`), so plain fields replace locks.
-
 use crate::CallOption;
 use crate::app::AppState;
 use crate::call::active_call::ActiveCallType;
@@ -27,13 +12,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-/// Lock-free shared variables (playbook variables, SIP headers, hangup headers).
 pub type Extras = Arc<ArcSwap<HashMap<String, Value>>>;
 
-/// Lifecycle progress of one call leg (main leg or refer leg).
 #[derive(Clone, Debug, Default)]
 pub struct CallProgress {
-    /// SIP dialog id once known (set on `Calling`/`Confirmed`).
     pub session_id: String,
     pub start_time: Option<DateTime<Utc>>,
     pub ring_time: Option<DateTime<Utc>>,
@@ -45,40 +27,34 @@ pub struct CallProgress {
 }
 
 impl CallProgress {
-    /// First provisional response observed: record ring time and status.
     pub fn on_early(&mut self, code: u16) {
         self.ring_time.get_or_insert_with(Utc::now);
         self.last_status_code = code;
     }
 
-    /// Dialog confirmed (200 OK): record answer time and status.
     pub fn on_confirmed(&mut self, session_id: String) {
         self.session_id = session_id;
         self.answer_time.get_or_insert_with(Utc::now);
         self.last_status_code = 200;
     }
 
-    /// Call answered by a local track (websocket/webrtc): no dialog id change.
     pub fn on_answered(&mut self) {
         self.answer_time.get_or_insert_with(Utc::now);
         self.last_status_code = 200;
     }
 
-    /// Store an answer SDP only if none was stored yet (keeps early-media SDP).
     pub fn try_set_answer(&mut self, sdp: &str) {
         if self.answer.is_none() {
             self.answer = Some(sdp.to_string());
         }
     }
 
-    /// Set the hangup reason unless one was already recorded.
     pub fn set_hangup_reason(&mut self, reason: CallRecordHangupReason) {
         if self.hangup_reason.is_none() {
             self.hangup_reason = Some(reason);
         }
     }
 
-    /// Merge `option` with the stored one (stored values fill missing fields).
     pub fn merge_option(&self, mut option: CallOption) -> CallOption {
         if let Some(existing) = &self.option {
             if option.asr.is_none() {
@@ -115,8 +91,6 @@ impl CallProgress {
         option
     }
 
-    /// Map a dialog termination reason to the status code / hangup reason /
-    /// initiator triple in a single match so new variants only touch one place.
     pub fn termination(reason: Option<&TerminatedReason>) -> TerminationInfo {
         match reason {
             Some(TerminatedReason::UacCancel) => {
@@ -148,7 +122,6 @@ impl CallProgress {
     }
 }
 
-/// Result of mapping a [`TerminatedReason`] onto call-record fields.
 pub struct TerminationInfo {
     pub status_code: u16,
     pub hangup_reason: CallRecordHangupReason,
@@ -169,7 +142,6 @@ impl TerminationInfo {
     }
 }
 
-/// Lock-free shared state of one SIP leg (main call or refer leg).
 #[derive(Clone)]
 pub struct LegShared {
     pub ssrc: u32,
@@ -188,7 +160,6 @@ impl LegShared {
         }
     }
 
-    /// Apply a progress mutation under the swap (retries on contention).
     pub fn update_progress(&self, f: impl Fn(&mut CallProgress)) {
         self.progress.rcu(|p| {
             let mut p = CallProgress::clone(p);
@@ -197,7 +168,6 @@ impl LegShared {
         });
     }
 
-    /// Insert/overwrite one extras variable.
     pub fn set_extra(&self, key: &str, value: Value) {
         self.extras.rcu(|e| {
             let mut e = HashMap::clone(e);
@@ -206,20 +176,17 @@ impl LegShared {
         });
     }
 
-    /// Build the `Hangup` session event from the current snapshots.
     pub fn build_hangup_event(&self, track_id: TrackId, initiator: Option<String>) -> SessionEvent {
         let progress = self.progress.load_full();
         let extras = self.extras.load_full();
         build_hangup_event(&progress, &extras, self.is_refer, track_id, initiator)
     }
 
-    /// Build the call record from the current snapshots (never blocks).
     pub fn build_callrecord(&self, app_state: &AppState, call_type: ActiveCallType) -> CallRecord {
         let session_id = self.progress.load_full().session_id.clone();
         self.build_callrecord_with_id(app_state, call_type, session_id)
     }
 
-    /// Same as [`Self::build_callrecord`] with an explicit record id.
     pub fn build_callrecord_with_id(
         &self,
         app_state: &AppState,
@@ -232,7 +199,6 @@ impl LegShared {
     }
 }
 
-/// Free-function variant usable without a `LegShared` (e.g. from `Drop`).
 pub fn build_hangup_event(
     progress: &CallProgress,
     extras: &HashMap<String, Value>,
@@ -259,8 +225,6 @@ pub fn build_hangup_event(
     }
 }
 
-/// Build a call record from snapshots; `refer_leg` (when present) contributes
-/// the nested refer record.
 pub fn build_callrecord(
     progress: &CallProgress,
     extras: &HashMap<String, Value>,
@@ -322,11 +286,6 @@ pub fn build_callrecord(
     }
 }
 
-/// Resolve the final answer SDP for an outgoing INVITE, falling back to the
-/// early-media (183) SDP when the 200 OK carries no body.
-///
-/// Returns `(sdp, remote_description_already_applied)`; `Err` when there is no
-/// answer at all.
 pub fn resolve_final_answer(
     raw: Option<Vec<u8>>,
     early: Option<&String>,
@@ -350,8 +309,6 @@ pub fn resolve_final_answer(
     }
 }
 
-/// Messages delivered back to the call actor by spawned background work
-/// (e.g. the refer INVITE leg, which must not block event processing).
 pub enum ActorMsg {
     ReferDone {
         track_id: TrackId,
@@ -360,19 +317,9 @@ pub enum ActorMsg {
     },
 }
 
-/// Mutable state owned exclusively by the call actor task (`serve`).
-/// Plain fields — the borrow checker replaces locks here.
-///
-/// Only truly loop-internal state lives here; state that must survive the
-/// actor (or be visible to teardown paths like `cleanup`) lives on
-/// `ActiveCall` as lock-free `ArcSwap` slots instead.
 pub struct CallRuntime {
-    /// (start_timestamp_ms, timeout_secs) for wait-input silence detection.
     pub input_timeout_expire: (u64, u32),
-    /// Sender for background tasks to notify the actor loop.
     pub actor_tx: mpsc::Sender<ActorMsg>,
-    /// The actor's own strong handle, set when `serve` starts; lets commands
-    /// spawn background work (e.g. the refer INVITE) that calls back into the call.
     pub me: Option<crate::call::active_call::ActiveCallRef>,
 }
 

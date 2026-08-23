@@ -1,4 +1,5 @@
 use crate::call::state::{CallProgress, LegShared};
+use crate::callrecord::CallRecordHangupReason;
 use crate::event::EventSender;
 use crate::media::TrackId;
 use crate::media::stream::MediaStream;
@@ -90,6 +91,9 @@ pub(super) struct InviteDialogStates {
     pub media_stream: Arc<MediaStream>,
     pub terminated_reason: Option<TerminatedReason>,
     pub has_early_media: bool,
+    /// Hangup intent carried by this leg (refer legs with `auto_hangup`),
+    /// reported on the leg's TrackEnd so the call actor can hang up.
+    pub hangup_reason: Option<CallRecordHangupReason>,
 }
 
 impl InviteDialogStates {
@@ -101,6 +105,7 @@ impl InviteDialogStates {
         media_stream: Arc<MediaStream>,
         leg: LegShared,
         cancel_token: CancellationToken,
+        hangup_reason: Option<CallRecordHangupReason>,
     ) -> Self {
         Self {
             is_client,
@@ -112,6 +117,7 @@ impl InviteDialogStates {
             media_stream,
             terminated_reason: None,
             has_early_media: false,
+            hangup_reason,
         }
     }
 }
@@ -140,6 +146,7 @@ impl InviteDialogStates {
                     .unwrap_or_default() as u64,
                 ssrc: self.leg.ssrc,
                 play_id: None,
+                auto_hangup: self.hangup_reason.clone(),
             })
             .ok();
         let hangup_event = self
@@ -594,6 +601,7 @@ mod tests {
             media_stream,
             terminated_reason: None,
             has_early_media,
+            hangup_reason: None,
         }
     }
 

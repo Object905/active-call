@@ -1,3 +1,4 @@
+use crate::callrecord::CallRecordHangupReason;
 use crate::event::{EventSender, SessionEvent};
 use crate::media::processor::ProcessorChain;
 use crate::media::{AudioFrame, PcmBuf, Samples, TrackId};
@@ -249,6 +250,9 @@ pub struct FileTrack {
     use_cache: bool,
     ssrc: u32,
     offset_ms: u32,
+    /// Hangup intent: hang up the call when this file finishes playing
+    /// (natural completion only, not when cancelled/interrupted).
+    hangup_reason: Option<CallRecordHangupReason>,
     paused: Arc<AtomicBool>,
 }
 
@@ -265,6 +269,7 @@ impl FileTrack {
             use_cache: true,
             ssrc: 0,
             offset_ms: 0,
+            hangup_reason: None,
             paused: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -310,6 +315,16 @@ impl FileTrack {
 
     pub fn with_offset_ms(mut self, offset_ms: u32) -> Self {
         self.offset_ms = offset_ms;
+        self
+    }
+
+    /// Arm the hangup intent from the play command's `auto_hangup` flag.
+    pub fn with_auto_hangup(mut self, auto_hangup: Option<bool>) -> Self {
+        self.hangup_reason = if auto_hangup == Some(true) {
+            Some(CallRecordHangupReason::BySystem)
+        } else {
+            None
+        };
         self
     }
 }
@@ -364,6 +379,7 @@ impl Track for FileTrack {
         let paused = self.paused.clone();
         // Spawn async task to handle file streaming
         let play_id = self.play_id.clone();
+        let hangup_reason = self.hangup_reason.clone();
         crate::spawn(async move {
             let res = async move {
                 // Load (and cache) the decoded PCM so we don't re-download or
@@ -395,6 +411,7 @@ impl Track for FileTrack {
                                 duration: crate::media::get_timestamp() - start_time,
                                 ssrc,
                                 play_id: play_id.clone(),
+                                auto_hangup: hangup_reason.clone(),
                             })
                             .ok();
                         return Err(e);
@@ -408,7 +425,7 @@ impl Track for FileTrack {
                     sample_rate,
                     &id,
                     packet_duration_ms,
-                    token,
+                    token.clone(),
                     paused,
                     packet_sender,
                 )
@@ -436,6 +453,11 @@ impl Track for FileTrack {
                         duration: crate::media::get_timestamp() - start_time,
                         ssrc,
                         play_id,
+                        auto_hangup: if token.is_cancelled() {
+                            None
+                        } else {
+                            hangup_reason
+                        },
                     })
                     .ok();
                 Ok::<(), anyhow::Error>(())

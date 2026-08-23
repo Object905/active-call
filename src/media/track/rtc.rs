@@ -744,6 +744,7 @@ impl Track for RtcTrack {
                     duration: crate::media::get_timestamp() - start_time,
                     ssrc,
                     play_id: None,
+                    auto_hangup: None,
                 });
             });
         }
