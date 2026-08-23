@@ -126,7 +126,6 @@ pub async fn call_handler_core(
         dump_events,
         server_side_track,
         extras,
-        None,
     ));
 
     // Load playbook: prefer direct parameter, fall back to pending_playbooks
@@ -158,22 +157,24 @@ pub async fn call_handler_core(
                     if call_type == ActiveCallType::Sip {
                         if let Some(sip_config) = &playbook.config.sip {
                             if let Some(allowed_headers) = &sip_config.extract_headers {
-                                let mut state = active_call.call_state.write().await;
-                                if let Some(extras) = &mut state.extras {
-                                    filter_headers(extras, allowed_headers);
-                                    // Store the list of SIP header keys for later template rendering
-                                    let header_keys: Vec<String> = extras
-                                        .keys()
-                                        .filter(|k| !k.starts_with('_'))
-                                        .cloned()
-                                        .collect();
-                                    extras.insert(
-                                        "_sip_header_keys".to_string(),
-                                        serde_json::to_value(&header_keys).unwrap_or_default(),
-                                    );
-                                    if let Ok(result) = playbook.render(extras) {
-                                        playbook = result;
-                                    }
+                                let extras = active_call.extras.rcu(|e| {
+                                    let mut e = HashMap::clone(e);
+                                    filter_headers(&mut e, allowed_headers);
+                                    e
+                                });
+                                // Store the list of SIP header keys for later template rendering
+                                let header_keys: Vec<String> = extras
+                                    .keys()
+                                    .filter(|k| !k.starts_with('_'))
+                                    .cloned()
+                                    .collect();
+                                active_call.set_extra(
+                                    "_sip_header_keys",
+                                    serde_json::to_value(&header_keys).unwrap_or_default(),
+                                );
+                                if let Ok(result) = playbook.render(&active_call.extras.load_full())
+                                {
+                                    playbook = result;
                                 }
                             }
                         }
@@ -280,7 +281,7 @@ pub async fn call_handler_core(
     let receiver = active_call.new_receiver();
 
     let (r, _) = join! {
-        active_call.serve(receiver),
+        active_call.clone().serve(receiver),
         async {
             select!{
                 _ = send_ping_loop => {},
@@ -305,7 +306,7 @@ pub async fn call_handler_core(
     }
 
     // Capture final extras (including _hangup_headers) before cleanup
-    let final_extras = active_call.call_state.read().await.extras.clone();
+    let final_extras = Some(active_call.extras.load_full().as_ref().clone());
 
     active_call.cleanup().await.ok();
     debug!(session_id, "Call handler core completed");
@@ -465,30 +466,29 @@ pub(crate) async fn get_iceservers(State(state): State<AppState>) -> Response {
 }
 
 pub(crate) async fn list_active_calls(State(state): State<AppState>) -> Response {
+    // Clone the call handles out of the registry lock first, then read each
+    // call's lock-free progress snapshot without holding the registry lock.
     let calls = state
         .active_calls
         .lock()
         .unwrap()
         .iter()
-        .map(|(_, c)| {
-            if let Ok(cs) = c.call_state.try_read() {
-                json!({
-                    "id": c.session_id,
-                    "callType": c.call_type,
-                    "cs.option": cs.option,
-                    "ringTime": cs.ring_time,
-                    "startTime": cs.answer_time,
-                })
-            } else {
-                json!({
-                    "id": c.session_id,
-                    "callType": c.call_type,
-                    "status": "locked",
-                })
-            }
+        .map(|(_, c)| c.clone())
+        .collect::<Vec<_>>();
+    let list = calls
+        .iter()
+        .map(|c| {
+            let progress = c.progress.load_full();
+            json!({
+                "id": c.session_id,
+                "callType": c.call_type,
+                "cs.option": progress.option,
+                "ringTime": progress.ring_time,
+                "startTime": progress.answer_time,
+            })
         })
         .collect::<Vec<_>>();
-    Json(serde_json::json!({ "active_calls": calls })).into_response()
+    Json(serde_json::json!({ "active_calls": list })).into_response()
 }
 
 pub(crate) async fn kill_active_call(

@@ -501,10 +501,7 @@ impl LlmHandler {
         );
 
         if let Some(call) = &self.call {
-            let mut state = call.call_state.write().await;
-            let mut extras = state.extras.take().unwrap_or_default();
-            extras.insert(var_name.clone(), serde_json::Value::String(buffer.clone()));
-            state.extras = Some(extras);
+            call.set_extra(&var_name, serde_json::Value::String(buffer.clone()));
         }
 
         // Notify LLM of the result
@@ -659,11 +656,10 @@ impl LlmHandler {
         }
     }
 
-    /// Get current extras (variables) from call_state for dynamic template rendering.
+    /// Get current extras (variables) from the call for dynamic template rendering.
     async fn get_current_extras(&self) -> HashMap<String, serde_json::Value> {
         if let Some(call) = &self.call {
-            let state = call.call_state.read().await;
-            state.extras.clone().unwrap_or_default()
+            call.extras.load_full().as_ref().clone()
         } else {
             HashMap::new()
         }
@@ -990,10 +986,7 @@ impl LlmHandler {
                         }
 
                         if let Some(call) = &self.call {
-                            let mut state = call.call_state.write().await;
-                            let mut extras = state.extras.take().unwrap_or_default();
-                            extras.insert(key, serde_json::Value::String(value));
-                            state.extras = Some(extras);
+                            call.set_extra(&key, serde_json::Value::String(value));
                         }
 
                         buffer.drain(..mat.end());
@@ -1243,10 +1236,7 @@ impl LlmHandler {
 
             if let Some(call) = &self.call {
                 let h_val = serde_json::to_value(&headers).unwrap_or_default();
-                let mut state = call.call_state.write().await;
-                let mut extras = state.extras.take().unwrap_or_default();
-                extras.insert("_hangup_headers".to_string(), h_val);
-                state.extras = Some(extras);
+                call.set_extra("_hangup_headers", h_val);
             }
 
             if !prefix.trim().is_empty() {
@@ -1428,31 +1418,27 @@ impl LlmHandler {
     async fn render_sip_headers(&self) -> Option<HashMap<String, String>> {
         let hangup_template = self.sip_config.as_ref()?.hangup_headers.as_ref()?;
         let call = self.call.as_ref()?;
-        let state = call.call_state.read().await;
+        let extras = call.extras.load_full();
 
         let mut context = HashMap::new();
         let mut sip_headers = HashMap::new();
 
         // Get the list of SIP header keys stored during extraction
         // If not present, sip dict will be empty (no headers were configured for extraction)
-        let sip_header_keys: Vec<String> = state
-            .extras
-            .as_ref()
-            .and_then(|e| e.get("_sip_header_keys"))
+        let sip_header_keys: Vec<String> = extras
+            .get("_sip_header_keys")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
 
-        if let Some(extras) = &state.extras {
-            for (k, v) in extras {
-                // Skip internal keys
-                if k.starts_with('_') {
-                    continue;
-                }
-                context.insert(k.clone(), v.clone());
-                // Only include keys that were extracted as SIP headers
-                if sip_header_keys.contains(k) {
-                    sip_headers.insert(k.clone(), v.clone());
-                }
+        for (k, v) in extras.iter() {
+            // Skip internal keys
+            if k.starts_with('_') {
+                continue;
+            }
+            context.insert(k.clone(), v.clone());
+            // Only include keys that were extracted as SIP headers
+            if sip_header_keys.contains(k) {
+                sip_headers.insert(k.clone(), v.clone());
             }
         }
 

@@ -1117,7 +1117,6 @@ async fn test_set_var_updates_state() {
         false,
         None,
         None,
-        None,
     ));
 
     let mut handler = LlmHandler::with_provider(
@@ -1150,11 +1149,8 @@ async fn test_set_var_updates_state() {
     );
 
     // Check ActiveCall state
-    let state = active_call.call_state.read().await;
-    let extras = state
-        .extras
-        .as_ref()
-        .expect("extras should be initialized/set");
+    let extras = active_call.extras.load_full();
+    assert!(!extras.is_empty(), "extras should be initialized/set");
 
     assert_eq!(
         extras.get("my_key").unwrap(),
@@ -1204,7 +1200,6 @@ async fn test_set_var_with_sip_headers() {
         false,
         None,
         Some(initial_extras),
-        None,
     ));
 
     let mut handler = LlmHandler::with_provider(
@@ -1234,8 +1229,7 @@ async fn test_set_var_with_sip_headers() {
         buffer
     );
 
-    let state = active_call.call_state.read().await;
-    let extras = state.extras.as_ref().unwrap();
+    let extras = active_call.extras.load_full();
 
     // Verify original header still exists
     assert_eq!(extras.get("X-CID").unwrap(), &serde_json::json!("123456"));
@@ -1288,7 +1282,6 @@ async fn test_http_command_in_stream() {
         track_config,
         None,
         false,
-        None,
         None,
         None,
     ));
@@ -1379,7 +1372,6 @@ async fn test_http_command_post_with_body() {
         false,
         None,
         None,
-        None,
     ));
 
     let mut handler = LlmHandler::with_provider(
@@ -1458,7 +1450,6 @@ async fn test_multiple_commands_in_sequence() {
         false,
         None,
         None,
-        None,
     ));
 
     let mut handler = LlmHandler::with_provider(
@@ -1487,8 +1478,7 @@ async fn test_multiple_commands_in_sequence() {
     assert!(!commands.is_empty());
 
     // Check state was updated
-    let state = active_call.call_state.read().await;
-    let extras = state.extras.as_ref().unwrap();
+    let extras = active_call.extras.load_full();
     assert_eq!(
         extras.get("user_name").unwrap(),
         &serde_json::Value::String("Alice".to_string())
@@ -1531,7 +1521,6 @@ async fn test_set_var_individual_sip_header() {
         false,
         None,
         None,
-        None,
     ));
 
     let mut handler = LlmHandler::with_provider(
@@ -1559,8 +1548,7 @@ async fn test_set_var_individual_sip_header() {
         .extract_streaming_commands(&mut buffer2, "p2", true)
         .await;
 
-    let state = active_call.call_state.read().await;
-    let extras = state.extras.as_ref().unwrap();
+    let extras = active_call.extras.load_full();
 
     // Both headers should be set
     assert_eq!(
@@ -1629,7 +1617,6 @@ async fn test_bye_headers_with_all_variables() {
         false,
         None,
         Some(initial_extras),
-        None,
     ));
 
     let mut handler = LlmHandler::with_provider(
@@ -1714,7 +1701,6 @@ async fn test_bye_headers_with_unset_variables() {
         false,
         None,
         Some(initial_extras),
-        None,
     ));
 
     let mut handler = LlmHandler::with_provider(
@@ -1806,7 +1792,6 @@ async fn test_set_var_then_bye_headers() {
         false,
         None,
         Some(initial_extras),
-        None,
     ));
 
     let mut handler = LlmHandler::with_provider(
@@ -1831,8 +1816,8 @@ async fn test_set_var_then_bye_headers() {
     println!("Generated commands: {:?}", commands);
 
     // Now check if variables were set in state
-    let state = active_call.call_state.read().await;
-    if let Some(extras) = &state.extras {
+    {
+        let extras = active_call.extras.load_full();
         println!("Extras after generate_response: {:?}", extras);
 
         // Check if set_var worked
@@ -1847,10 +1832,7 @@ async fn test_set_var_then_bye_headers() {
         } else {
             println!("WARNING: skillgroupid not found in extras!");
         }
-    } else {
-        println!("WARNING: extras is None!");
     }
-    drop(state);
 
     // Now render BYE headers
     let rendered_headers = handler.render_sip_headers().await;
@@ -1967,7 +1949,6 @@ async fn test_hangup_before_set_var_still_works() {
         false,
         None,
         Some(initial_extras),
-        None,
     ));
 
     let mut handler = LlmHandler::with_provider(
@@ -1990,8 +1971,8 @@ async fn test_hangup_before_set_var_still_works() {
     println!("Generated commands: {:?}", commands);
 
     // Check if variables were set DESPITE hangup coming first
-    let state = active_call.call_state.read().await;
-    if let Some(extras) = &state.extras {
+    {
+        let extras = active_call.extras.load_full();
         println!("Extras after generate_response: {:?}", extras);
 
         assert_eq!(
@@ -2005,10 +1986,7 @@ async fn test_hangup_before_set_var_still_works() {
             Some("7084rx000003"),
             "skillgroupid should be set even though hangup came first"
         );
-    } else {
-        panic!("extras should not be None!");
     }
-    drop(state);
 
     // Render BYE headers
     let rendered_headers = handler.render_sip_headers().await;
@@ -2061,7 +2039,6 @@ async fn test_dynamic_scene_prompt_rendering() {
         false,
         None,
         Some(initial_extras),
-        None,
     ));
 
     // Create scenes with raw_prompt templates
@@ -2110,13 +2087,7 @@ async fn test_dynamic_scene_prompt_rendering() {
 
     // Simulate set_var: LLM sets intent during conversation
     {
-        let mut state = active_call.call_state.write().await;
-        let mut extras = state.extras.take().unwrap_or_default();
-        extras.insert(
-            "intent".to_string(),
-            serde_json::Value::String("买零食".to_string()),
-        );
-        state.extras = Some(extras);
+        active_call.set_extra("intent", serde_json::Value::String("买零食".to_string()));
     }
 
     // Now switch to greeting scene, it should dynamically render with the latest variables
@@ -2187,13 +2158,11 @@ async fn test_dynamic_prompt_with_builtin_vars() {
         false,
         None,
         None,
-        None,
     ));
 
     // Verify built-in variables were injected
     {
-        let state = active_call.call_state.read().await;
-        let extras = state.extras.as_ref().expect("extras should exist");
+        let extras = active_call.extras.load_full();
         assert_eq!(
             extras.get(BUILTIN_SESSION_ID).and_then(|v| v.as_str()),
             Some("session-builtin-test"),

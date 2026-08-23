@@ -74,7 +74,6 @@ async fn test_playbook_run_flow() -> Result<()> {
         false, // dump_events
         None,  // server_side_track
         None,  // extras
-        None,
     ));
 
     // Get command receiver
@@ -224,7 +223,6 @@ async fn test_playbook_hangup_flow() -> Result<()> {
         false,
         None,
         None,
-        None,
     ));
 
     let receiver = active_call.new_receiver();
@@ -322,7 +320,6 @@ async fn test_playbook_accept_flow() -> Result<()> {
         false,
         None,
         None,
-        None,
     ));
 
     let receiver = active_call.new_receiver();
@@ -387,7 +384,6 @@ async fn test_playbook_reject_flow() -> Result<()> {
         TrackConfig::default(),
         None,
         false,
-        None,
         None,
         None,
     ));
@@ -459,7 +455,6 @@ async fn test_playbook_media_wait_flow() -> Result<()> {
         TrackConfig::default(),
         None,
         false,
-        None,
         None,
         None,
     ));

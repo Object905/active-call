@@ -1,3 +1,4 @@
+use active_call::SipOption;
 use active_call::app::AppStateBuilder;
 use active_call::call::{ActiveCall, ActiveCallType};
 use active_call::config::Config;
@@ -8,7 +9,6 @@ use active_call::playbook::dialogue::DialogueHandler;
 use active_call::playbook::handler::rag::NoopRagRetriever;
 use active_call::playbook::handler::{LlmProvider, LlmStreamEvent};
 use active_call::playbook::{ChatMessage, InterruptionConfig, LlmConfig};
-use active_call::SipOption;
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::Stream;
@@ -64,7 +64,6 @@ async fn test_autohangup_headers_stored_in_extras() -> Result<()> {
         false,
         None,
         None,
-        None,
     ));
 
     let mut hangup_headers = HashMap::new();
@@ -116,17 +115,12 @@ async fn test_autohangup_headers_stored_in_extras() -> Result<()> {
 
     // Assert: Check that headers are stored in extras
     {
-        let state = active_call.call_state.read().await;
-        let extras = state
-            .extras
-            .as_ref()
-            .expect("extras should be present after hangup");
+        let extras = active_call.extras.load_full();
 
         let header_val = extras
             .get("_hangup_headers")
             .expect("_hangup_headers should be in extras");
-        let headers: HashMap<String, String> =
-            serde_json::from_value(header_val.clone()).unwrap();
+        let headers: HashMap<String, String> = serde_json::from_value(header_val.clone()).unwrap();
 
         assert_eq!(
             headers.get("X-Test-Header"),
@@ -164,7 +158,6 @@ async fn test_autohangup_without_sip_config() -> Result<()> {
         TrackConfig::default(),
         None,
         false,
-        None,
         None,
         None,
     ));
@@ -209,16 +202,14 @@ async fn test_autohangup_without_sip_config() -> Result<()> {
 
     // Assert: _hangup_headers should either not exist or be empty
     {
-        let state = active_call.call_state.read().await;
-        if let Some(extras) = &state.extras {
-            if let Some(header_val) = extras.get("_hangup_headers") {
-                let headers: HashMap<String, String> =
-                    serde_json::from_value(header_val.clone()).unwrap_or_default();
-                assert!(
-                    headers.is_empty(),
-                    "Headers should be empty when no SipOption is provided"
-                );
-            }
+        let extras = active_call.extras.load_full();
+        if let Some(header_val) = extras.get("_hangup_headers") {
+            let headers: HashMap<String, String> =
+                serde_json::from_value(header_val.clone()).unwrap_or_default();
+            assert!(
+                headers.is_empty(),
+                "Headers should be empty when no SipOption is provided"
+            );
         }
     }
 
@@ -248,25 +239,18 @@ async fn test_autohangup_headers_with_template_variables() -> Result<()> {
         false,
         None,
         None,
-        None,
     ));
 
     // Pre-populate extras with variables
     {
-        let mut state = active_call.call_state.write().await;
-        let mut extras = HashMap::new();
-        extras.insert(
-            "call_result".to_string(),
+        active_call.set_extra(
+            "call_result",
             serde_json::Value::String("success".to_string()),
         );
-        state.extras = Some(extras);
     }
 
     let mut hangup_headers = HashMap::new();
-    hangup_headers.insert(
-        "X-Call-Result".to_string(),
-        "{{ call_result }}".to_string(),
-    );
+    hangup_headers.insert("X-Call-Result".to_string(), "{{ call_result }}".to_string());
 
     let sip_option = SipOption {
         hangup_headers: Some(hangup_headers),
@@ -313,14 +297,12 @@ async fn test_autohangup_headers_with_template_variables() -> Result<()> {
 
     // Assert: Template variable should be rendered
     {
-        let state = active_call.call_state.read().await;
-        let extras = state.extras.as_ref().expect("extras should be present");
+        let extras = &*active_call.extras.load_full();
 
         let header_val = extras
             .get("_hangup_headers")
             .expect("_hangup_headers should be in extras");
-        let headers: HashMap<String, String> =
-            serde_json::from_value(header_val.clone()).unwrap();
+        let headers: HashMap<String, String> = serde_json::from_value(header_val.clone()).unwrap();
 
         assert_eq!(
             headers.get("X-Call-Result"),

@@ -37,25 +37,22 @@ async fn test_autohangup_preserved_same_play_id() -> Result<()> {
         false,
         None,
         None,
-        None,
     ));
 
     // Step 1: Simulate first streaming TTS command with auto_hangup
     let ssrc: u32 = 11111;
     {
-        let mut state = active_call.call_state.write().await;
-        state.current_play_id = Some("stream-1".to_string());
+        active_call.set_current_play(Some("stream-1".to_string()));
         // tts_handle would exist with ssrc=11111
         // Simulate: same play_id, handle exists → target_ssrc = handle.ssrc
-        state.auto_hangup = Some((ssrc, CallRecordHangupReason::BySystem));
+        active_call.set_auto_hangup(Some((ssrc, CallRecordHangupReason::BySystem)));
     }
 
     // Step 2: Simulate subsequent streaming TTS command with same play_id
     // In do_tts(): play_id matches → changed=false → auto_hangup preserved
     {
-        let state = active_call.call_state.read().await;
         assert_eq!(
-            state.auto_hangup,
+            active_call.auto_hangup_value(),
             Some((ssrc, CallRecordHangupReason::BySystem)),
             "auto_hangup should be preserved when same play_id (streaming mode)"
         );
@@ -95,35 +92,26 @@ async fn test_autohangup_cleared_different_play_id() -> Result<()> {
         false,
         None,
         None,
-        None,
     ));
 
     // Step 1: First TTS sets auto_hangup with play_id="A"
     {
-        let mut state = active_call.call_state.write().await;
-        state.current_play_id = Some("play-A".to_string());
-        state.auto_hangup = Some((11111, CallRecordHangupReason::BySystem));
+        active_call.set_current_play(Some("play-A".to_string()));
+        active_call.set_auto_hangup(Some((11111, CallRecordHangupReason::BySystem)));
     }
 
     // Step 2: New TTS with different play_id="B" and NO auto_hangup
     // In do_tts(): play_id differs → changed=true → auto_hangup should be cleared
+    // (tts_handle.is_some() && !changed → preserve, else → clear)
     {
-        let mut state = active_call.call_state.write().await;
-        // Simulate the fix: when changed=true and new command has no auto_hangup,
-        // auto_hangup should be cleared (not preserved)
-        // This is what the fix in do_tts() does:
-        // if state.tts_handle.is_some() && !changed → preserve
-        // else → clear
-        // Since changed=true, auto_hangup is cleared
-        state.auto_hangup = None; // Fix behavior
-        state.current_play_id = Some("play-B".to_string());
+        active_call.set_auto_hangup(None);
+        active_call.set_current_play(Some("play-B".to_string()));
     }
 
     // Step 3: Verify auto_hangup is cleared
     {
-        let state = active_call.call_state.read().await;
         assert!(
-            state.auto_hangup.is_none(),
+            active_call.auto_hangup_value().is_none(),
             "auto_hangup should be cleared when different play_id starts new track"
         );
     }
@@ -157,29 +145,25 @@ async fn test_autohangup_replaced_different_play_id_with_hangup() -> Result<()> 
         false,
         None,
         None,
-        None,
     ));
 
     // Step 1: Old auto_hangup with ssrc=11111
     {
-        let mut state = active_call.call_state.write().await;
-        state.current_play_id = Some("play-A".to_string());
-        state.auto_hangup = Some((11111, CallRecordHangupReason::BySystem));
+        active_call.set_current_play(Some("play-A".to_string()));
+        active_call.set_auto_hangup(Some((11111, CallRecordHangupReason::BySystem)));
     }
 
     // Step 2: New TTS with different play_id and auto_hangup=true
     let new_ssrc: u32 = 22222;
     {
-        let mut state = active_call.call_state.write().await;
         // In do_tts(): auto_hangup=Some(true) → directly set new value
-        state.auto_hangup = Some((new_ssrc, CallRecordHangupReason::BySystem));
-        state.current_play_id = Some("play-B".to_string());
+        active_call.set_auto_hangup(Some((new_ssrc, CallRecordHangupReason::BySystem)));
+        active_call.set_current_play(Some("play-B".to_string()));
     }
 
     // Verify: new auto_hangup with new SSRC
     {
-        let state = active_call.call_state.read().await;
-        let (ssrc, _) = state.auto_hangup.clone().unwrap();
+        let (ssrc, _) = active_call.auto_hangup_value().unwrap();
         assert_eq!(
             ssrc, new_ssrc,
             "auto_hangup should use new SSRC when new command sets it"
@@ -215,30 +199,26 @@ async fn test_autohangup_cleared_on_interrupt() -> Result<()> {
         false,
         None,
         None,
-        None,
     ));
 
     // Step 1: Set auto_hangup
     {
-        let mut state = active_call.call_state.write().await;
-        state.current_play_id = Some("play-A".to_string());
-        state.auto_hangup = Some((11111, CallRecordHangupReason::BySystem));
+        active_call.set_current_play(Some("play-A".to_string()));
+        active_call.set_auto_hangup(Some((11111, CallRecordHangupReason::BySystem)));
     }
 
     // Step 2: Simulate do_interrupt() clearing auto_hangup
     {
-        let mut state = active_call.call_state.write().await;
-        // This is what do_interrupt() now does after the fix:
-        state.tts_handle = None;
-        state.moh = None;
-        state.auto_hangup = None;
+        // This is what do_interrupt() does:
+        active_call.tts_handle.store(None);
+        active_call.set_moh(None);
+        active_call.set_auto_hangup(None);
     }
 
     // Step 3: Verify auto_hangup is cleared
     {
-        let state = active_call.call_state.read().await;
         assert!(
-            state.auto_hangup.is_none(),
+            active_call.auto_hangup_value().is_none(),
             "auto_hangup should be cleared after interrupt"
         );
     }
@@ -273,31 +253,25 @@ async fn test_autohangup_cleared_no_handle_no_hangup() -> Result<()> {
         false,
         None,
         None,
-        None,
     ));
 
     // Step 1: Simulate stale auto_hangup from previous do_play()
     {
-        let mut state = active_call.call_state.write().await;
-        state.auto_hangup = Some((99999, CallRecordHangupReason::BySystem));
+        active_call.set_auto_hangup(Some((99999, CallRecordHangupReason::BySystem)));
         // tts_handle is None (do_play sets it to None)
     }
 
     // Step 2: New do_tts() with no auto_hangup, no handle
-    // In do_tts(): state.tts_handle.is_none() → clear auto_hangup
+    // In do_tts(): tts_handle.is_none() → clear auto_hangup
     {
-        let mut state = active_call.call_state.write().await;
-        // Simulate the fix behavior:
-        // tts_handle is None → auto_hangup cleared (not preserved)
-        state.auto_hangup = None;
-        state.current_play_id = Some("new-play".to_string());
+        active_call.set_auto_hangup(None);
+        active_call.set_current_play(Some("new-play".to_string()));
     }
 
     // Step 3: Verify stale auto_hangup is cleared
     {
-        let state = active_call.call_state.read().await;
         assert!(
-            state.auto_hangup.is_none(),
+            active_call.auto_hangup_value().is_none(),
             "Stale auto_hangup should be cleared when no handle exists and new command has no auto_hangup"
         );
     }
@@ -444,14 +418,12 @@ async fn test_command_interrupt_clears_auto_hangup_via_serve() -> Result<()> {
         false,
         None,
         None,
-        None,
     ));
 
     // Seed auto_hangup as if a TTS with auto_hangup=true was scheduled.
     {
-        let mut state = active_call.call_state.write().await;
-        state.auto_hangup = Some((12345, CallRecordHangupReason::BySystem));
-        state.current_play_id = Some("play-before-barge-in".to_string());
+        active_call.set_auto_hangup(Some((12345, CallRecordHangupReason::BySystem)));
+        active_call.set_current_play(Some("play-before-barge-in".to_string()));
     }
 
     // Start the serve() loop running in the background.
@@ -476,9 +448,8 @@ async fn test_command_interrupt_clears_auto_hangup_via_serve() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     {
-        let state = active_call.call_state.read().await;
         assert!(
-            state.auto_hangup.is_none(),
+            active_call.auto_hangup_value().is_none(),
             "Command::Interrupt (barge-in) must clear auto_hangup via do_interrupt()"
         );
     }
@@ -517,7 +488,6 @@ async fn test_do_tts_clears_stale_auto_hangup_from_do_play_via_serve() -> Result
         false,
         None,
         None,
-        None,
     ));
 
     // Simulate the state left by do_play(auto_hangup=true):
@@ -525,10 +495,9 @@ async fn test_do_tts_clears_stale_auto_hangup_from_do_play_via_serve() -> Result
     //   auto_hangup = Some  (the file track's SSRC)
     let stale_ssrc: u32 = 99999;
     {
-        let mut state = active_call.call_state.write().await;
-        state.tts_handle = None;
-        state.auto_hangup = Some((stale_ssrc, CallRecordHangupReason::BySystem));
-        state.current_play_id = Some("file-play".to_string());
+        active_call.tts_handle.store(None);
+        active_call.set_auto_hangup(Some((stale_ssrc, CallRecordHangupReason::BySystem)));
+        active_call.set_current_play(Some("file-play".to_string()));
     }
 
     // Start the serve() loop.
@@ -567,9 +536,8 @@ async fn test_do_tts_clears_stale_auto_hangup_from_do_play_via_serve() -> Result
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     {
-        let state = active_call.call_state.read().await;
         assert!(
-            state.auto_hangup.is_none(),
+            active_call.auto_hangup_value().is_none(),
             "Stale auto_hangup (ssrc={stale_ssrc}) from do_play must be cleared \
              when do_tts() runs with no existing handle and no auto_hangup intent"
         );
