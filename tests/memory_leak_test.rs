@@ -16,6 +16,7 @@
 //! catch per-call leaks (a leaked MediaStream alone would add ~1 MB/cycle).
 
 use active_call::app::AppStateBuilder;
+use active_call::call::active_call::CallSpec;
 use active_call::call::{ActiveCall, ActiveCallType};
 use active_call::config::Config;
 use active_call::event::SessionEvent;
@@ -58,18 +59,18 @@ async fn run_call_cycle(
     seed_events: usize,
 ) -> Result<()> {
     let cancel_token = CancellationToken::new();
-    let call = Arc::new(ActiveCall::new(
-        ActiveCallType::WebSocket,
-        cancel_token.clone(),
-        format!("leak-{}", uuid::Uuid::new_v4()),
-        app_state.invitation.clone(),
-        app_state.clone(),
-        TrackConfig::default(),
-        None,
-        false,
-        None,
-        None,
-    ));
+    let call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::WebSocket,
+        cancel_token: cancel_token.clone(),
+        session_id: format!("leak-{}", uuid::Uuid::new_v4()),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     // Register in the global registry like real handlers do.
     let _guard = active_call::call::active_call::ActiveCallGuard::new(call.clone());
@@ -219,18 +220,18 @@ async fn test_refer_leg_references_released() -> Result<()> {
         .build()
         .await?;
 
-    let call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        CancellationToken::new(),
-        "refer-leak".to_string(),
-        app_state.invitation.clone(),
-        app_state.clone(),
-        TrackConfig::default(),
-        None,
-        false,
-        None,
-        None,
-    ));
+    let call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: CancellationToken::new(),
+        session_id: "refer-leak".to_string(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     let leg = active_call::call::state::LegShared::new(7, true, Default::default());
     // `leg` itself holds one reference to the progress ArcSwap.

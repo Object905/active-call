@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
-    call::{RoutingState, sip::Invitation},
+    call::{RoutingState, sip::Invitation, sip::remove_dialog},
     config::InviteHandlerConfig,
     useragent::{playbook_handler::PlaybookInvitationHandler, webhook::WebhookInvitationHandler},
 };
@@ -33,17 +33,9 @@ impl PendingDialogGuard {
     }
 
     fn take_dialog(&self) -> Option<Dialog> {
-        if let Some(pending) = self.invitation.get_pending_call(&self.id) {
-            let dialog_id = pending.dialog.id();
-            match self.invitation.dialog_layer.get_dialog(&dialog_id) {
-                Some(dialog) => {
-                    self.invitation.dialog_layer.remove_dialog(&dialog_id);
-                    return Some(dialog);
-                }
-                None => {}
-            }
-        }
-        None
+        let pending = self.invitation.get_pending_call(&self.id)?;
+        let dialog_id = pending.dialog.id();
+        remove_dialog(&self.invitation.dialog_layer, &dialog_id)
     }
     pub async fn drop_async(&self) {
         if let Some(dialog) = self.take_dialog() {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::call::active_call::CallSpec;
 use crate::event::SessionEvent;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -1106,18 +1107,18 @@ async fn test_set_var_updates_state() {
     let session_id = "test-session-set-var".to_string();
     let track_config = TrackConfig::default();
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel_token,
-        session_id,
-        app_state.invitation.clone(),
-        app_state.clone(),
-        track_config,
-        None,
-        false,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel_token,
+        session_id: session_id,
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: track_config,
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     let mut handler = LlmHandler::with_provider(
         config,
@@ -1189,18 +1190,18 @@ async fn test_set_var_with_sip_headers() {
     let mut initial_extras = std::collections::HashMap::new();
     initial_extras.insert("X-CID".to_string(), serde_json::json!("123456"));
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel_token,
-        session_id,
-        app_state.invitation.clone(),
-        app_state.clone(),
-        track_config,
-        None,
-        false,
-        None,
-        Some(initial_extras),
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel_token,
+        session_id: session_id,
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: track_config,
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: Some(initial_extras),
+    }));
 
     let mut handler = LlmHandler::with_provider(
         config,
@@ -1273,18 +1274,18 @@ async fn test_http_command_in_stream() {
     let session_id = "test-session-http".to_string();
     let track_config = TrackConfig::default();
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel_token,
-        session_id,
-        app_state.invitation.clone(),
-        app_state.clone(),
-        track_config,
-        None,
-        false,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel_token,
+        session_id: session_id,
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: track_config,
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     let mut handler = LlmHandler::with_provider(
         config,
@@ -1361,18 +1362,18 @@ async fn test_http_command_post_with_body() {
     let session_id = "test-session-http-post".to_string();
     let track_config = TrackConfig::default();
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel_token,
-        session_id,
-        app_state.invitation.clone(),
-        app_state.clone(),
-        track_config,
-        None,
-        false,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel_token,
+        session_id: session_id,
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: track_config,
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     let mut handler = LlmHandler::with_provider(
         config,
@@ -1439,18 +1440,18 @@ async fn test_multiple_commands_in_sequence() {
     let session_id = "test-session-multi".to_string();
     let track_config = TrackConfig::default();
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel_token,
-        session_id,
-        app_state.invitation.clone(),
-        app_state.clone(),
-        track_config,
-        None,
-        false,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel_token,
+        session_id: session_id,
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: track_config,
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     let mut handler = LlmHandler::with_provider(
         config,
@@ -1510,18 +1511,18 @@ async fn test_set_var_individual_sip_header() {
     let session_id = "test-session-individual-header".to_string();
     let track_config = TrackConfig::default();
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel_token,
-        session_id,
-        app_state.invitation.clone(),
-        app_state.clone(),
-        track_config,
-        None,
-        false,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel_token,
+        session_id: session_id,
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: track_config,
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     let mut handler = LlmHandler::with_provider(
         config,
@@ -1606,18 +1607,18 @@ async fn test_bye_headers_with_all_variables() {
     // Mark X-CID as SIP header
     initial_extras.insert("_sip_header_keys".to_string(), serde_json::json!(["X-CID"]));
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel_token,
-        session_id,
-        app_state.invitation.clone(),
-        app_state.clone(),
-        track_config,
-        None,
-        false,
-        None,
-        Some(initial_extras),
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel_token,
+        session_id: session_id,
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: track_config,
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: Some(initial_extras),
+    }));
 
     let mut handler = LlmHandler::with_provider(
         llm_config,
@@ -1690,18 +1691,18 @@ async fn test_bye_headers_with_unset_variables() {
     // Initialize WITHOUT setting hangupreason and skillgroupid
     let initial_extras = StdHashMap::new();
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel_token,
-        session_id,
-        app_state.invitation.clone(),
-        app_state.clone(),
-        track_config,
-        None,
-        false,
-        None,
-        Some(initial_extras),
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel_token,
+        session_id: session_id,
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: track_config,
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: Some(initial_extras),
+    }));
 
     let mut handler = LlmHandler::with_provider(
         llm_config,
@@ -1781,18 +1782,18 @@ async fn test_set_var_then_bye_headers() {
 
     let initial_extras = StdHashMap::new();
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel_token,
-        session_id,
-        app_state.invitation.clone(),
-        app_state.clone(),
-        track_config,
-        None,
-        false,
-        None,
-        Some(initial_extras),
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel_token,
+        session_id: session_id,
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: track_config,
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: Some(initial_extras),
+    }));
 
     let mut handler = LlmHandler::with_provider(
         llm_config,
@@ -1938,18 +1939,18 @@ async fn test_hangup_before_set_var_still_works() {
 
     let initial_extras = StdHashMap::new();
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel_token,
-        session_id,
-        app_state.invitation.clone(),
-        app_state.clone(),
-        track_config,
-        None,
-        false,
-        None,
-        Some(initial_extras),
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel_token,
+        session_id: session_id,
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: track_config,
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: Some(initial_extras),
+    }));
 
     let mut handler = LlmHandler::with_provider(
         llm_config,
@@ -2028,18 +2029,18 @@ async fn test_dynamic_scene_prompt_rendering() {
         serde_json::json!(["X-Jobid"]),
     );
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel_token,
-        session_id.clone(),
-        app_state.invitation.clone(),
-        app_state.clone(),
-        track_config,
-        None,
-        false,
-        None,
-        Some(initial_extras),
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel_token,
+        session_id: session_id.clone(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: track_config,
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: Some(initial_extras),
+    }));
 
     // Create scenes with raw_prompt templates
     let mut scenes = std::collections::HashMap::new();
@@ -2147,18 +2148,18 @@ async fn test_dynamic_prompt_with_builtin_vars() {
     let session_id = "session-builtin-test".to_string();
     let track_config = TrackConfig::default();
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel_token,
-        session_id.clone(),
-        app_state.invitation.clone(),
-        app_state.clone(),
-        track_config,
-        None,
-        false,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel_token,
+        session_id: session_id.clone(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: track_config,
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     // Verify built-in variables were injected
     {

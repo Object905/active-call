@@ -2,16 +2,17 @@
 ///
 /// This test verifies:
 /// 1. ReferOption.pause_parent_asr field exists and can be set
-/// 2. CallRuntime.pending_asr_resume field exists for state tracking
+/// 2. The call's pending_asr_resume slot exists for state tracking
 /// 3. MediaStream supports processor add/remove operations
 /// 4. SessionEvent::Hangup { refer: Some(true) } is handled without panic in
 ///    the actor's event handling (lock-free refer-leg lookup)
 use active_call::{
     ReferOption,
     app::AppStateBuilder,
+    call::active_call::CallSpec,
     call::{
         ActiveCall, ActiveCallType,
-        state::{CallProgress, CallRuntime, LegShared},
+        state::{CallProgress, LegShared},
     },
     config::Config,
     event::SessionEvent,
@@ -21,12 +22,13 @@ use active_call::{
 use anyhow::Result;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-fn test_runtime() -> CallRuntime {
-    let (tx, _rx) = mpsc::channel(1);
-    CallRuntime::new(tx)
+fn test_config() -> Config {
+    let mut config = Config::default();
+    config.udp_port = 0;
+    config.media_cache_path = "/tmp/mediacache".to_string();
+    config
 }
 
 #[tokio::test]
@@ -82,24 +84,37 @@ async fn test_refer_option_pause_parent_asr_field() {
 }
 
 #[tokio::test]
-async fn test_call_runtime_has_pending_asr_resume() -> Result<()> {
-    // pending_asr_resume is actor-owned runtime state now (no locks involved)
-    let mut runtime = test_runtime();
+async fn test_call_has_pending_asr_resume() -> Result<()> {
+    // pending_asr_resume is a lock-free slot on the call (survives the actor)
+    let app_state = AppStateBuilder::new()
+        .with_config(test_config())
+        .with_stream_engine(Arc::new(StreamEngine::default()))
+        .build()
+        .await?;
+    let call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: CancellationToken::new(),
+        session_id: "asr-resume-slot".to_string(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
     let asr_option = TranscriptionOption {
         provider: Some(TranscriptionType::Aliyun),
         ..Default::default()
     };
-    runtime.pending_asr_resume = Some((12345u32, asr_option.clone()));
+    call.set_pending_asr_resume((12345u32, asr_option.clone()));
 
-    assert!(runtime.pending_asr_resume.is_some());
-    let (ssrc, option) = runtime.pending_asr_resume.as_ref().unwrap();
-    assert_eq!(*ssrc, 12345u32);
+    let (ssrc, option) = call
+        .take_pending_asr_resume()
+        .expect("pending_asr_resume should be set");
+    assert_eq!(ssrc, 12345u32);
     assert!(option.provider.is_some());
-
-    // Test that it can be taken (moved out)
-    let taken = runtime.pending_asr_resume.take();
-    assert!(taken.is_some());
-    assert!(runtime.pending_asr_resume.is_none());
+    assert!(call.take_pending_asr_resume().is_none(), "slot drained");
 
     Ok(())
 }
@@ -177,8 +192,24 @@ async fn test_media_stream_processor_operations() -> Result<()> {
 
 #[tokio::test]
 async fn test_pending_asr_resume_lifecycle() -> Result<()> {
-    // Test the full lifecycle of pending_asr_resume state (actor-owned)
-    let mut runtime = test_runtime();
+    // Test the full lifecycle of the pending_asr_resume slot
+    let app_state = AppStateBuilder::new()
+        .with_config(test_config())
+        .with_stream_engine(Arc::new(StreamEngine::default()))
+        .build()
+        .await?;
+    let call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: CancellationToken::new(),
+        session_id: "asr-resume-lifecycle".to_string(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     // Simulate refer with pause_parent_asr
     let refer_ssrc = 99999u32;
@@ -194,23 +225,26 @@ async fn test_pending_asr_resume_lifecycle() -> Result<()> {
     };
 
     // 1. Store pending resume state (simulating what do_refer does)
-    runtime.pending_asr_resume = Some((refer_ssrc, asr_option.clone()));
+    call.set_pending_asr_resume((refer_ssrc, asr_option.clone()));
 
     // 2. Verify state is stored
     {
-        let (stored_ssrc, stored_option) = runtime.pending_asr_resume.as_ref().unwrap();
-        assert_eq!(*stored_ssrc, refer_ssrc);
+        let (stored_ssrc, stored_option) =
+            call.take_pending_asr_resume().expect("state should be set");
+        assert_eq!(stored_ssrc, refer_ssrc);
         assert_eq!(stored_option.provider, Some(asr_provider.clone()));
+        // put it back for the "hangup" step
+        call.set_pending_asr_resume((stored_ssrc, stored_option));
     }
 
     // 3. Simulate refer hangup - take and process the pending resume
     {
-        if let Some((ssrc, option)) = runtime.pending_asr_resume.take() {
-            assert_eq!(ssrc, refer_ssrc);
-            assert_eq!(option.provider, Some(asr_provider));
-            // In real code, this is where we'd recreate the ASR processor
-        }
-        assert!(runtime.pending_asr_resume.is_none());
+        let (ssrc, option) = call
+            .take_pending_asr_resume()
+            .expect("pending resume should still be set");
+        assert_eq!(ssrc, refer_ssrc);
+        assert_eq!(option.provider, Some(asr_provider));
+        // In real code, this is where we'd recreate the ASR processor
     }
 
     Ok(())
@@ -238,18 +272,18 @@ async fn test_refer_hangup_event_in_async_does_not_panic() -> Result<()> {
     let cancel_token = CancellationToken::new();
     let session_id = format!("test-refer-hangup-no-panic-{}", uuid::Uuid::new_v4());
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel_token.clone(),
-        session_id.clone(),
-        app_state.invitation.clone(),
-        app_state.clone(),
-        TrackConfig::default(),
-        None,
-        false,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel_token.clone(),
+        session_id: session_id.clone(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     // The ssrc of the refer leg is what the Hangup(refer=true) handler compares
     // against; install a refer leg so that lookup path is exercised.

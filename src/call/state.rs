@@ -19,16 +19,13 @@ use crate::call::active_call::ActiveCallType;
 use crate::callrecord::{CallRecord, CallRecordHangupReason};
 use crate::event::SessionEvent;
 use crate::media::TrackId;
-use crate::transcription::TranscriptionOption;
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use rsipstack::dialog::dialog::TerminatedReason;
-use rsipstack::dialog::invite_dialog::InviteDialog;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 
 /// Lock-free shared variables (playbook variables, SIP headers, hangup headers).
 pub type Extras = Arc<ArcSwap<HashMap<String, Value>>>;
@@ -365,16 +362,11 @@ pub enum ActorMsg {
 
 /// Mutable state owned exclusively by the call actor task (`serve`).
 /// Plain fields — the borrow checker replaces locks here.
+///
+/// Only truly loop-internal state lives here; state that must survive the
+/// actor (or be visible to teardown paths like `cleanup`) lives on
+/// `ActiveCall` as lock-free `ArcSwap` slots instead.
 pub struct CallRuntime {
-    pub wait_input_timeout: Option<u32>,
-    pub ready_to_answer: Option<(
-        String,
-        crate::call::active_call::PendingCallerTrack,
-        InviteDialog,
-    )>,
-    pub pending_asr_resume: Option<(u32, TranscriptionOption)>,
-    /// Cancel this token to hang up only the refer call, leaving the main call alive.
-    pub refer_call_token: Option<CancellationToken>,
     /// (start_timestamp_ms, timeout_secs) for wait-input silence detection.
     pub input_timeout_expire: (u64, u32),
     /// Sender for background tasks to notify the actor loop.
@@ -387,10 +379,6 @@ pub struct CallRuntime {
 impl CallRuntime {
     pub fn new(actor_tx: mpsc::Sender<ActorMsg>) -> Self {
         Self {
-            wait_input_timeout: None,
-            ready_to_answer: None,
-            pending_asr_resume: None,
-            refer_call_token: None,
             input_timeout_expire: (0, 0),
             actor_tx,
             me: None,

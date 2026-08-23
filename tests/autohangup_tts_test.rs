@@ -1,4 +1,5 @@
 use active_call::app::AppStateBuilder;
+use active_call::call::active_call::CallSpec;
 use active_call::call::{ActiveCall, ActiveCallType, Command};
 use active_call::callrecord::CallRecordHangupReason;
 use active_call::config::Config;
@@ -26,18 +27,18 @@ async fn test_autohangup_preserved_same_play_id() -> Result<()> {
         .build()
         .await?;
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        CancellationToken::new(),
-        "test-preserve".to_string(),
-        app_state.invitation.clone(),
-        app_state.clone(),
-        TrackConfig::default(),
-        None,
-        false,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: CancellationToken::new(),
+        session_id: "test-preserve".to_string(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     // Step 1: Simulate first streaming TTS command with auto_hangup
     let ssrc: u32 = 11111;
@@ -81,18 +82,18 @@ async fn test_autohangup_cleared_different_play_id() -> Result<()> {
         .build()
         .await?;
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        CancellationToken::new(),
-        "test-clear-diff-playid".to_string(),
-        app_state.invitation.clone(),
-        app_state.clone(),
-        TrackConfig::default(),
-        None,
-        false,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: CancellationToken::new(),
+        session_id: "test-clear-diff-playid".to_string(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     // Step 1: First TTS sets auto_hangup with play_id="A"
     {
@@ -134,18 +135,18 @@ async fn test_autohangup_replaced_different_play_id_with_hangup() -> Result<()> 
         .build()
         .await?;
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        CancellationToken::new(),
-        "test-replace-hangup".to_string(),
-        app_state.invitation.clone(),
-        app_state.clone(),
-        TrackConfig::default(),
-        None,
-        false,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: CancellationToken::new(),
+        session_id: "test-replace-hangup".to_string(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     // Step 1: Old auto_hangup with ssrc=11111
     {
@@ -188,18 +189,18 @@ async fn test_autohangup_cleared_on_interrupt() -> Result<()> {
         .build()
         .await?;
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        CancellationToken::new(),
-        "test-interrupt-clears".to_string(),
-        app_state.invitation.clone(),
-        app_state.clone(),
-        TrackConfig::default(),
-        None,
-        false,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: CancellationToken::new(),
+        session_id: "test-interrupt-clears".to_string(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     // Step 1: Set auto_hangup
     {
@@ -242,18 +243,18 @@ async fn test_autohangup_cleared_no_handle_no_hangup() -> Result<()> {
         .build()
         .await?;
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        CancellationToken::new(),
-        "test-no-handle-clears".to_string(),
-        app_state.invitation.clone(),
-        app_state.clone(),
-        TrackConfig::default(),
-        None,
-        false,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: CancellationToken::new(),
+        session_id: "test-no-handle-clears".to_string(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     // Step 1: Simulate stale auto_hangup from previous do_play()
     {
@@ -407,18 +408,18 @@ async fn make_app_state() -> Result<active_call::app::AppState> {
 async fn test_command_interrupt_clears_auto_hangup_via_serve() -> Result<()> {
     let app_state = make_app_state().await?;
     let cancel = CancellationToken::new();
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel.clone(),
-        "itg-interrupt-clears".to_string(),
-        app_state.invitation.clone(),
-        app_state.clone(),
-        TrackConfig::default(),
-        None,
-        false,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel.clone(),
+        session_id: "itg-interrupt-clears".to_string(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     // Seed auto_hangup as if a TTS with auto_hangup=true was scheduled.
     {
@@ -477,18 +478,18 @@ async fn test_do_tts_clears_stale_auto_hangup_from_do_play_via_serve() -> Result
 
     let app_state = make_app_state().await?;
     let cancel = CancellationToken::new();
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel.clone(),
-        "itg-tts-clears-play".to_string(),
-        app_state.invitation.clone(),
-        app_state.clone(),
-        TrackConfig::default(),
-        None,
-        false,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel.clone(),
+        session_id: "itg-tts-clears-play".to_string(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     // Simulate the state left by do_play(auto_hangup=true):
     //   tts_handle = None   (do_play always sets it to None)

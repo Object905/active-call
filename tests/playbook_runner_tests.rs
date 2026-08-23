@@ -1,4 +1,5 @@
 use active_call::app::AppStateBuilder;
+use active_call::call::active_call::CallSpec;
 use active_call::call::{ActiveCall, ActiveCallType, Command};
 use active_call::config::Config;
 use active_call::event::SessionEvent;
@@ -63,18 +64,18 @@ async fn test_playbook_run_flow() -> Result<()> {
     let session_id = "test-session".to_string();
     let track_config = TrackConfig::default();
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel_token.clone(),
-        session_id.clone(),
-        app_state.invitation.clone(),
-        app_state.clone(),
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel_token.clone(),
+        session_id: session_id.clone(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
         track_config,
-        None,  // audio_receiver
-        false, // dump_events
-        None,  // server_side_track
-        None,  // extras
-    ));
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     // Get command receiver
     let receiver = active_call.new_receiver();
@@ -212,18 +213,18 @@ async fn test_playbook_hangup_flow() -> Result<()> {
         .build()
         .await?;
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        CancellationToken::new(),
-        "test-hangup".to_string(),
-        app_state.invitation.clone(),
-        app_state.clone(),
-        TrackConfig::default(),
-        None,
-        false,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: CancellationToken::new(),
+        session_id: "test-hangup".to_string(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     let receiver = active_call.new_receiver();
     let mut cmd_rx = receiver.cmd_receiver;
@@ -309,18 +310,18 @@ async fn test_playbook_accept_flow() -> Result<()> {
         .build()
         .await?;
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        CancellationToken::new(),
-        "test-accept".to_string(),
-        app_state.invitation.clone(),
-        app_state.clone(),
-        TrackConfig::default(),
-        None,
-        false,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: CancellationToken::new(),
+        session_id: "test-accept".to_string(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     let receiver = active_call.new_receiver();
     let mut cmd_rx = receiver.cmd_receiver;
@@ -375,18 +376,18 @@ async fn test_playbook_reject_flow() -> Result<()> {
         .build()
         .await?;
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        CancellationToken::new(),
-        "test-reject".to_string(),
-        app_state.invitation.clone(),
-        app_state.clone(),
-        TrackConfig::default(),
-        None,
-        false,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: CancellationToken::new(),
+        session_id: "test-reject".to_string(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     let receiver = active_call.new_receiver();
     let mut cmd_rx = receiver.cmd_receiver;
@@ -446,18 +447,18 @@ async fn test_playbook_media_wait_flow() -> Result<()> {
         .build()
         .await?;
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        CancellationToken::new(),
-        "test-wait".to_string(),
-        app_state.invitation.clone(),
-        app_state.clone(),
-        TrackConfig::default(),
-        None,
-        false,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: CancellationToken::new(),
+        session_id: "test-wait".to_string(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     let receiver = active_call.new_receiver();
     let mut cmd_rx = receiver.cmd_receiver;

@@ -615,89 +615,56 @@ impl AppStateInner {
             }
         };
 
-        let callee_host = match &parsed_callee.host_with_port.host {
-            rsipstack::rsip::Host::Domain(domain) => domain.to_string(),
-            rsipstack::rsip::Host::IpAddr(ip) => return self.find_credentials_by_ip(ip),
-        };
-
-        // Look through registered users to find one matching this domain
-        if let Some(register_users) = &self.config.register_users {
-            for option in register_users.iter() {
-                let server = crate::sip_util::ensure_sip_scheme(option.server.clone());
-
-                let parsed_server = match rsipstack::rsip::Uri::try_from(server.as_str()) {
-                    Ok(uri) => uri,
-                    Err(e) => {
-                        warn!("failed to parse server URI: {} {:?}", option.server, e);
-                        continue;
-                    }
-                };
-
-                let server_host = match &parsed_server.host_with_port.host {
-                    rsipstack::rsip::Host::Domain(domain) => domain.to_string(),
-                    rsipstack::rsip::Host::IpAddr(ip) => {
-                        // Compare IP addresses
-                        if let rsipstack::rsip::Host::IpAddr(callee_ip) =
-                            &parsed_callee.host_with_port.host
-                        {
-                            if ip == callee_ip {
-                                if let Some(cred) = &option.credential {
-                                    info!(
-                                        callee,
-                                        username = cred.username,
-                                        server = option.server,
-                                        "Auto-injecting credentials from registered user for outbound call (IP match)"
-                                    );
-                                    return Some(cred.clone());
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                };
-
-                if server_host == callee_host {
-                    if let Some(cred) = &option.credential {
-                        info!(
-                            callee,
-                            username = cred.username,
-                            server = option.server,
-                            "Auto-injecting credentials from registered user for outbound call"
-                        );
-                        return Some(cred.clone());
-                    }
-                }
+        // Matching is host-kind-homogeneous: a domain callee matches domain
+        // servers, an IP callee matches IP servers.
+        match &parsed_callee.host_with_port.host {
+            rsipstack::rsip::Host::Domain(domain) => {
+                let domain = domain.0.clone();
+                self.find_credentials(
+                    callee,
+                    &format!("domain {}", domain),
+                    |host| matches!(host, rsipstack::rsip::Host::Domain(d) if d.0 == domain),
+                )
+            }
+            rsipstack::rsip::Host::IpAddr(ip) => {
+                let ip = *ip;
+                self.find_credentials(callee, "IP match", move |host| {
+                    matches!(host, rsipstack::rsip::Host::IpAddr(server_ip) if *server_ip == ip)
+                })
             }
         }
-
-        None
     }
 
-    /// Helper function to find credentials by IP address
-    fn find_credentials_by_ip(
+    /// Scan registered users for the first server matching `pred` that has a
+    /// credential.
+    fn find_credentials(
         &self,
-        callee_ip: &std::net::IpAddr,
-    ) -> Option<crate::useragent::registration::UserCredential> {
-        if let Some(register_users) = &self.config.register_users {
-            for option in register_users.iter() {
-                let server = crate::sip_util::ensure_sip_scheme(option.server.clone());
+        callee: &str,
+        match_type: &str,
+        pred: impl Fn(&rsipstack::rsip::Host) -> bool,
+    ) -> Option<UserCredential> {
+        let register_users = self.config.register_users.as_ref()?;
+        for option in register_users.iter() {
+            let server = crate::sip_util::ensure_sip_scheme(option.server.clone());
 
-                if let Ok(parsed_server) = rsipstack::rsip::Uri::try_from(server.as_str()) {
-                    if let rsipstack::rsip::Host::IpAddr(server_ip) =
-                        &parsed_server.host_with_port.host
-                    {
-                        if server_ip == callee_ip {
-                            if let Some(cred) = &option.credential {
-                                info!(
-                                    callee_ip = %callee_ip,
-                                    username = cred.username,
-                                    server = option.server,
-                                    "Auto-injecting credentials from registered user for outbound call (IP match)"
-                                );
-                                return Some(cred.clone());
-                            }
-                        }
-                    }
+            let parsed_server = match rsipstack::rsip::Uri::try_from(server.as_str()) {
+                Ok(uri) => uri,
+                Err(e) => {
+                    warn!("failed to parse server URI: {} {:?}", option.server, e);
+                    continue;
+                }
+            };
+
+            if pred(&parsed_server.host_with_port.host) {
+                if let Some(cred) = &option.credential {
+                    info!(
+                        callee,
+                        username = cred.username,
+                        server = option.server,
+                        match_type,
+                        "Auto-injecting credentials from registered user for outbound call"
+                    );
+                    return Some(cred.clone());
                 }
             }
         }

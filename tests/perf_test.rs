@@ -6,6 +6,7 @@
 //! hot path).
 
 use active_call::app::AppStateBuilder;
+use active_call::call::active_call::CallSpec;
 use active_call::call::state::{CallProgress, LegShared};
 use active_call::call::{ActiveCall, ActiveCallType, Command};
 use active_call::config::Config;
@@ -126,18 +127,18 @@ async fn bench_actor_command_round_trip() -> Result<()> {
         .await?;
 
     let cancel_token = CancellationToken::new();
-    let call = Arc::new(ActiveCall::new(
-        ActiveCallType::WebSocket,
-        cancel_token.clone(),
-        "perf-actor".to_string(),
-        app_state.invitation.clone(),
-        app_state.clone(),
-        TrackConfig::default(),
-        None,
-        false,
-        None,
-        None,
-    ));
+    let call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::WebSocket,
+        cancel_token: cancel_token.clone(),
+        session_id: "perf-actor".to_string(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     let mut event_receiver = call.event_sender.subscribe();
     let receiver = call.new_receiver();
@@ -238,18 +239,18 @@ async fn bench_call_setup_teardown_rate() -> Result<()> {
 
 async fn one_cycle(app_state: &active_call::app::AppState) -> Result<()> {
     let cancel_token = CancellationToken::new();
-    let call = Arc::new(ActiveCall::new(
-        ActiveCallType::WebSocket,
-        cancel_token.clone(),
-        format!("perf-{}", uuid::Uuid::new_v4()),
-        app_state.invitation.clone(),
-        app_state.clone(),
-        TrackConfig::default(),
-        None,
-        false,
-        None,
-        None,
-    ));
+    let call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::WebSocket,
+        cancel_token: cancel_token.clone(),
+        session_id: format!("perf-{}", uuid::Uuid::new_v4()),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
     let receiver = call.new_receiver();
     let handle = tokio::spawn({
         let call = call.clone();

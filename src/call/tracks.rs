@@ -4,7 +4,7 @@
 //! from the (heavily reused) track assembly building blocks.
 
 use super::active_call::{ActiveCall, ActiveCallType, PendingCallerTrack};
-use super::state::{CallRuntime, LegShared};
+use super::state::LegShared;
 use crate::CallOption;
 use crate::event::SessionEvent;
 use crate::media::TrackId;
@@ -30,6 +30,22 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::sip::{DialogStateReceiverGuard, InviteDialogStates};
+
+/// Everything needed to place one outgoing INVITE (main leg or refer leg).
+pub(super) struct OutgoingLeg {
+    /// Lifetime token of the leg (call token or the refer-specific child).
+    pub cancel_token: CancellationToken,
+    /// Lock-free shared state of the leg being established.
+    pub leg: LegShared,
+    /// Media track id for the leg.
+    pub track_id: TrackId,
+    /// The outgoing INVITE (offer may be filled in by the caller).
+    pub invite_option: InviteOption,
+    /// Call option used to build media processors / MOH.
+    pub call_option: CallOption,
+    /// Music-on-hold path to play while the INVITE is in flight.
+    pub moh: Option<String>,
+}
 
 impl ActiveCall {
     /// Apply the configured codec list to an RTC track config.
@@ -111,7 +127,6 @@ impl ActiveCall {
     /// the incoming SIP track; shared by the Sip and B2bua call types.
     pub(super) async fn try_prepare_incoming_sip_track(
         &self,
-        runtime: &mut CallRuntime,
         hangup_headers: Option<Vec<rsipstack::rsip::Header>>,
     ) -> Option<Result<()>> {
         let dialog_id = self
@@ -119,15 +134,21 @@ impl ActiveCall {
             .find_dialog_id_by_session_id(&self.session_id)?;
         let pending_dialog = self.invitation.get_pending_call(&dialog_id)?;
         Some(
-            self.prepare_incoming_sip_track(
-                runtime,
-                self.cancel_token.clone(),
-                &self.session_id,
-                pending_dialog,
-                hangup_headers,
-            )
-            .await,
+            self.prepare_incoming_sip_track(pending_dialog, hangup_headers)
+                .await,
         )
+    }
+
+    /// Per-call ambiance option merged over the global config.
+    fn merged_ambiance(
+        &self,
+        call_ambiance: Option<&crate::media::ambiance::AmbianceOption>,
+    ) -> crate::media::ambiance::AmbianceOption {
+        let mut opt = call_ambiance.cloned().unwrap_or_default();
+        if let Some(global) = &self.app_state.config.ambiance {
+            opt.merge(global);
+        }
+        opt
     }
 
     pub(super) async fn create_rtp_track(
@@ -214,26 +235,18 @@ impl ActiveCall {
         mut track: Box<dyn Track>,
         play_id: Option<String>,
     ) {
-        let (ambiance_opt, subscribe) = {
+        let (call_ambiance, subscribe) = {
             let state = self.progress.load_full();
-            let mut opt = state
-                .option
-                .as_ref()
-                .and_then(|o| o.ambiance.clone())
-                .unwrap_or_default();
-
-            if let Some(global) = &self.app_state.config.ambiance {
-                opt.merge(global);
-            }
-
-            let subscribe = state
-                .option
-                .as_ref()
-                .and_then(|o| o.subscribe)
-                .unwrap_or_default();
-
-            (opt, subscribe)
+            (
+                state.option.as_ref().and_then(|o| o.ambiance.clone()),
+                state
+                    .option
+                    .as_ref()
+                    .and_then(|o| o.subscribe)
+                    .unwrap_or_default(),
+            )
         };
+        let ambiance_opt = self.merged_ambiance(call_ambiance.as_ref());
 
         let shared_ambiance = match self
             .media_stream
@@ -267,6 +280,197 @@ impl ActiveCall {
 
         self.set_current_play(play_id.clone());
         self.media_stream.update_track(track, play_id).await;
+    }
+
+    pub(super) async fn setup_caller_track(&self, option: &CallOption) -> Result<()> {
+        let hangup_headers = option
+            .sip
+            .as_ref()
+            .and_then(|s| s.hangup_headers.as_ref())
+            .map(crate::sip_util::sip_headers_from_map);
+        self.set_option(option.clone());
+        info!(
+            session_id = self.session_id,
+            call_type = ?self.call_type,
+            "setup caller track"
+        );
+
+        let track = match self.call_type {
+            ActiveCallType::Webrtc => Some(self.create_webrtc_track().await?),
+            ActiveCallType::WebSocket => {
+                let audio_receiver = self.audio_receiver.lock().unwrap().take();
+                if let Some(receiver) = audio_receiver {
+                    Some(self.create_websocket_track(receiver).await?)
+                } else {
+                    None
+                }
+            }
+            ActiveCallType::Sip | ActiveCallType::B2bua => {
+                // Incoming call with a pending dialog: prepare the answering leg.
+                if let Some(result) = self.try_prepare_incoming_sip_track(hangup_headers).await {
+                    return result;
+                }
+
+                if matches!(self.call_type, ActiveCallType::B2bua) {
+                    warn!(
+                        session_id = self.session_id,
+                        "no pending dialog found for B2BUA call"
+                    );
+                    return Err(anyhow::anyhow!(
+                        "no pending dialog found for session_id: {}",
+                        self.session_id
+                    ));
+                }
+
+                // Outgoing SIP call below (Sip only).
+                // Auto-inject credentials from registered users if not already provided
+                let mut option = option.clone();
+                if option.sip.is_none()
+                    || option
+                        .sip
+                        .as_ref()
+                        .and_then(|s| s.username.as_ref())
+                        .is_none()
+                {
+                    if let Some(callee) = &option.callee {
+                        if let Some(cred) = self.app_state.find_credentials_for_callee(callee) {
+                            if option.sip.is_none() {
+                                option.sip = Some(crate::SipOption {
+                                    username: Some(cred.username.clone()),
+                                    password: Some(cred.password.clone()),
+                                    realm: cred.realm.clone(),
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                    }
+                }
+
+                let mut invite_option = option.build_invite_option()?;
+                invite_option.call_id = Some(self.session_id.clone());
+
+                let out = OutgoingLeg {
+                    cancel_token: self.cancel_token.clone(),
+                    leg: self.leg(),
+                    track_id: self.session_id.clone(),
+                    invite_option,
+                    call_option: option.clone(),
+                    moh: None,
+                };
+                match self.create_outgoing_sip_track(out).await {
+                    Ok(answer) => {
+                        self.event_sender
+                            .send(SessionEvent::Answer {
+                                timestamp: crate::media::get_timestamp(),
+                                track_id: self.session_id.clone(),
+                                sdp: answer,
+                                refer: Some(false),
+                            })
+                            .ok();
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        warn!(
+                            session_id = self.session_id,
+                            "failed to create sip track: {}", e
+                        );
+                        self.emit_reject_from_rsip_error(self.session_id.clone(), false, &e);
+                        return Err(e.into());
+                    }
+                }
+            }
+        };
+        match track {
+            Some(track) => {
+                self.finish_caller_stack(&option, PendingCallerTrack::NotStarted(track))
+                    .await?;
+            }
+            None => {
+                warn!(session_id = self.session_id, "no track created for caller");
+                return Err(anyhow::anyhow!("no track created for caller"));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) async fn finish_caller_stack(
+        &self,
+        option: &CallOption,
+        pending_track: PendingCallerTrack,
+    ) -> Result<()> {
+        self.ensure_call_ambiance(option).await;
+        match pending_track {
+            PendingCallerTrack::NotStarted(track) => {
+                self.setup_track_with_stream(option, track).await?;
+            }
+            PendingCallerTrack::StartedForEarlyMedia => {
+                // Track is already running in the media stream (started during ringing
+                // for early-media ringtone). Build processors from the accept option
+                // and append them to the running caller track.
+                let track_id = self.session_id.clone();
+                let processors = StreamEngine::create_processors(
+                    self.app_state.stream_engine.clone(),
+                    track_id.clone(),
+                    self.cancel_token.child_token(),
+                    self.event_sender.clone(),
+                    self.media_stream.packet_sender.clone(),
+                    option,
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(
+                        session_id = self.session_id,
+                        "failed to create processors on accept: {}", e
+                    );
+                    vec![]
+                });
+                for processor in processors {
+                    self.media_stream
+                        .append_processor(&track_id, processor)
+                        .await
+                        .ok();
+                }
+            }
+        }
+
+        {
+            let call_state = self.progress.load_full();
+            if let Some(ref answer) = call_state.answer {
+                info!(
+                    session_id = self.session_id,
+                    "sending answer event: {}", answer,
+                );
+                self.event_sender
+                    .send(SessionEvent::Answer {
+                        timestamp: crate::media::get_timestamp(),
+                        track_id: self.session_id.clone(),
+                        sdp: answer.clone(),
+                        refer: Some(false),
+                    })
+                    .ok();
+            } else {
+                warn!(
+                    session_id = self.session_id,
+                    "no answer in state to send event"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) async fn ensure_call_ambiance(&self, option: &CallOption) {
+        let opt = self.merged_ambiance(option.ambiance.as_ref());
+        if let Err(e) = self
+            .media_stream
+            .ensure_ambiance(opt, self.server_side_track_id.clone())
+            .await
+        {
+            tracing::error!(
+                session_id = self.session_id,
+                "failed to load ambiance wav {}",
+                e
+            );
+        }
     }
 
     pub(super) async fn create_websocket_track(
@@ -348,20 +552,18 @@ impl ActiveCall {
 
     pub(super) async fn create_outgoing_sip_track(
         &self,
-        cancel_token: CancellationToken,
-        leg: LegShared,
-        track_id: &String,
-        mut invite_option: InviteOption,
-        call_option: &CallOption,
-        moh: Option<String>,
+        mut out: OutgoingLeg,
     ) -> Result<String, rsipstack::Error> {
         // Apply trunk rules (match + rewrite caller/callee/contact) to the
         // outgoing INVITE/REFER before it is sent. Covers both normal invite
         // calls and refer legs since both flow through this function.
-        self.app_state.config.apply_trunk_rules(&mut invite_option);
+        self.app_state
+            .config
+            .apply_trunk_rules(&mut out.invite_option);
 
-        let ssrc = leg.ssrc;
-        let per_call_srtp = call_option.sip.as_ref().and_then(|s| s.enable_srtp);
+        let track_id = &out.track_id;
+        let ssrc = out.leg.ssrc;
+        let per_call_srtp = out.call_option.sip.as_ref().and_then(|s| s.enable_srtp);
         let rtp_track = self
             .create_rtp_track(track_id.clone(), ssrc, per_call_srtp)
             .await
@@ -374,13 +576,14 @@ impl ActiveCall {
                 .map_err(|e| rsipstack::Error::Error(e.to_string()))?,
         );
 
-        leg.update_progress(|p| {
+        out.leg.update_progress(|p| {
             if let Some(o) = p.option.as_mut() {
                 o.offer = offer.clone();
             }
             p.start_time = Some(Utc::now());
         });
 
+        let invite_option = &mut out.invite_option;
         invite_option.offer = offer.clone().map(|s| s.into());
 
         // Set contact to local SIP endpoint address if not already set explicitly
@@ -419,7 +622,7 @@ impl ActiveCall {
 
         let mut rtp_track_to_setup = Some(Box::new(rtp_track) as Box<dyn Track>);
 
-        if let Some(moh) = moh {
+        if let Some(moh) = out.moh.take() {
             let ssrc_and_moh = {
                 self.set_moh(Some(moh.clone()));
                 if self.current_play().is_none() {
@@ -441,7 +644,7 @@ impl ActiveCall {
             }
         } else {
             let track = rtp_track_to_setup.take().unwrap();
-            self.setup_track_with_stream(&call_option, track)
+            self.setup_track_with_stream(&out.call_option, track)
                 .await
                 .map_err(|e| rsipstack::Error::Error(e.to_string()))?;
         }
@@ -465,11 +668,12 @@ impl ActiveCall {
             track_id.clone(),
             self.event_sender.clone(),
             self.media_stream.clone(),
-            leg.clone(),
-            cancel_token,
+            out.leg.clone(),
+            out.cancel_token.clone(),
         );
 
-        let hangup_headers = call_option
+        let hangup_headers = out
+            .call_option
             .sip
             .as_ref()
             .and_then(|s| s.hangup_headers.as_ref())
@@ -487,7 +691,7 @@ impl ActiveCall {
 
         let (dialog_id, answer) = self
             .invitation
-            .invite(invite_option, dlg_state_sender)
+            .invite(out.invite_option, dlg_state_sender)
             .await?;
 
         self.set_moh(None);
@@ -501,14 +705,14 @@ impl ActiveCall {
                 .remove_track(&self.server_side_track_id, false)
                 .await;
 
-            self.setup_track_with_stream(&call_option, track)
+            self.setup_track_with_stream(&out.call_option, track)
                 .await
                 .map_err(|e| rsipstack::Error::Error(e.to_string()))?;
         }
 
         // Resolve the final answer SDP, falling back to the early-media (183)
         // SDP when the 200 OK carries no body.
-        let early_answer = leg.progress.load_full().answer.clone();
+        let early_answer = out.leg.progress.load_full().answer.clone();
         let (answer, remote_description_already_applied) =
             match crate::call::state::resolve_final_answer(answer, early_answer.as_ref()) {
                 Ok(resolved) => resolved,
@@ -522,7 +726,7 @@ impl ActiveCall {
                 }
             };
 
-        leg.update_progress(|p| p.try_set_answer(&answer));
+        out.leg.update_progress(|p| p.try_set_answer(&answer));
 
         if !remote_description_already_applied {
             self.media_stream
@@ -542,7 +746,6 @@ impl ActiveCall {
 
     pub(super) async fn setup_answer_track(
         &self,
-        ssrc: u32,
         option: &CallOption,
         offer: String,
     ) -> Result<(String, Box<dyn Track>)> {
@@ -566,13 +769,13 @@ impl ActiveCall {
                 self.track_config.clone(),
                 rtc_config,
             )
-            .with_ssrc(ssrc);
+            .with_ssrc(self.ssrc);
 
             Box::new(webrtc_track) as Box<dyn Track>
         } else {
             let per_call_srtp = option.sip.as_ref().and_then(|s| s.enable_srtp);
             let rtp_track = self
-                .create_rtp_track(self.session_id.clone(), ssrc, per_call_srtp)
+                .create_rtp_track(self.session_id.clone(), self.ssrc, per_call_srtp)
                 .await?;
             Box::new(rtp_track) as Box<dyn Track>
         };
@@ -589,9 +792,6 @@ impl ActiveCall {
 
     pub(super) async fn prepare_incoming_sip_track(
         &self,
-        runtime: &mut CallRuntime,
-        cancel_token: CancellationToken,
-        track_id: &String,
         pending_dialog: PendingDialog,
         hangup_headers: Option<Vec<rsipstack::rsip::Header>>,
     ) -> Result<()> {
@@ -600,11 +800,11 @@ impl ActiveCall {
         let states = InviteDialogStates::new(
             false,
             self.session_id.clone(),
-            track_id.clone(),
+            self.session_id.clone(),
             self.event_sender.clone(),
             self.media_stream.clone(),
             self.leg(),
-            cancel_token,
+            self.cancel_token.clone(),
         );
 
         let initial_request = pending_dialog.dialog.initial_request();
@@ -642,12 +842,9 @@ impl ActiveCall {
             })
             .ok();
 
-        let (ssrc, option) = {
-            let call_state = self.progress.load_full();
-            (self.ssrc, call_state.option.clone().unwrap_or_default())
-        };
+        let option = self.progress.load_full().option.clone().unwrap_or_default();
 
-        match self.setup_answer_track(ssrc, &option, offer).await {
+        match self.setup_answer_track(&option, offer).await {
             Ok((offer, track)) => {
                 // Start the track in the media stream now — early-media ringtone
                 // requires the RTP sender loop to be running during ringing.
@@ -663,11 +860,11 @@ impl ActiveCall {
                 // update_track_wrapper only starts the track (plus ambiance/subscribe),
                 // deferring all VAD/ASR/AGC processors to accept time.
                 self.update_track_wrapper(track, None).await;
-                runtime.ready_to_answer = Some((
-                    offer,
-                    PendingCallerTrack::StartedForEarlyMedia,
-                    pending_dialog.dialog,
-                ));
+                self.set_ready_to_answer(crate::call::active_call::ReadyAnswer {
+                    answer: offer,
+                    track: PendingCallerTrack::StartedForEarlyMedia,
+                    dialog: pending_dialog.dialog,
+                });
             }
             Err(e) => {
                 return Err(anyhow::anyhow!("error creating track: {}", e));

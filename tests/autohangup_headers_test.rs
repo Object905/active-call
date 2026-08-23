@@ -1,5 +1,6 @@
 use active_call::SipOption;
 use active_call::app::AppStateBuilder;
+use active_call::call::active_call::CallSpec;
 use active_call::call::{ActiveCall, ActiveCallType};
 use active_call::config::Config;
 use active_call::event::SessionEvent;
@@ -53,18 +54,18 @@ async fn test_autohangup_headers_stored_in_extras() -> Result<()> {
         .build()
         .await?;
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        CancellationToken::new(),
-        "test-hangup-headers".to_string(),
-        app_state.invitation.clone(),
-        app_state.clone(),
-        TrackConfig::default(),
-        None,
-        false,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: CancellationToken::new(),
+        session_id: "test-hangup-headers".to_string(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     let mut hangup_headers = HashMap::new();
     hangup_headers.insert("X-Test-Header".to_string(), "test-value".to_string());
@@ -149,18 +150,18 @@ async fn test_autohangup_without_sip_config() -> Result<()> {
         .build()
         .await?;
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        CancellationToken::new(),
-        "test-no-sip-config".to_string(),
-        app_state.invitation.clone(),
-        app_state.clone(),
-        TrackConfig::default(),
-        None,
-        false,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: CancellationToken::new(),
+        session_id: "test-no-sip-config".to_string(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     let llm_config = LlmConfig::default();
 
@@ -228,18 +229,18 @@ async fn test_autohangup_headers_with_template_variables() -> Result<()> {
         .build()
         .await?;
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        CancellationToken::new(),
-        "test-headers-template".to_string(),
-        app_state.invitation.clone(),
-        app_state.clone(),
-        TrackConfig::default(),
-        None,
-        false,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: CancellationToken::new(),
+        session_id: "test-headers-template".to_string(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     // Pre-populate extras with variables
     {

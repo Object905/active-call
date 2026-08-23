@@ -4,7 +4,7 @@ use crate::{
     app::AppState,
     call::{
         ActiveCall, ActiveCallType, Command,
-        active_call::{ActiveCallGuard, CallParams},
+        active_call::{ActiveCallGuard, CallParams, CallSpec},
     },
     handler::playbook,
     playbook::{Playbook, PlaybookRunner},
@@ -115,18 +115,18 @@ pub async fn call_handler_core(
     let _cancel_guard = cancel_token.clone().drop_guard();
     let track_config = TrackConfig::default();
 
-    let active_call = Arc::new(ActiveCall::new(
-        call_type.clone(),
-        cancel_token.clone(),
-        session_id.clone(),
-        app_state.invitation.clone(),
-        app_state.clone(),
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: call_type.clone(),
+        cancel_token: cancel_token.clone(),
+        session_id: session_id.clone(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
         track_config,
-        Some(audio_receiver),
+        audio_receiver: Some(audio_receiver),
         dump_events,
-        server_side_track,
+        server_side_track_id: server_side_track.clone(),
         extras,
-    ));
+    }));
 
     // Load playbook: prefer direct parameter, fall back to pending_playbooks
     // (pending_playbooks is used by the run_playbook HTTP endpoint)

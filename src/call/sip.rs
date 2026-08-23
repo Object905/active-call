@@ -16,6 +16,14 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+/// Remove `id` from the dialog layer and return the dialog, ready to be
+/// hung up. Shared by the dialog guards and `Invitation::hangup`.
+pub(crate) fn remove_dialog(layer: &DialogLayer, id: &DialogId) -> Option<Dialog> {
+    let dialog = layer.get_dialog(id)?;
+    layer.remove_dialog(id);
+    Some(dialog)
+}
+
 pub struct DialogStateReceiverGuard {
     pub(super) dialog_layer: Arc<DialogLayer>,
     pub(super) receiver: DialogStateReceiver,
@@ -45,20 +53,9 @@ impl DialogStateReceiverGuard {
     }
 
     fn take_dialog(&mut self) -> Option<Dialog> {
-        let id = match self.dialog_id.take() {
-            Some(id) => id,
-            None => return None,
-        };
-
-        match self.dialog_layer.get_dialog(&id) {
-            Some(dialog) => {
-                info!(%id, "dialog removed on  drop");
-                self.dialog_layer.remove_dialog(&id);
-                return Some(dialog);
-            }
-            _ => {}
-        }
-        None
+        let id = self.dialog_id.take()?;
+        info!(%id, "dialog removed on  drop");
+        remove_dialog(&self.dialog_layer, &id)
     }
 
     pub async fn drop_async(&mut self) {
@@ -515,12 +512,8 @@ impl Invitation {
         if let Some(call) = self.get_pending_call(&dialog_id) {
             call.dialog.reject(code, reason).ok();
         }
-        match self.dialog_layer.get_dialog(&dialog_id) {
-            Some(dialog) => {
-                self.dialog_layer.remove_dialog(&dialog_id);
-                dialog.hangup().await.ok();
-            }
-            None => {}
+        if let Some(dialog) = remove_dialog(&self.dialog_layer, &dialog_id) {
+            dialog.hangup().await.ok();
         }
         Ok(())
     }
