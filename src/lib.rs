@@ -28,6 +28,7 @@ pub mod net_tool;
 pub mod offline;
 
 pub mod playbook;
+pub mod sip_util;
 pub mod synthesis;
 pub mod transcription;
 pub mod useragent;
@@ -126,11 +127,7 @@ impl CallOption {
         }
         let caller_uri = if let Some(caller) = &self.caller {
             // Ensure caller URI has proper sip: scheme
-            if caller.starts_with("sip:") || caller.starts_with("sips:") {
-                caller.clone()
-            } else {
-                format!("sip:{}", caller)
-            }
+            crate::sip_util::ensure_sip_scheme(caller.clone())
         } else if let Some(username) = self.sip.as_ref().and_then(|sip| sip.username.as_ref()) {
             // If caller is not specified but we have SIP credentials, use username as caller
             // If realm is available, use it, otherwise use local IP
@@ -153,11 +150,10 @@ impl CallOption {
                 password: sip.password.clone().unwrap_or_default(),
                 realm: sip.realm.clone(),
             });
-            invite_option.headers = sip.headers.as_ref().map(|h| {
-                h.iter()
-                    .map(|(k, v)| rsipstack::rsip::Header::Other(k.clone(), v.clone()))
-                    .collect::<Vec<_>>()
-            });
+            invite_option.headers = sip
+                .headers
+                .as_ref()
+                .map(crate::sip_util::sip_headers_from_map);
             sip.contact.as_ref().map(|c| match c.clone().try_into() {
                 Ok(u) => {
                     invite_option.contact = u;

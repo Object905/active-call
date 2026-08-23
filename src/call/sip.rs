@@ -96,6 +96,30 @@ pub(super) struct InviteDialogStates {
 }
 
 impl InviteDialogStates {
+    pub(super) fn new(
+        is_client: bool,
+        session_id: String,
+        track_id: TrackId,
+        event_sender: EventSender,
+        media_stream: Arc<MediaStream>,
+        leg: LegShared,
+        cancel_token: CancellationToken,
+    ) -> Self {
+        Self {
+            is_client,
+            session_id,
+            track_id,
+            cancel_token,
+            event_sender,
+            leg,
+            media_stream,
+            terminated_reason: None,
+            has_early_media: false,
+        }
+    }
+}
+
+impl InviteDialogStates {
     /// Called from `Drop` (synchronous context): everything used here is
     /// lock-free (ArcSwap rcu/load + broadcast send), so no state or events
     /// can be lost the way a failed `try_write` used to lose them.
@@ -402,20 +426,10 @@ impl DialogStateReceiverGuard {
 
         // Update hangup headers from the leg extras if available
         let extras = states.leg.extras.load_full();
-        if let Some(h_val) = extras.get("_hangup_headers") {
-            if let Ok(headers_map) =
-                serde_json::from_value::<HashMap<String, String>>(h_val.clone())
-            {
-                let headers = headers_map
-                    .into_iter()
-                    .map(|(k, v)| rsipstack::rsip::Header::Other(k.into(), v.into()))
-                    .collect::<Vec<_>>();
-                if !headers.is_empty() {
-                    match &mut self.hangup_headers {
-                        Some(existing) => existing.extend(headers),
-                        None => self.hangup_headers = Some(headers),
-                    }
-                }
+        if let Some(headers) = crate::sip_util::hangup_headers_from_extras(&extras) {
+            match &mut self.hangup_headers {
+                Some(existing) => existing.extend(headers),
+                None => self.hangup_headers = Some(headers),
             }
         }
 
@@ -804,6 +818,9 @@ mod tests {
         // writer only ever writes 100, so observing 487 proves the rcu landed.
         let progress = leg.progress.load_full();
         assert_eq!(progress.last_status_code, 487);
-        assert_eq!(progress.hangup_reason, Some(crate::callrecord::CallRecordHangupReason::Canceled));
+        assert_eq!(
+            progress.hangup_reason,
+            Some(crate::callrecord::CallRecordHangupReason::Canceled)
+        );
     }
 }

@@ -254,12 +254,8 @@ impl InvitationHandler for PlaybookInvitationHandler {
                         })
                     });
 
-                    let sip_headers = headers.map(|h_map| {
-                        h_map
-                            .into_iter()
-                            .map(|(k, v)| rsipstack::rsip::Header::Other(k.into(), v.into()))
-                            .collect::<Vec<_>>()
-                    });
+                    let sip_headers =
+                        headers.map(|h_map| crate::sip_util::sip_headers_from_map(&h_map));
 
                     // Terminate the SIP dialog
                     if let Err(e) = dialog.bye_with_headers(sip_headers).await {

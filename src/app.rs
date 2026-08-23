@@ -22,6 +22,7 @@ use crate::{
 use crate::media::{cache::set_cache_dir, engine::StreamEngine};
 use anyhow::Result;
 use arc_swap::ArcSwap;
+use async_trait::async_trait;
 use chrono::{DateTime, Local};
 use futures::FutureExt;
 use humantime::parse_duration;
@@ -31,12 +32,14 @@ use rsipstack::transaction::{
     Endpoint, TransactionReceiver,
     endpoint::{TargetLocator, TransportEventInspector},
 };
-use rsipstack::{dialog::dialog_layer::DialogLayer, transaction::endpoint::MessageInspector};
 use rsipstack::transport::transport_layer::DomainResolver;
-use rsipstack::{rsip::{Host, HostWithPort}, transport::SipAddr};
-use async_trait::async_trait;
+use rsipstack::{dialog::dialog_layer::DialogLayer, transaction::endpoint::MessageInspector};
+use rsipstack::{
+    rsip::{Host, HostWithPort},
+    transport::SipAddr,
+};
 use std::future::pending;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -602,15 +605,7 @@ impl AppStateInner {
     }
 
     pub fn find_credentials_for_callee(&self, callee: &str) -> Option<UserCredential> {
-        let callee_uri = callee
-            .strip_prefix("sip:")
-            .or_else(|| callee.strip_prefix("sips:"))
-            .unwrap_or(callee);
-        let callee_uri = if !callee_uri.starts_with("sip:") && !callee_uri.starts_with("sips:") {
-            format!("sip:{}", callee_uri)
-        } else {
-            callee_uri.to_string()
-        };
+        let callee_uri = crate::sip_util::ensure_sip_scheme(callee.to_string());
 
         let parsed_callee = match rsipstack::rsip::Uri::try_from(callee_uri.as_str()) {
             Ok(uri) => uri,
@@ -628,10 +623,7 @@ impl AppStateInner {
         // Look through registered users to find one matching this domain
         if let Some(register_users) = &self.config.register_users {
             for option in register_users.iter() {
-                let mut server = option.server.clone();
-                if !server.starts_with("sip:") && !server.starts_with("sips:") {
-                    server = format!("sip:{}", server);
-                }
+                let server = crate::sip_util::ensure_sip_scheme(option.server.clone());
 
                 let parsed_server = match rsipstack::rsip::Uri::try_from(server.as_str()) {
                     Ok(uri) => uri,
@@ -688,10 +680,7 @@ impl AppStateInner {
     ) -> Option<crate::useragent::registration::UserCredential> {
         if let Some(register_users) = &self.config.register_users {
             for option in register_users.iter() {
-                let mut server = option.server.clone();
-                if !server.starts_with("sip:") && !server.starts_with("sips:") {
-                    server = format!("sip:{}", server);
-                }
+                let server = crate::sip_util::ensure_sip_scheme(option.server.clone());
 
                 if let Ok(parsed_server) = rsipstack::rsip::Uri::try_from(server.as_str()) {
                     if let rsipstack::rsip::Host::IpAddr(server_ip) =
@@ -753,10 +742,7 @@ impl AppStateInner {
 
     pub async fn register(&self, option: RegisterOption) -> Result<()> {
         let user = option.aor();
-        let mut server = option.server.clone();
-        if !server.starts_with("sip:") && !server.starts_with("sips:") {
-            server = format!("sip:{}", server);
-        }
+        let server = crate::sip_util::ensure_sip_scheme(option.server.clone());
         let sip_server = match rsipstack::rsip::Uri::try_from(server) {
             Ok(uri) => uri,
             Err(e) => {
@@ -1001,7 +987,9 @@ impl AppStateBuilder {
         })) {
             Ok(tl) => tl,
             Err(_) => {
-                warn!("failed to initialize default DNS resolver with hickory-resolver, falling back to simple resolver via tokio::net::lookup_host");
+                warn!(
+                    "failed to initialize default DNS resolver with hickory-resolver, falling back to simple resolver via tokio::net::lookup_host"
+                );
                 rsipstack::transport::TransportLayer::new_with_domain_resolver(
                     token.clone(),
                     Box::new(SimpleDomainResolver),
