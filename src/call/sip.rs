@@ -91,6 +91,14 @@ pub(super) struct InviteDialogStates {
     pub media_stream: Arc<MediaStream>,
     pub terminated_reason: Option<TerminatedReason>,
     pub has_early_media: bool,
+    /// Set once the initial INVITE's answer has been applied via
+    /// `DialogState::Confirmed`. rsipstack reuses the same `Confirmed` event
+    /// for the ACK of a re-INVITE we received (see `handle_reinvite`), but
+    /// in that case the body is the PBX's own locally-generated answer, not
+    /// a remote description — that re-invite was already fully handled via
+    /// `DialogState::Updated`/`handshake()`. Re-applying it here corrupts
+    /// the peer connection's remote SSRC/address with our own values.
+    initial_confirmed: bool,
     /// Hangup intent carried by this leg (refer legs with `auto_hangup`),
     /// reported on the leg's TrackEnd so the call actor can hang up.
     pub hangup_reason: Option<CallRecordHangupReason>,
@@ -117,6 +125,7 @@ impl InviteDialogStates {
             media_stream,
             terminated_reason: None,
             has_early_media: false,
+            initial_confirmed: false,
             hangup_reason,
         }
     }
@@ -210,7 +219,8 @@ impl DialogStateReceiverGuard {
                     states
                         .leg
                         .update_progress(|p| p.on_confirmed(dialog_id.to_string()));
-                    if states.is_client {
+                    if states.is_client && !states.initial_confirmed {
+                        states.initial_confirmed = true;
                         let answer = String::from_utf8_lossy(msg.body());
                         let answer = answer.trim();
                         if !answer.is_empty() {
