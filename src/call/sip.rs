@@ -611,6 +611,7 @@ mod tests {
             media_stream,
             terminated_reason: None,
             has_early_media,
+            initial_confirmed: false,
             hangup_reason: None,
         }
     }
