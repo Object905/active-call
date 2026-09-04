@@ -1166,7 +1166,7 @@ impl ActiveCall {
 
     async fn dispatch(&self, runtime: &mut CallRuntime, command: Command) -> Result<()> {
         match command {
-            Command::Invite { option } => self.do_invite(option).await,
+            Command::Invite { option } => self.do_invite(runtime, option).await,
             Command::Accept { option } => self.do_accept(option).await,
             Command::Reject { reason, code } => {
                 self.do_reject(code.map(|c| (c as u16).into()), Some(reason))
@@ -1334,10 +1334,32 @@ impl ActiveCall {
         }
     }
 
-    async fn do_invite(&self, option: CallOption) -> Result<()> {
-        self.invite_or_accept(option, "invite".to_string())
-            .await
-            .map(|_| ())
+    async fn do_invite(&self, runtime: &mut CallRuntime, option: CallOption) -> Result<()> {
+        // Run the INVITE handshake in the background so the actor keeps
+        // serving media (and everything else) while the call rings - same
+        // reasoning as do_refer below. invite_or_accept blocks on the SIP
+        // transaction for the entire ring duration; handling that inline on
+        // the actor's own select loop would freeze media_stream.serve() (and
+        // therefore all live audio bridging for this leg) for just as long.
+        let me = runtime
+            .me
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("invite is only supported inside serve()"))?;
+        crate::spawn(async move {
+            if let Err(e) = me.invite_or_accept(option, "invite".to_string()).await {
+                warn!(session_id = me.session_id, "{}", e);
+                me.event_sender
+                    .send(SessionEvent::Error {
+                        track_id: me.session_id.clone(),
+                        timestamp: crate::media::get_timestamp(),
+                        sender: "command".to_string(),
+                        error: e.to_string(),
+                        code: None,
+                    })
+                    .ok();
+            }
+        });
+        Ok(())
     }
 
     async fn do_accept(&self, mut option: CallOption) -> Result<()> {
