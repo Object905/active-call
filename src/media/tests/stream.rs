@@ -764,6 +764,85 @@ async fn test_ambiance_idle_fills_without_tts() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_ambiance_idle_is_recorded_into_right_channel() -> Result<()> {
+    use crate::media::stream::SERVER_SIDE_TRACK_ID;
+
+    let wav_path = write_loud_ambiance_wav().await?;
+
+    let rec_dir = tempdir()?;
+    let file_path = rec_dir.path().join("recording.wav");
+    let event_sender = crate::event::create_event_sender();
+    let stream = Arc::new(
+        MediaStreamBuilder::new(event_sender)
+            .with_recorder_config(RecorderOption {
+                recorder_file: file_path.to_string_lossy().to_string(),
+                ..Default::default()
+            })
+            .build(),
+    );
+
+    // Production order: serve (starts recorder), user track, then ambiance. No TTS.
+    let serve_stream = stream.clone();
+    let handle = tokio::spawn(async move {
+        serve_stream.serve().await.ok();
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let received = Arc::new(Mutex::new(Vec::new()));
+    stream
+        .update_track(
+            Box::new(CollectTrack::new("user".to_string(), received.clone())),
+            None,
+        )
+        .await;
+
+    stream
+        .ensure_ambiance(
+            ambiance_option(wav_path.to_str().unwrap()),
+            SERVER_SIDE_TRACK_ID.to_string(),
+        )
+        .await?
+        .expect("ambiance should load");
+
+    // Let the idle loop play ~0.5s of background audio.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    stream.stop(None, None);
+    handle.abort();
+    // The recorder flushes buffered samples on cancellation; give it time
+    // to finalize the wav file.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut reader = hound::WavReader::open(&file_path)?;
+    assert_eq!(reader.spec().channels, 2);
+    assert_eq!(reader.spec().sample_rate, 16000);
+
+    // Interleaved stereo: even samples = left (caller), odd = right (server side).
+    let mut right_loud = 0usize;
+    let mut left_max = 0i32;
+    for (i, s) in reader.samples::<i16>().enumerate() {
+        let s = s? as i32;
+        if i % 2 == 0 {
+            left_max = left_max.max(s.abs());
+        } else if s.abs() > 1000 {
+            right_loud += 1;
+        }
+    }
+
+    assert!(
+        right_loud >= 3200,
+        "idle ambiance must be recorded into the right channel; got {} loud samples (~{}ms)",
+        right_loud,
+        right_loud / 16
+    );
+    assert_eq!(
+        left_max, 0,
+        "left channel must stay silent without caller audio"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_ambiance_idle_resumes_after_tts_stops() -> Result<()> {
     use crate::media::INTERNAL_SAMPLERATE;
     use crate::media::ambiance::AmbianceOption;

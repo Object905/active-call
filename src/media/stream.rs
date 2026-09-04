@@ -40,6 +40,10 @@ pub struct MediaStream {
     recorder_sender: mpsc::UnboundedSender<AudioFrame>,
     recorder_receiver: Mutex<Option<mpsc::UnboundedReceiver<AudioFrame>>>,
     recorder_handle: Mutex<Option<JoinHandle<()>>>,
+    /// True once a recorder task is actually consuming `recorder_sender`.
+    /// The ambiance idle loop mirrors its frames to the recorder only when
+    /// this is set, avoiding unbounded buffering when recording starts late.
+    recording_active: Arc<AtomicBool>,
     ambiance: Mutex<Option<Arc<StdMutex<AmbianceProcessor>>>>,
     ambiance_source_id: StdMutex<Option<TrackId>>,
     last_server_packet_ts: Arc<AtomicU64>,
@@ -105,6 +109,7 @@ impl MediaStreamBuilder {
             recorder_sender,
             recorder_receiver: Mutex::new(Some(recorder_receiver)),
             recorder_handle: Mutex::new(None),
+            recording_active: Arc::new(AtomicBool::new(false)),
             ambiance: Mutex::new(None),
             ambiance_source_id: StdMutex::new(None),
             last_server_packet_ts: Arc::new(AtomicU64::new(0)),
@@ -171,6 +176,8 @@ impl MediaStream {
         let packet_sender = self.packet_sender.clone();
         let last_server_packet_ts = self.last_server_packet_ts.clone();
         let session_id = self.id.clone();
+        let recorder_sender = self.recorder_sender.clone();
+        let recording_active = self.recording_active.clone();
 
         crate::spawn(async move {
             let mut ticker = tokio::time::interval(AMBIANCE_IDLE_PTIME);
@@ -205,6 +212,14 @@ impl MediaStream {
                         }
                         if matches!(frame.samples, Samples::Empty) {
                             continue;
+                        }
+                        // Mirror the mixed idle ambiance into the recording so the
+                        // stereo WAV's server-side channel reflects what the user
+                        // actually heard, including silent-period background audio.
+                        if recording_active.load(Ordering::SeqCst) {
+                            let mut recorded = frame.clone();
+                            recorded.track_id = SERVER_SIDE_TRACK_ID.to_string();
+                            let _ = recorder_sender.send(recorded);
                         }
                         if packet_sender.send(frame).is_err() {
                             debug!(session_id, "ambiance idle sender closed");
@@ -575,6 +590,7 @@ impl MediaStream {
                 }
             });
             *self.recorder_handle.lock().await = Some(recorder_handle);
+            self.recording_active.store(true, Ordering::SeqCst);
 
             // Inject RecorderProcessor into tracks that were added before the recorder started
             for (track, _) in self.tracks.lock().await.values_mut() {
