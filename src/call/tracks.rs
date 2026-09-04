@@ -698,6 +698,28 @@ impl ActiveCall {
             .invite(out.invite_option, dlg_state_sender)
             .await?;
 
+        if out.cancel_token.is_cancelled() {
+            // CANCEL and the far end's 2xx crossed in flight (RFC 3261 S9.1
+            // glare) - e.g. a slow PSTN gateway had already committed to
+            // alerting the handset by the time our CANCEL arrived, and it
+            // answered anyway. do_invite already ACKed the 2xx; per spec we
+            // must now BYE it instead of treating this as a normal answer -
+            // the ActiveCall session this invite belongs to is already gone.
+            if let Some(dialog) = self.invitation.dialog_layer.get_dialog(&dialog_id) {
+                if let Err(e) = dialog.hangup().await {
+                    warn!(
+                        session_id = self.session_id,
+                        "failed to BYE a late-confirmed cancelled invite: {}", e
+                    );
+                }
+            }
+            return Err(rsipstack::Error::DialogError(
+                "invite was cancelled before this late answer arrived".to_string(),
+                dialog_id,
+                rsipstack::rsip::StatusCode::RequestTerminated,
+            ));
+        }
+
         self.set_moh(None);
 
         if let Some(track) = rtp_track_to_setup {
