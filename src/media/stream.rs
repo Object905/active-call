@@ -317,6 +317,25 @@ impl MediaStream {
         Ok(())
     }
 
+    /// Apply a provisional remote description (SIP 183 early media). See
+    /// `Track::update_remote_description_provisional`.
+    pub async fn update_remote_description_provisional(
+        &self,
+        track_id: &TrackId,
+        answer: &String,
+    ) -> Result<()> {
+        let track_entry = { self.tracks.lock().await.remove(track_id) };
+        if let Some((mut track, dtmf)) = track_entry {
+            let res = track.update_remote_description_provisional(answer).await;
+            self.tracks
+                .lock()
+                .await
+                .insert(track_id.clone(), (track, dtmf));
+            res?;
+        }
+        Ok(())
+    }
+
     pub async fn handshake(
         &self,
         track_id: &TrackId,
