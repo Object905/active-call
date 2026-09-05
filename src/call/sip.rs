@@ -56,7 +56,21 @@ impl DialogStateReceiverGuard {
     fn take_dialog(&mut self) -> Option<Dialog> {
         let id = self.dialog_id.take()?;
         info!(%id, "dialog removed on  drop");
-        remove_dialog(&self.dialog_layer, &id)
+        if let Some(dialog) = remove_dialog(&self.dialog_layer, &id) {
+            return Some(dialog);
+        }
+        // A client dialog is only re-registered under its tag-bearing id once
+        // do_invite's process_invite() fully completes; while still ringing
+        // it's registered under the pre-response id (empty remote tag). Our
+        // tracked `id` already reflects whatever tag the latest DialogState
+        // event carried (e.g. a 183's), so the exact-key lookup above misses
+        // it for any dialog hung up before it's confirmed. Fall back to a
+        // call-id scan, which is unaffected by that id mutation.
+        self.dialog_layer
+            .get_client_dialog_by_call_id(&id.call_id)
+            .into_iter()
+            .next()
+            .map(Dialog::Invite)
     }
 
     pub async fn drop_async(&mut self) {
