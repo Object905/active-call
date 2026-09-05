@@ -583,13 +583,15 @@ impl RtcTrack {
         &mut self,
         answer: &String,
         force_update: bool,
+        sdp_type: rustrtc::SdpType,
     ) -> Result<()> {
         info!(
             track_id=%self.track_id,
-            "update_remote_description_internal called. force={}, last_sdp_is_some={}, mode={:?}",
+            "update_remote_description_internal called. force={}, last_sdp_is_some={}, mode={:?}, sdp_type={:?}",
             force_update,
             self.last_remote_sdp.is_some(),
-            self.rtc_config.mode
+            self.rtc_config.mode,
+            sdp_type
         );
 
         if let Some(pc) = &self.peer_connection {
@@ -606,7 +608,7 @@ impl RtcTrack {
 
             let _is_first_remote_sdp = self.last_remote_sdp.is_none();
 
-            let sdp_obj = rustrtc::SessionDescription::parse(rustrtc::SdpType::Answer, answer)?;
+            let sdp_obj = rustrtc::SessionDescription::parse(sdp_type, answer)?;
             match pc.set_remote_description(sdp_obj.clone()).await {
                 Ok(_) => {
                     debug!(track_id=%self.track_id, "set_remote_description succeeded");
@@ -647,7 +649,7 @@ impl RtcTrack {
             // Track events will be handled by the event loop after SSRC latching
 
             // Extract negotiated payload types from SDP string
-            self.parse_sdp_payload_types(rustrtc::SdpType::Answer, answer)?;
+            self.parse_sdp_payload_types(sdp_type, answer)?;
         }
         Ok(())
     }
@@ -715,11 +717,25 @@ impl Track for RtcTrack {
     }
 
     async fn update_remote_description(&mut self, answer: &String) -> Result<()> {
-        self.update_remote_description_internal(answer, false).await
+        self.update_remote_description_internal(answer, false, rustrtc::SdpType::Answer)
+            .await
     }
 
     async fn update_remote_description_force(&mut self, answer: &String) -> Result<()> {
-        self.update_remote_description_internal(answer, true).await
+        self.update_remote_description_internal(answer, true, rustrtc::SdpType::Answer)
+            .await
+    }
+
+    async fn update_remote_description_provisional(&mut self, answer: &String) -> Result<()> {
+        // SIP 183 early media: apply as a provisional answer so signaling
+        // state stays in HaveLocalOffer, leaving room for the real 200 OK
+        // answer to complete negotiation. Tagging this as a full Answer (as
+        // the final answer does) would move state to Stable early, so the
+        // real answer would then be rejected as an invalid re-application
+        // and only recover via the SDP-mismatch re-sync fallback below —
+        // losing/disrupting the media path for the ringing window.
+        self.update_remote_description_internal(answer, false, rustrtc::SdpType::Pranswer)
+            .await
     }
 
     async fn start(

@@ -81,6 +81,13 @@ pub trait Track: Send + Sync {
         // Default implementation: force update is same as regular update for most tracks
         self.update_remote_description(answer).await
     }
+    /// Apply a provisional remote description (SIP 183 early media). Unlike
+    /// `update_remote_description`, this must not finalize SDP negotiation —
+    /// the real answer (200 OK) is still to come. Default: same as a regular
+    /// update, for track types that don't have a signaling state machine.
+    async fn update_remote_description_provisional(&mut self, answer: &String) -> Result<()> {
+        self.update_remote_description(answer).await
+    }
     async fn start(
         &mut self,
         event_sender: EventSender,

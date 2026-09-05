@@ -201,7 +201,10 @@ impl DialogStateReceiverGuard {
                         states.leg.update_progress(|p| p.try_set_answer(&answer));
                         states
                             .media_stream
-                            .update_remote_description(&states.track_id, &answer.to_string())
+                            .update_remote_description_provisional(
+                                &states.track_id,
+                                &answer.to_string(),
+                            )
                             .await?;
                     }
                 }
