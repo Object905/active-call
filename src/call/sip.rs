@@ -852,4 +852,116 @@ mod tests {
             Some(crate::callrecord::CallRecordHangupReason::Canceled)
         );
     }
+
+    /// A minimal counting track that records how many times its remote
+    /// description was (force-)updated, without touching any real media.
+    struct CountingTrack {
+        id: TrackId,
+        config: crate::media::track::TrackConfig,
+        processor_chain: crate::media::processor::ProcessorChain,
+        updates: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::media::track::Track for CountingTrack {
+        fn ssrc(&self) -> u32 {
+            0
+        }
+        fn id(&self) -> &TrackId {
+            &self.id
+        }
+        fn config(&self) -> &crate::media::track::TrackConfig {
+            &self.config
+        }
+        fn processor_chain(&mut self) -> &mut crate::media::processor::ProcessorChain {
+            &mut self.processor_chain
+        }
+        async fn handshake(
+            &mut self,
+            _offer: String,
+            _timeout: Option<tokio::time::Duration>,
+        ) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn update_remote_description(&mut self, _answer: &String) -> Result<()> {
+            self.updates
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn update_remote_description_force(&mut self, _answer: &String) -> Result<()> {
+            self.updates
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn start(
+            &mut self,
+            _event_sender: EventSender,
+            _packet_sender: crate::media::track::TrackPacketSender,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn stop(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn send_packet(&mut self, _packet: &crate::media::AudioFrame) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Regression: a client dialog must apply its remote SDP answer exactly
+    /// once. The `initial_confirmed` guard exists because the final `Confirmed`
+    /// event fires both when the 200 OK is processed *and* again when the ACK
+    /// for the re-INVITE completes; without the guard the answer would be
+    /// re-applied (and a duplicate `TrackStart`/`SessionEvent::Answer` emitted).
+    #[tokio::test]
+    async fn test_confirmed_applies_remote_answer_only_once() {
+        let mut states = make_states(false);
+
+        let updates = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let track = CountingTrack {
+            id: states.track_id.clone(),
+            config: crate::media::track::TrackConfig::default(),
+            processor_chain: crate::media::processor::ProcessorChain::new(16000),
+            updates: updates.clone(),
+        };
+        states
+            .media_stream
+            .update_track(Box::new(track), None)
+            .await;
+
+        let endpoint = {
+            let mut builder = rsipstack::EndpointBuilder::new();
+            builder.build()
+        };
+        let dialog_layer = Arc::new(DialogLayer::new(endpoint.inner.clone()));
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DialogState>();
+        let mut guard = DialogStateReceiverGuard::new(dialog_layer, rx, None);
+
+        let dialog_id = DialogId {
+            call_id: "test-call-id".to_string(),
+            local_tag: "test-local-tag".to_string(),
+            remote_tag: "test-remote-tag".to_string(),
+        };
+
+        let mut resp = rsipstack::rsip::Response::default();
+        resp.body = EARLY_MEDIA_SDP.as_bytes().to_vec();
+
+        // Two Confirmed events (200 OK + re-INVITE ACK) must only apply once.
+        tx.send(DialogState::Confirmed(dialog_id.clone(), resp.clone()))
+            .unwrap();
+        tx.send(DialogState::Confirmed(dialog_id, resp)).unwrap();
+        drop(tx);
+
+        guard
+            .dialog_event_loop(&mut states)
+            .await
+            .expect("dialog event loop must complete");
+
+        assert_eq!(
+            updates.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "remote answer must be applied exactly once, not on the re-INVITE ACK Confirmed event"
+        );
+    }
 }

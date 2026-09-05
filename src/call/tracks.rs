@@ -754,7 +754,17 @@ impl ActiveCall {
 
         out.leg.update_progress(|p| p.try_set_answer(&answer));
 
-        if !remote_description_already_applied {
+        if remote_description_already_applied {
+            // The 200 OK carried no body, so the early-media (183) SDP *is*
+            // the answer. It was applied provisionally (Pranswer) while
+            // ringing; re-apply it as a final Answer so the peer connection's
+            // signaling state stabilizes. A plain update would be skipped by
+            // the SDP-equality fast path, so force it.
+            self.media_stream
+                .update_remote_description_force(&track_id, &answer)
+                .await
+                .ok();
+        } else {
             self.media_stream
                 .update_remote_description(&track_id, &answer)
                 .await

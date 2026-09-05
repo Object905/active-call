@@ -1032,4 +1032,112 @@ a=sendrecv\r\n";
             panic!("PeerConnection not initialized");
         }
     }
+
+    /// Build an RTP-mode RtcTrack that has already generated its local offer,
+    /// returning the track together with its peer connection.
+    async fn rtp_track_with_local_offer(id: &str) -> RtcTrack {
+        let mut rtc_config = RtcTrackConfig::default();
+        rtc_config.mode = rustrtc::TransportMode::Rtp;
+        rtc_config.preferred_codec = Some(CodecType::PCMU);
+        rtc_config.codecs = vec![CodecType::PCMU, CodecType::PCMA];
+
+        let mut track = RtcTrack::new(
+            CancellationToken::new(),
+            id.to_string(),
+            TrackConfig {
+                codec: CodecType::PCMU,
+                samplerate: 8000,
+                ..Default::default()
+            },
+            rtc_config,
+        );
+        track.create().await.expect("create peer connection");
+        track.local_description().await.expect("local offer");
+        track
+    }
+
+    const PCMU_SDP_1: &str = "v=0\r\n\
+        o=- 0 0 IN IP4 127.0.0.1\r\n\
+        s=-\r\n\
+        c=IN IP4 127.0.0.1\r\n\
+        t=0 0\r\n\
+        m=audio 10000 RTP/AVP 0\r\n\
+        a=rtpmap:0 PCMU/8000\r\n";
+
+    const PCMU_SDP_2: &str = "v=0\r\n\
+        o=- 0 1 IN IP4 127.0.0.1\r\n\
+        s=-\r\n\
+        c=IN IP4 127.0.0.1\r\n\
+        t=0 0\r\n\
+        m=audio 20000 RTP/AVP 0\r\n\
+        a=rtpmap:0 PCMU/8000\r\n";
+
+    /// SIP 183 early media must be applied as a provisional answer (Pranswer),
+    /// keeping the signaling state in HaveLocalOffer, so the final 200 OK can
+    /// still complete the negotiation as a full Answer.
+    #[tokio::test]
+    async fn test_pranswer_keeps_local_offer_until_final_answer() {
+        use rustrtc::SignalingState;
+
+        let mut track = rtp_track_with_local_offer("test-pranswer").await;
+        let pc = track.peer_connection.clone().expect("peer connection");
+
+        assert_eq!(
+            pc.signaling_state(),
+            SignalingState::HaveLocalOffer,
+            "after local offer"
+        );
+
+        track
+            .update_remote_description_provisional(&PCMU_SDP_1.to_string())
+            .await
+            .expect("apply 183 as provisional answer");
+
+        assert_eq!(
+            pc.signaling_state(),
+            SignalingState::HaveLocalOffer,
+            "183 (Pranswer) must not finalize negotiation"
+        );
+
+        track
+            .update_remote_description_force(&PCMU_SDP_2.to_string())
+            .await
+            .expect("apply 200 OK as final answer");
+
+        assert_eq!(
+            pc.signaling_state(),
+            SignalingState::Stable,
+            "final 200 OK answer must stabilize signaling"
+        );
+    }
+
+    /// When the 200 OK carries no body after early media, the early SDP is
+    /// re-applied as a final Answer. Even though it is byte-for-byte the same
+    /// SDP as the provisional answer, the forced update must still transition
+    /// the signaling state from HaveLocalOffer to Stable.
+    #[tokio::test]
+    async fn test_pranswer_finalized_with_force_even_when_sdp_unchanged() {
+        use rustrtc::SignalingState;
+
+        let mut track = rtp_track_with_local_offer("test-pranswer-force").await;
+        let pc = track.peer_connection.clone().expect("peer connection");
+
+        track
+            .update_remote_description_provisional(&PCMU_SDP_1.to_string())
+            .await
+            .expect("apply 183 as provisional answer");
+        assert_eq!(pc.signaling_state(), SignalingState::HaveLocalOffer);
+
+        // Final answer resolves to the same SDP (empty 200 OK body fallback).
+        track
+            .update_remote_description_force(&PCMU_SDP_1.to_string())
+            .await
+            .expect("re-apply early SDP as final answer");
+
+        assert_eq!(
+            pc.signaling_state(),
+            SignalingState::Stable,
+            "forced final answer must stabilize even with unchanged SDP"
+        );
+    }
 }
