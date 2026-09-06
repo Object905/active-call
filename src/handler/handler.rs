@@ -332,11 +332,20 @@ pub async fn call_handler(
     // Only an empty `forward` may hop to peers. Any present value is local-only.
     // `forward=true` probes 404 if the call is absent so the originator can try
     // the next peer instead of creating a new call.
+    //
+    // A ringing inbound SIP call only exists as a pending dialog (registered by
+    // the INVITE handler), not yet in `active_calls` — the ActiveCall is
+    // created by the websocket attach below. Treat pending dialogs as hosted
+    // locally so the attach neither probes peers nor 404s (same predicate the
+    // ActiveCall itself uses to resolve its SIP dialog).
     if has_explicit_id {
         let found_locally = {
             let active_calls = app_state.active_calls.lock().unwrap();
             active_calls.contains_key(&session_id)
-        };
+        } || app_state
+            .invitation
+            .find_dialog_id_by_session_id(&session_id)
+            .is_some();
         if !found_locally {
             if params.forward.is_none() {
                 if let Some(peer_ws) =
