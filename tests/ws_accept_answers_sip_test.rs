@@ -31,24 +31,26 @@ use tracing::{info, Level};
 struct WebhookPayload {
     #[serde(rename = "dialogId")]
     dialog_id: String,
+    #[serde(rename = "sipCallId")]
+    sip_call_id: String,
     event: String,
 }
 
 struct TestNode {
     http_port: u16,
     sip_port: u16,
-    dialog_rx: mpsc::Receiver<String>,
+    webhook_rx: mpsc::Receiver<WebhookPayload>,
 }
 
 async fn spawn_node(sip_port: u16, codecs: Vec<String>) -> TestNode {
-    // Webhook server that reports the dialog id back to the test.
-    let (dialog_tx, dialog_rx) = mpsc::channel::<String>(1);
+    // Webhook server that reports the invite payload back to the test.
+    let (webhook_tx, webhook_rx) = mpsc::channel::<WebhookPayload>(1);
     let webhook = axum::Router::new().route(
         "/mock-handler",
         axum::routing::post(
             move |axum::Json(payload): axum::Json<WebhookPayload>| async move {
                 if payload.event == "invite" {
-                    let _ = dialog_tx.try_send(payload.dialog_id);
+                    let _ = webhook_tx.try_send(payload);
                 }
                 axum::Json(serde_json::json!({"status": "ok"}))
             },
@@ -104,7 +106,7 @@ async fn spawn_node(sip_port: u16, codecs: Vec<String>) -> TestNode {
     TestNode {
         http_port,
         sip_port,
-        dialog_rx,
+        webhook_rx,
     }
 }
 
@@ -221,15 +223,23 @@ type WsReceiver = futures::stream::SplitStream<WsStream>;
 
 /// Attach a bot websocket to the ringing call and send `accept`.
 async fn attach_and_accept(node: &mut TestNode, call_id: &str) -> (WsSender, WsReceiver) {
-    let dialog_id = tokio::time::timeout(Duration::from_secs(5), node.dialog_rx.recv())
+    let payload = tokio::time::timeout(Duration::from_secs(5), node.webhook_rx.recv())
         .await
         .expect("webhook not called")
         .expect("webhook channel closed");
-    assert!(
-        dialog_id.starts_with(call_id),
-        "unexpected dialog id {dialog_id}"
+    // `sipCallId` carries the raw SIP Call-ID for correlation; `dialogId` is
+    // the short public session id (s.<12 hex>) used to attach the websocket.
+    assert_eq!(
+        payload.sip_call_id, call_id,
+        "unexpected sip call id {}",
+        payload.sip_call_id
     );
-    info!(%dialog_id, "got dialog id from webhook");
+    let dialog_id = payload.dialog_id;
+    assert!(
+        dialog_id.starts_with("s.") && dialog_id.len() <= 16,
+        "unexpected session id {dialog_id}"
+    );
+    info!(%dialog_id, "got session id from webhook");
 
     let (ws, _) =
         connect_async(format!("ws://127.0.0.1:{}/call?id={dialog_id}", node.http_port))

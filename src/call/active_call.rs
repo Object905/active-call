@@ -726,6 +726,11 @@ impl Drop for ActiveCallGuard {
             .lock()
             .unwrap()
             .remove(&self.call.session_id);
+        // Idempotent cleanup of the incoming-call session-id mapping (no-op
+        // for outgoing/websocket sessions that were never registered).
+        self.call
+            .invitation
+            .unregister_session(&self.call.session_id);
     }
 }
 
@@ -2139,6 +2144,17 @@ impl ActiveCall {
             .as_ref()
             .filter(|id| !id.is_empty())
             .and_then(|id| self.invitation.dialog_layer.get_dialog_with(id));
+
+        // Incoming sessions use short session ids, so resolve them through the
+        // session-id mapping before falling back to a dialog-id string scan.
+        if dialog.is_none() {
+            if let Some(target_id) = dialog_key.as_ref().filter(|id| !id.is_empty()) {
+                dialog = self
+                    .invitation
+                    .find_dialog_id_by_session_id(target_id)
+                    .and_then(|dialog_id| self.invitation.dialog_layer.get_dialog(&dialog_id));
+            }
+        }
 
         if dialog.is_none() {
             if let Some(target_id) = dialog_key.as_ref().filter(|id| !id.is_empty()) {

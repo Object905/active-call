@@ -22,6 +22,8 @@ pub struct PendingDialog {
 }
 pub struct PendingDialogGuard {
     pub id: DialogId,
+    /// Short public session id registered for this dialog; removed on drop.
+    pub session_id: Option<String>,
     pub invitation: Invitation,
 }
 
@@ -29,7 +31,27 @@ impl PendingDialogGuard {
     pub fn new(invitation: Invitation, id: DialogId, pending_dialog: PendingDialog) -> Self {
         invitation.add_pending(id.clone(), pending_dialog);
         info!(%id, "added pending dialog");
-        Self { id, invitation }
+        Self {
+            id,
+            session_id: None,
+            invitation,
+        }
+    }
+
+    pub fn new_with_session(
+        invitation: Invitation,
+        id: DialogId,
+        session_id: String,
+        pending_dialog: PendingDialog,
+    ) -> Self {
+        invitation.add_pending(id.clone(), pending_dialog);
+        invitation.register_session(&session_id, &id);
+        info!(%id, %session_id, "added pending dialog");
+        Self {
+            id,
+            session_id: Some(session_id),
+            invitation,
+        }
     }
 
     fn take_dialog(&self) -> Option<Dialog> {
@@ -38,6 +60,9 @@ impl PendingDialogGuard {
         remove_dialog(&self.invitation.dialog_layer, &dialog_id)
     }
     pub async fn drop_async(&self) {
+        if let Some(session_id) = &self.session_id {
+            self.invitation.unregister_session(session_id);
+        }
         if let Some(dialog) = self.take_dialog() {
             dialog.hangup().await.ok();
         }
@@ -46,6 +71,9 @@ impl PendingDialogGuard {
 
 impl Drop for PendingDialogGuard {
     fn drop(&mut self) {
+        if let Some(session_id) = &self.session_id {
+            self.invitation.unregister_session(session_id);
+        }
         if let Some(dialog) = self.take_dialog() {
             info!(%self.id, "removing pending dialog on drop");
 

@@ -54,6 +54,19 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+/// Generates a short unique session id for incoming calls, e.g. `s.3f9a2b1c4d5e`,
+/// instead of reusing the raw SIP dialog-id string. Collisions with live
+/// sessions are retried (practically impossible with 48 bits of randomness).
+fn generate_short_session_id(invitation: &Invitation) -> String {
+    loop {
+        let uuid = uuid::Uuid::new_v4().simple().to_string();
+        let session_id = format!("s.{}", &uuid[..12]);
+        if !invitation.session_exists(&session_id) {
+            return session_id;
+        }
+    }
+}
+
 pub struct AppStateInner {
     pub config: Arc<Config>,
     pub token: CancellationToken,
@@ -355,6 +368,10 @@ impl AppStateInner {
 
                     let dialog_id = dialog.id();
                     let dialog_id_str = dialog_id.to_string();
+                    // Incoming calls get a short public session id instead of
+                    // the raw dialog-id string; the guard registers the mapping
+                    // below so accept/hangup/message lookups can resolve it.
+                    let session_id = generate_short_session_id(&self.invitation);
                     let dialog_id_for_cleanup = dialog_id.clone();
                     let token = self.token.child_token();
                     let pending_dialog = PendingDialog {
@@ -363,9 +380,10 @@ impl AppStateInner {
                         state_receiver,
                     };
 
-                    let guard = Arc::new(PendingDialogGuard::new(
+                    let guard = Arc::new(PendingDialogGuard::new_with_session(
                         self.invitation.clone(),
                         dialog_id,
+                        session_id.clone(),
                         pending_dialog,
                     ));
 
@@ -380,13 +398,14 @@ impl AppStateInner {
                     let routing_state = self.routing_state.clone();
                     let dialog_for_reject = dialog.clone();
                     let invitation_for_cleanup = self.invitation.clone();
+                    let session_id_for_task = session_id.clone();
                     crate::spawn(async move {
-                        info!(id = dialog_id_str, "incoming invite task started");
+                        info!(session_id = session_id_for_task, id = dialog_id_str, "incoming invite task started");
                         let _pending_guard = guard;
                         let token_ref = token.clone();
                         let accept_timeout_sleep = tokio::time::sleep(accept_timeout);
                         let invite_handler = invitation_handler.on_invite(
-                            dialog_id_str.clone(),
+                            session_id_for_task.clone(),
                             token.clone(),
                             dialog.clone(),
                             routing_state,

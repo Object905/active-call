@@ -34,7 +34,7 @@ impl WebhookInvitationHandler {
 impl InvitationHandler for WebhookInvitationHandler {
     async fn on_invite(
         &self,
-        dialog_id: String,
+        session_id: String,
         _cancel_token: CancellationToken,
         dialog: InviteDialog,
         routing_state: Arc<RoutingState>,
@@ -45,6 +45,7 @@ impl InvitationHandler for WebhookInvitationHandler {
         let invite_request = dialog.initial_request();
         let caller = invite_request.from_header()?.uri()?.to_string();
         let callee = invite_request.to_header()?.uri()?.to_string();
+        let sip_call_id = invite_request.call_id_header()?.value().to_string();
         let headers = invite_request
             .headers()
             .clone()
@@ -53,7 +54,8 @@ impl InvitationHandler for WebhookInvitationHandler {
             .collect::<Vec<_>>();
 
         let payload = json!({
-            "dialogId": dialog_id,
+            "dialogId": session_id,
+            "sipCallId": sip_call_id,
             "createdAt": create_time,
             "caller": caller,
             "callee": callee,
@@ -84,7 +86,8 @@ impl InvitationHandler for WebhookInvitationHandler {
         match request.json(&payload).send().await {
             Ok(response) => {
                 info!(
-                    dialog_id,
+                    session_id,
+                    sip_call_id,
                     url,
                     caller,
                     callee,

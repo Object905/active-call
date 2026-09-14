@@ -496,6 +496,10 @@ async fn apply_hold_state(states: &mut InviteDialogStates, is_on_hold: bool) {
 pub struct Invitation {
     pub dialog_layer: Arc<DialogLayer>,
     pub pending_dialogs: Arc<std::sync::Mutex<HashMap<DialogId, PendingDialog>>>,
+    /// Maps the (short) public session id of an incoming call to the DialogId
+    /// captured when the INVITE arrived. Incoming sessions no longer reuse the
+    /// raw dialog-id string, so every session-id based lookup resolves here.
+    sessions: Arc<std::sync::Mutex<HashMap<String, DialogId>>>,
 }
 
 impl Invitation {
@@ -503,7 +507,26 @@ impl Invitation {
         Self {
             dialog_layer,
             pending_dialogs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn register_session(&self, session_id: &str, dialog_id: &DialogId) {
+        self.sessions
+            .lock()
+            .map(|mut ss| ss.insert(session_id.to_string(), dialog_id.clone()))
+            .ok();
+    }
+
+    pub fn unregister_session(&self, session_id: &str) {
+        self.sessions.lock().map(|mut ss| ss.remove(session_id)).ok();
+    }
+
+    pub fn session_exists(&self, session_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .map(|ss| ss.contains_key(session_id))
+            .unwrap_or(false)
     }
 
     pub fn add_pending(&self, dialog_id: DialogId, pending: PendingDialog) {
@@ -529,6 +552,14 @@ impl Invitation {
     }
 
     pub fn find_dialog_id_by_session_id(&self, session_id: &str) -> Option<DialogId> {
+        if let Some(id) = self
+            .sessions
+            .lock()
+            .ok()
+            .and_then(|ss| ss.get(session_id).cloned())
+        {
+            return Some(id);
+        }
         self.pending_dialogs.lock().ok().and_then(|ps| {
             ps.iter()
                 .find(|(id, _)| id.to_string() == session_id)
@@ -962,6 +993,134 @@ mod tests {
             updates.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "remote answer must be applied exactly once, not on the re-INVITE ACK Confirmed event"
+        );
+    }
+
+    #[test]
+    fn test_session_map_register_find_unregister() {
+        let endpoint = {
+            let mut builder = rsipstack::EndpointBuilder::new();
+            builder.build()
+        };
+        let invitation = Invitation::new(Arc::new(DialogLayer::new(endpoint.inner.clone())));
+
+        let dialog_id = DialogId {
+            call_id: "long-call-id-from-carrier".to_string(),
+            local_tag: String::new(),
+            remote_tag: "remote-tag".to_string(),
+        };
+
+        assert!(!invitation.session_exists("s.3f9a2b1c4d5e"));
+        assert!(
+            invitation
+                .find_dialog_id_by_session_id("s.3f9a2b1c4d5e")
+                .is_none()
+        );
+
+        invitation.register_session("s.3f9a2b1c4d5e", &dialog_id);
+        assert!(invitation.session_exists("s.3f9a2b1c4d5e"));
+        assert_eq!(
+            invitation
+                .find_dialog_id_by_session_id("s.3f9a2b1c4d5e")
+                .unwrap(),
+            dialog_id
+        );
+
+        invitation.unregister_session("s.3f9a2b1c4d5e");
+        assert!(!invitation.session_exists("s.3f9a2b1c4d5e"));
+        assert!(
+            invitation
+                .find_dialog_id_by_session_id("s.3f9a2b1c4d5e")
+                .is_none()
+        );
+        // Unregistering an unknown session is a no-op.
+        invitation.unregister_session("s.unknown");
+    }
+
+    /// The legacy fallback must keep resolving session ids that match a pending
+    /// dialog's dialog-id string (e.g. sessions registered before the mapping
+    /// table existed, or callers still using the raw dialog id).
+    #[test]
+    fn test_find_dialog_id_falls_back_to_pending_scan() {
+        use rsipstack::dialog::dialog::DialogInner;
+        use rsipstack::dialog::invite_dialog::InviteDialog;
+        use rsipstack::rsip::typed::{Contact, CSeq, From, To, Via};
+        use rsipstack::rsip::{Header, Request};
+        use rsipstack::transaction::key::TransactionRole;
+
+        let endpoint = {
+            let mut builder = rsipstack::EndpointBuilder::new();
+            builder.build()
+        };
+        let invitation = Invitation::new(Arc::new(DialogLayer::new(endpoint.inner.clone())));
+
+        let dialog_id = DialogId {
+            call_id: "legacy-call-id".to_string(),
+            local_tag: String::new(),
+            remote_tag: "remote-tag".to_string(),
+        };
+
+        let initial_request = Request {
+            method: rsipstack::rsip::Method::Invite,
+            uri: rsipstack::rsip::Uri::try_from("sip:bob@example.com:5060").unwrap(),
+            headers: vec![
+                Via::parse("SIP/2.0/UDP alice.example.com:5060;branch=z9hG4bKnashds")
+                    .unwrap()
+                    .into(),
+                CSeq::parse("1 INVITE").unwrap().into(),
+                From::parse("Alice <sip:alice@example.com>;tag=remote-tag")
+                    .unwrap()
+                    .into(),
+                To::parse("Bob <sip:bob@example.com>").unwrap().into(),
+                Header::CallId("legacy-call-id".into()),
+                Contact::parse("<sip:alice@alice.example.com:5060>").unwrap().into(),
+                Header::MaxForwards("70".into()),
+            ]
+            .into(),
+            version: rsipstack::rsip::Version::V2,
+            body: vec![],
+        };
+
+        let (state_sender, _state_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (tu_sender, _tu_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let inner = std::sync::Arc::new(
+            DialogInner::new(
+                TransactionRole::Server,
+                dialog_id.clone(),
+                initial_request,
+                endpoint.inner.clone(),
+                state_sender,
+                None,
+                None,
+                tu_sender,
+            )
+            .expect("failed to create dialog inner"),
+        );
+        let dialog = InviteDialog::from_inner(inner);
+
+        assert!(
+            invitation
+                .find_dialog_id_by_session_id(&dialog_id.to_string())
+                .is_none()
+        );
+
+        invitation.add_pending(
+            dialog_id.clone(),
+            PendingDialog {
+                token: tokio_util::sync::CancellationToken::new(),
+                dialog,
+                state_receiver: {
+                    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                    rx
+                },
+            },
+        );
+
+        assert_eq!(
+            invitation
+                .find_dialog_id_by_session_id(&dialog_id.to_string())
+                .unwrap(),
+            dialog_id
         );
     }
 }
