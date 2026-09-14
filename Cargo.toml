@@ -1,6 +1,6 @@
 [package]
 name = "active-call"
-version = "0.3.90"
+version = "0.3.91"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 description = "A SIP/WebRTC voice agent"
@@ -64,6 +64,7 @@ serde_with = "3.22.0"
 rand = "0.10"
 humantime = "2"
 lru = "0.18.2"
+ipnet = "2"
 md5 = { package = "md-5", version = "0.11.0" }
 sha2 = "0.11.0"
 serde_yaml = "0.9.33"
