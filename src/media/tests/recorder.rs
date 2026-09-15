@@ -583,7 +583,7 @@ async fn test_processor_chain_raw_tap_keeps_native_rate() -> Result<()> {
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut chain = ProcessorChain::new(16000);
-    chain.raw_tap = Some(tx);
+    chain.set_raw_tap(Some(tx));
 
     let mut frame = AudioFrame {
         track_id: "caller".to_string(),
