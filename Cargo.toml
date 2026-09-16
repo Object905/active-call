@@ -1,6 +1,6 @@
 [package]
 name = "active-call"
-version = "0.3.94"
+version = "0.3.95"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 description = "A SIP/WebRTC voice agent"
@@ -22,7 +22,7 @@ not_vad = []
 [dependencies]
 libc = "0.2"
 audio-codec = "0.4.5"
-rustrtc = "0.3.124"
+rustrtc = "0.3.135"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 minijinja = { version = "2.23.0", features = ["loader", "json"] }
