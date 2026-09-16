@@ -61,7 +61,7 @@ use tracing::{debug, info, warn};
 fn generate_short_session_id(invitation: &Invitation) -> String {
     loop {
         let uuid = uuid::Uuid::new_v4().simple().to_string();
-        let session_id = format!("s.{}", &uuid[..12]);
+        let session_id = format!("s.{}", &uuid);
         if !invitation.session_exists(&session_id) {
             return session_id;
         }
