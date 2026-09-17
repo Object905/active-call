@@ -1,4 +1,4 @@
-use crate::call::active_call::ActiveCallStateRef;
+use crate::call::state::{CallProgress, LegShared};
 use crate::callrecord::CallRecordHangupReason;
 use crate::event::EventSender;
 use crate::media::TrackId;
@@ -16,6 +16,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+
+/// Remove `id` from the dialog layer and return the dialog, ready to be
+/// hung up. Shared by the dialog guards and `Invitation::hangup`.
+pub(crate) fn remove_dialog(layer: &DialogLayer, id: &DialogId) -> Option<Dialog> {
+    let dialog = layer.get_dialog(id)?;
+    layer.remove_dialog(id);
+    Some(dialog)
+}
 
 pub struct DialogStateReceiverGuard {
     pub(super) dialog_layer: Arc<DialogLayer>,
@@ -46,20 +54,23 @@ impl DialogStateReceiverGuard {
     }
 
     fn take_dialog(&mut self) -> Option<Dialog> {
-        let id = match self.dialog_id.take() {
-            Some(id) => id,
-            None => return None,
-        };
-
-        match self.dialog_layer.get_dialog(&id) {
-            Some(dialog) => {
-                info!(%id, "dialog removed on  drop");
-                self.dialog_layer.remove_dialog(&id);
-                return Some(dialog);
-            }
-            _ => {}
+        let id = self.dialog_id.take()?;
+        info!(%id, "dialog removed on  drop");
+        if let Some(dialog) = remove_dialog(&self.dialog_layer, &id) {
+            return Some(dialog);
         }
-        None
+        // A client dialog is only re-registered under its tag-bearing id once
+        // do_invite's process_invite() fully completes; while still ringing
+        // it's registered under the pre-response id (empty remote tag). Our
+        // tracked `id` already reflects whatever tag the latest DialogState
+        // event carried (e.g. a 183's), so the exact-key lookup above misses
+        // it for any dialog hung up before it's confirmed. Fall back to a
+        // call-id scan, which is unaffected by that id mutation.
+        self.dialog_layer
+            .get_client_dialog_by_call_id(&id.call_id)
+            .into_iter()
+            .next()
+            .map(Dialog::Invite)
     }
 
     pub async fn drop_async(&mut self) {
@@ -89,72 +100,81 @@ pub(super) struct InviteDialogStates {
     pub track_id: TrackId,
     pub cancel_token: CancellationToken,
     pub event_sender: EventSender,
-    pub call_state: ActiveCallStateRef,
+    /// Lock-free shared state of the leg this dialog belongs to.
+    pub leg: LegShared,
     pub media_stream: Arc<MediaStream>,
     pub terminated_reason: Option<TerminatedReason>,
     pub has_early_media: bool,
+    /// Set once the initial INVITE's answer has been applied via
+    /// `DialogState::Confirmed`. rsipstack reuses the same `Confirmed` event
+    /// for the ACK of a re-INVITE we received (see `handle_reinvite`), but
+    /// in that case the body is the PBX's own locally-generated answer, not
+    /// a remote description — that re-invite was already fully handled via
+    /// `DialogState::Updated`/`handshake()`. Re-applying it here corrupts
+    /// the peer connection's remote SSRC/address with our own values.
+    initial_confirmed: bool,
+    /// Hangup intent carried by this leg (refer legs with `auto_hangup`),
+    /// reported on the leg's TrackEnd so the call actor can hang up.
+    pub hangup_reason: Option<CallRecordHangupReason>,
 }
 
 impl InviteDialogStates {
-    pub(super) fn on_terminated(&mut self) {
-        let mut call_state_ref = match self.call_state.try_write() {
-            Ok(cs) => cs,
-            Err(_) => {
-                return;
-            }
-        };
-        let reason = &self.terminated_reason;
-        call_state_ref.last_status_code = match reason {
-            Some(TerminatedReason::UacCancel) => 487,
-            Some(TerminatedReason::UacBye) => 200,
-            Some(TerminatedReason::UacBusy) => 486,
-            Some(TerminatedReason::UasBye) => 200,
-            Some(TerminatedReason::UasBusy) => 486,
-            Some(TerminatedReason::UasDecline) => 603,
-            Some(TerminatedReason::UacOther(code)) => code.code(),
-            Some(TerminatedReason::UasOther(code)) => code.code(),
-            _ => 500, // Default to internal server error
-        };
+    pub(super) fn new(
+        is_client: bool,
+        session_id: String,
+        track_id: TrackId,
+        event_sender: EventSender,
+        media_stream: Arc<MediaStream>,
+        leg: LegShared,
+        cancel_token: CancellationToken,
+        hangup_reason: Option<CallRecordHangupReason>,
+    ) -> Self {
+        Self {
+            is_client,
+            session_id,
+            track_id,
+            cancel_token,
+            event_sender,
+            leg,
+            media_stream,
+            terminated_reason: None,
+            has_early_media: false,
+            initial_confirmed: false,
+            hangup_reason,
+        }
+    }
+}
 
-        if call_state_ref.hangup_reason.is_none() {
-            call_state_ref.hangup_reason.replace(match reason {
-                Some(TerminatedReason::UacCancel) => CallRecordHangupReason::Canceled,
-                Some(TerminatedReason::UacBye) | Some(TerminatedReason::UacBusy) => {
-                    CallRecordHangupReason::ByCaller
-                }
-                Some(TerminatedReason::UasBye) | Some(TerminatedReason::UasBusy) => {
-                    CallRecordHangupReason::ByCallee
-                }
-                Some(TerminatedReason::UasDecline) => CallRecordHangupReason::ByCallee,
-                Some(TerminatedReason::UacOther(_)) => CallRecordHangupReason::ByCaller,
-                Some(TerminatedReason::UasOther(_)) => CallRecordHangupReason::ByCallee,
-                _ => CallRecordHangupReason::BySystem,
-            });
-        };
-        let initiator = match reason {
-            Some(TerminatedReason::UacCancel) => "caller".to_string(),
-            Some(TerminatedReason::UacBye) | Some(TerminatedReason::UacBusy) => {
-                "caller".to_string()
-            }
-            Some(TerminatedReason::UasBye)
-            | Some(TerminatedReason::UasBusy)
-            | Some(TerminatedReason::UasDecline) => "callee".to_string(),
-            _ => "system".to_string(),
-        };
+impl InviteDialogStates {
+    /// Called from `Drop` (synchronous context): everything used here is
+    /// lock-free (ArcSwap rcu/load + broadcast send), so no state or events
+    /// can be lost the way a failed `try_write` used to lose them.
+    pub(super) fn on_terminated(&mut self) {
+        let term = CallProgress::termination(self.terminated_reason.as_ref());
+        let status_code = term.status_code;
+        let reason = term.hangup_reason;
+        self.leg.update_progress(|p| {
+            p.last_status_code = status_code;
+            p.set_hangup_reason(reason.clone());
+        });
+        let progress = self.leg.progress.load_full();
+
         self.event_sender
             .send(crate::event::SessionEvent::TrackEnd {
                 track_id: self.track_id.clone(),
                 timestamp: crate::media::get_timestamp(),
-                duration: call_state_ref
+                duration: progress
                     .answer_time
                     .map(|t| (Utc::now() - t).num_milliseconds())
                     .unwrap_or_default() as u64,
-                ssrc: call_state_ref.ssrc,
+                ssrc: self.leg.ssrc,
                 play_id: None,
+                auto_hangup: self.hangup_reason.clone(),
             })
             .ok();
-        let hangup_event =
-            call_state_ref.build_hangup_event(self.track_id.clone(), Some(initiator));
+        let hangup_event = self
+            .leg
+            .build_hangup_event(self.track_id.clone(), Some(term.initiator.to_string()));
         self.event_sender.send(hangup_event).ok();
     }
 }
@@ -172,7 +192,9 @@ impl DialogStateReceiverGuard {
             match event {
                 DialogState::Calling(dialog_id) => {
                     info!(session_id=states.session_id, %dialog_id, "dialog calling");
-                    states.call_state.write().await.session_id = dialog_id.to_string();
+                    states
+                        .leg
+                        .update_progress(|p| p.session_id = dialog_id.to_string());
                 }
                 DialogState::Trying(_) => {}
                 DialogState::Early(dialog_id, resp) => {
@@ -182,19 +204,11 @@ impl DialogStateReceiverGuard {
                     let has_sdp = !answer.is_empty();
                     info!(session_id=states.session_id, %dialog_id, has_sdp=%has_sdp, "dialog early ({}): \n{}", code, answer);
 
-                    {
-                        let mut cs = states.call_state.write().await;
-                        if cs.ring_time.is_none() {
-                            cs.ring_time.replace(Utc::now());
-                        }
-                        cs.last_status_code = code;
-                    }
+                    states.leg.update_progress(|p| p.on_early(code));
 
                     if !states.is_client {
                         continue;
                     }
-
-                    let refer = states.call_state.read().await.is_refer;
 
                     states
                         .event_sender
@@ -202,32 +216,28 @@ impl DialogStateReceiverGuard {
                             track_id: states.track_id.clone(),
                             timestamp: crate::media::get_timestamp(),
                             early_media: has_sdp,
-                            refer: Some(refer),
+                            refer: Some(states.leg.is_refer),
                         })?;
 
                     if has_sdp {
                         states.has_early_media = true;
-                        {
-                            let mut cs = states.call_state.write().await;
-                            if cs.answer.is_none() {
-                                cs.answer = Some(answer.to_string());
-                            }
-                        }
+                        states.leg.update_progress(|p| p.try_set_answer(&answer));
                         states
                             .media_stream
-                            .update_remote_description(&states.track_id, &answer.to_string())
+                            .update_remote_description_provisional(
+                                &states.track_id,
+                                &answer.to_string(),
+                            )
                             .await?;
                     }
                 }
                 DialogState::Confirmed(dialog_id, msg) => {
                     info!(session_id=states.session_id, %dialog_id, has_early_media=%states.has_early_media, "dialog confirmed");
-                    {
-                        let mut cs = states.call_state.write().await;
-                        cs.session_id = dialog_id.to_string();
-                        cs.answer_time.replace(Utc::now());
-                        cs.last_status_code = 200;
-                    }
-                    if states.is_client {
+                    states
+                        .leg
+                        .update_progress(|p| p.on_confirmed(dialog_id.to_string()));
+                    if states.is_client && !states.initial_confirmed {
+                        states.initial_confirmed = true;
                         let answer = String::from_utf8_lossy(msg.body());
                         let answer = answer.trim();
                         if !answer.is_empty() {
@@ -281,9 +291,38 @@ impl DialogStateReceiverGuard {
                                 track_id: states.track_id.clone(),
                                 timestamp: crate::media::get_timestamp(),
                                 digit: digit.to_string(),
+                                refer: Some(states.leg.is_refer),
                             })?;
                         }
                     }
+                    tx_handle.reply(rsipstack::rsip::StatusCode::OK).await.ok();
+                }
+                DialogState::Message(dialog_id, req, tx_handle) => {
+                    let body_str = String::from_utf8_lossy(req.body()).to_string();
+                    let content_type = req.headers.iter().find_map(|h| {
+                        if let rsipstack::rsip::Header::ContentType(content_type) = h {
+                            Some(content_type.value().to_string())
+                        } else {
+                            None
+                        }
+                    });
+                    info!(
+                        session_id=states.session_id,
+                        %dialog_id,
+                        content_type=content_type.as_deref(),
+                        body=%body_str,
+                        "dialog message received"
+                    );
+                    states
+                        .event_sender
+                        .send(crate::event::SessionEvent::Message {
+                            track_id: states.track_id.clone(),
+                            timestamp: crate::media::get_timestamp(),
+                            body: body_str,
+                            content_type,
+                            refer: Some(states.leg.is_refer),
+                        })
+                        .ok();
                     tx_handle.reply(rsipstack::rsip::StatusCode::OK).await.ok();
                 }
                 DialogState::Updated(dialog_id, _req, tx_handle) => {
@@ -302,28 +341,8 @@ impl DialogStateReceiverGuard {
                                 crate::media::negotiate::detect_hold_state_from_sdp(&sdp_str);
                             info!(session_id=states.session_id, %dialog_id, is_on_hold=%is_on_hold, "detected hold state from re-invite SDP");
 
-                            // Update media stream hold state
-                            if is_on_hold {
-                                states
-                                    .media_stream
-                                    .hold_track(Some(states.track_id.clone()))
-                                    .await;
-                            } else {
-                                states
-                                    .media_stream
-                                    .resume_track(Some(states.track_id.clone()))
-                                    .await;
-                            }
-
-                            // Emit hold event
-                            states
-                                .event_sender
-                                .send(crate::event::SessionEvent::Hold {
-                                    track_id: states.track_id.clone(),
-                                    timestamp: crate::media::get_timestamp(),
-                                    on_hold: is_on_hold,
-                                })
-                                .ok();
+                            // Update media stream hold state + emit hold event
+                            apply_hold_state(states, is_on_hold).await;
 
                             match states
                                 .media_stream
@@ -344,33 +363,7 @@ impl DialogStateReceiverGuard {
                             // Also check hold state for non-INVITE/UPDATE messages with SDP
                             let is_on_hold =
                                 crate::media::negotiate::detect_hold_state_from_sdp(&sdp_str);
-                            if is_on_hold {
-                                states
-                                    .media_stream
-                                    .hold_track(Some(states.track_id.clone()))
-                                    .await;
-                                states
-                                    .event_sender
-                                    .send(crate::event::SessionEvent::Hold {
-                                        track_id: states.track_id.clone(),
-                                        timestamp: crate::media::get_timestamp(),
-                                        on_hold: true,
-                                    })
-                                    .ok();
-                            } else {
-                                states
-                                    .media_stream
-                                    .resume_track(Some(states.track_id.clone()))
-                                    .await;
-                                states
-                                    .event_sender
-                                    .send(crate::event::SessionEvent::Hold {
-                                        track_id: states.track_id.clone(),
-                                        timestamp: crate::media::get_timestamp(),
-                                        on_hold: false,
-                                    })
-                                    .ok();
-                            }
+                            apply_hold_state(states, is_on_hold).await;
 
                             states
                                 .media_stream
@@ -397,6 +390,39 @@ impl DialogStateReceiverGuard {
                 DialogState::Options(dialog_id, _req, tx_handle) => {
                     info!(session_id = states.session_id, %dialog_id, "dialog options received");
                     tx_handle.reply(rsipstack::rsip::StatusCode::OK).await.ok();
+                }
+                DialogState::Refer(dialog_id, req, tx_handle) => {
+                    let refer_to = req
+                        .headers
+                        .iter()
+                        .find_map(|h| {
+                            if let rsipstack::rsip::Header::ReferTo(h) = h {
+                                return Some(h.value().to_string());
+                            }
+                            None
+                        })
+                        .unwrap_or_default();
+                    let referred_by = req.headers.iter().find_map(|h| {
+                        if let rsipstack::rsip::Header::ReferredBy(h) = h {
+                            return Some(h.value().to_string());
+                        }
+                        None
+                    });
+                    info!(session_id = states.session_id, %dialog_id, %refer_to, "received REFER");
+                    tx_handle
+                        .reply(rsipstack::rsip::StatusCode::Other(202, "Accepted".into()))
+                        .await
+                        .ok();
+                    states
+                        .event_sender
+                        .send(crate::event::SessionEvent::TransferRequest {
+                            track_id: states.track_id.clone(),
+                            timestamp: crate::media::get_timestamp(),
+                            refer_to,
+                            referred_by,
+                            refer: Some(states.leg.is_refer),
+                        })
+                        .ok();
                 }
                 DialogState::Terminated(dialog_id, reason) => {
                     info!(
@@ -429,27 +455,12 @@ impl DialogStateReceiverGuard {
             _ = self.dialog_event_loop(&mut states) => {}
         };
 
-        // Update hangup headers from ActiveCallState if available
-        {
-            let state = states.call_state.read().await;
-            if let Some(extras) = &state.extras {
-                if let Some(h_val) = extras.get("_hangup_headers") {
-                    if let Ok(headers_map) =
-                        serde_json::from_value::<HashMap<String, String>>(h_val.clone())
-                    {
-                        let mut headers = Vec::new();
-                        for (k, v) in headers_map {
-                            headers.push(rsipstack::rsip::Header::Other(k.into(), v.into()));
-                        }
-                        if !headers.is_empty() {
-                            if let Some(existing) = &mut self.hangup_headers {
-                                existing.extend(headers);
-                            } else {
-                                self.hangup_headers = Some(headers);
-                            }
-                        }
-                    }
-                }
+        // Update hangup headers from the leg extras if available
+        let extras = states.leg.extras.load_full();
+        if let Some(headers) = crate::sip_util::hangup_headers_from_extras(&extras) {
+            match &mut self.hangup_headers {
+                Some(existing) => existing.extend(headers),
+                None => self.hangup_headers = Some(headers),
             }
         }
 
@@ -457,10 +468,38 @@ impl DialogStateReceiverGuard {
     }
 }
 
+/// Apply a hold/resume transition to the media track and emit the Hold event.
+async fn apply_hold_state(states: &mut InviteDialogStates, is_on_hold: bool) {
+    if is_on_hold {
+        states
+            .media_stream
+            .hold_track(Some(states.track_id.clone()))
+            .await;
+    } else {
+        states
+            .media_stream
+            .resume_track(Some(states.track_id.clone()))
+            .await;
+    }
+    states
+        .event_sender
+        .send(crate::event::SessionEvent::Hold {
+            track_id: states.track_id.clone(),
+            timestamp: crate::media::get_timestamp(),
+            on_hold: is_on_hold,
+            refer: Some(states.leg.is_refer),
+        })
+        .ok();
+}
+
 #[derive(Clone)]
 pub struct Invitation {
     pub dialog_layer: Arc<DialogLayer>,
     pub pending_dialogs: Arc<std::sync::Mutex<HashMap<DialogId, PendingDialog>>>,
+    /// Maps the (short) public session id of an incoming call to the DialogId
+    /// captured when the INVITE arrived. Incoming sessions no longer reuse the
+    /// raw dialog-id string, so every session-id based lookup resolves here.
+    sessions: Arc<std::sync::Mutex<HashMap<String, DialogId>>>,
 }
 
 impl Invitation {
@@ -468,7 +507,26 @@ impl Invitation {
         Self {
             dialog_layer,
             pending_dialogs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn register_session(&self, session_id: &str, dialog_id: &DialogId) {
+        self.sessions
+            .lock()
+            .map(|mut ss| ss.insert(session_id.to_string(), dialog_id.clone()))
+            .ok();
+    }
+
+    pub fn unregister_session(&self, session_id: &str) {
+        self.sessions.lock().map(|mut ss| ss.remove(session_id)).ok();
+    }
+
+    pub fn session_exists(&self, session_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .map(|ss| ss.contains_key(session_id))
+            .unwrap_or(false)
     }
 
     pub fn add_pending(&self, dialog_id: DialogId, pending: PendingDialog) {
@@ -494,6 +552,14 @@ impl Invitation {
     }
 
     pub fn find_dialog_id_by_session_id(&self, session_id: &str) -> Option<DialogId> {
+        if let Some(id) = self
+            .sessions
+            .lock()
+            .ok()
+            .and_then(|ss| ss.get(session_id).cloned())
+        {
+            return Some(id);
+        }
         self.pending_dialogs.lock().ok().and_then(|ps| {
             ps.iter()
                 .find(|(id, _)| id.to_string() == session_id)
@@ -501,6 +567,7 @@ impl Invitation {
         })
     }
 
+    /// Reject a pending dialog or hang up an established one.
     pub async fn hangup(
         &self,
         dialog_id: DialogId,
@@ -509,29 +576,9 @@ impl Invitation {
     ) -> Result<()> {
         if let Some(call) = self.get_pending_call(&dialog_id) {
             call.dialog.reject(code, reason).ok();
-            call.token.cancel();
         }
-        match self.dialog_layer.get_dialog(&dialog_id) {
-            Some(dialog) => {
-                self.dialog_layer.remove_dialog(&dialog_id);
-                dialog.hangup().await.ok();
-            }
-            None => {}
-        }
-        Ok(())
-    }
-
-    pub async fn reject(&self, dialog_id: DialogId) -> Result<()> {
-        if let Some(call) = self.get_pending_call(&dialog_id) {
-            call.dialog.reject(None, None).ok();
-            call.token.cancel();
-        }
-        match self.dialog_layer.get_dialog(&dialog_id) {
-            Some(dialog) => {
-                self.dialog_layer.remove_dialog(&dialog_id);
-                dialog.hangup().await.ok();
-            }
-            None => {}
+        if let Some(dialog) = remove_dialog(&self.dialog_layer, &dialog_id) {
+            dialog.hangup().await.ok();
         }
         Ok(())
     }
@@ -579,11 +626,8 @@ impl Invitation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::call::active_call::ActiveCallState;
+    use crate::call::state::CallProgress;
     use crate::media::stream::MediaStreamBuilder;
-    use std::sync::Arc;
-    use tokio::sync::RwLock;
-    use tokio_util::sync::CancellationToken;
 
     // SDP used to simulate an early-media 183 Session Progress response.
     const EARLY_MEDIA_SDP: &str = "v=0\r\n\
@@ -595,196 +639,123 @@ mod tests {
         a=rtpmap:0 PCMU/8000\r\n\
         a=sendrecv\r\n";
 
-    fn make_response_with_body(body: Vec<u8>) -> rsipstack::rsip::Response {
-        let mut resp = rsipstack::rsip::Response::default();
-        resp.body = body;
-        resp
-    }
-
-    /// Verify that when a 183 Session Progress with SDP arrives (`DialogState::Early`),
-    /// the early SDP is stored in `call_state.answer` so it can serve as a fallback
-    /// when the final 200 OK has an empty body.
-    #[tokio::test]
-    async fn test_early_sdp_stored_in_call_state() {
+    fn make_states(has_early_media: bool) -> InviteDialogStates {
         let (event_tx, _event_rx) = tokio::sync::broadcast::channel(16);
         let media_stream = Arc::new(
             MediaStreamBuilder::new(event_tx.clone())
                 .with_id("test-stream".to_string())
                 .build(),
         );
-        let call_state: ActiveCallStateRef = Arc::new(RwLock::new(ActiveCallState::default()));
         let cancel_token = CancellationToken::new();
+        let leg = LegShared::new(1000, true, CallProgress::default());
 
-        let mut states = InviteDialogStates {
+        InviteDialogStates {
             is_client: true,
             session_id: "test-session".to_string(),
             track_id: "test-track".to_string(),
             cancel_token: cancel_token.clone(),
             event_sender: event_tx.clone(),
-            call_state: call_state.clone(),
-            media_stream: media_stream.clone(),
+            leg,
+            media_stream,
             terminated_reason: None,
-            has_early_media: false,
-        };
+            has_early_media,
+            initial_confirmed: false,
+            hangup_reason: None,
+        }
+    }
 
-        // Simulate DialogState::Early with SDP body (183 Session Progress)
-        let early_resp = make_response_with_body(EARLY_MEDIA_SDP.as_bytes().to_vec());
+    /// Verify that when a 183 Session Progress with SDP arrives (`DialogState::Early`),
+    /// the early SDP is stored in the leg progress so it can serve as a fallback
+    /// when the final 200 OK has an empty body.
+    #[tokio::test]
+    async fn test_early_sdp_stored_in_leg_progress() {
+        let mut states = make_states(false);
 
-        // Manually execute the Early branch logic (same as dialog_event_loop)
-        let body = early_resp.body();
-        let answer = String::from_utf8_lossy(body);
+        // Simulate DialogState::Early with SDP body (183 Session Progress):
+        // same steps the Early branch performs.
+        let answer = EARLY_MEDIA_SDP.to_string();
         let has_sdp = !answer.is_empty();
         if states.is_client && has_sdp {
             states.has_early_media = true;
-            {
-                let mut cs = states.call_state.write().await;
-                if cs.answer.is_none() {
-                    cs.answer = Some(answer.to_string());
-                }
-            }
-            // (update_remote_description skipped — no real RTC peer)
+            states.leg.update_progress(|p| p.try_set_answer(&answer));
         }
 
-        // Assert: early SDP is stored in call_state.answer
-        {
-            let cs = call_state.read().await;
-            assert!(
-                cs.answer.is_some(),
-                "call_state.answer should be set after 183 with SDP"
-            );
-            assert_eq!(
-                cs.answer.as_deref().unwrap(),
-                EARLY_MEDIA_SDP,
-                "call_state.answer should contain the early SDP"
-            );
-        }
+        // Assert: early SDP is stored
+        let progress = states.leg.progress.load_full();
+        assert!(
+            progress.answer.is_some(),
+            "leg progress answer should be set after 183 with SDP"
+        );
+        assert_eq!(
+            progress.answer.as_deref().unwrap(),
+            EARLY_MEDIA_SDP,
+            "leg progress answer should contain the early SDP"
+        );
         assert!(states.has_early_media, "has_early_media should be true");
     }
 
     /// Verify that when a 200 OK arrives with an empty body after early media has been
-    /// negotiated, `call_state.answer` retains the early SDP (not overwritten with "").
+    /// negotiated, the leg progress retains the early SDP (not overwritten with "").
     ///
     /// This is the regression test for the bug where a late 200 OK with empty body would
     /// cause `SessionEvent::Answer { sdp: "" }` to be emitted, making the answer event
     /// appear as if no SDP was negotiated.
     #[tokio::test]
     async fn test_confirmed_empty_body_keeps_early_sdp() {
-        let (event_tx, _event_rx) = tokio::sync::broadcast::channel(16);
-        let media_stream = Arc::new(
-            MediaStreamBuilder::new(event_tx.clone())
-                .with_id("test-stream-2".to_string())
-                .build(),
-        );
-        let call_state: ActiveCallStateRef = Arc::new(RwLock::new(ActiveCallState::default()));
-        let cancel_token = CancellationToken::new();
+        let mut states = make_states(false);
 
-        let mut states = InviteDialogStates {
-            is_client: true,
-            session_id: "test-session-2".to_string(),
-            track_id: "test-track-2".to_string(),
-            cancel_token: cancel_token.clone(),
-            event_sender: event_tx.clone(),
-            call_state: call_state.clone(),
-            media_stream: media_stream.clone(),
-            terminated_reason: None,
-            has_early_media: false,
-        };
-
-        // Step 1: simulate 183 with SDP → set has_early_media and cs.answer
-        {
-            let answer_str = EARLY_MEDIA_SDP.to_string();
-            states.has_early_media = true;
-            let mut cs = states.call_state.write().await;
-            if cs.answer.is_none() {
-                cs.answer = Some(answer_str);
-            }
-        }
+        // Step 1: simulate 183 with SDP → set has_early_media and progress answer
+        states.has_early_media = true;
+        states
+            .leg
+            .update_progress(|p| p.try_set_answer(EARLY_MEDIA_SDP));
 
         // Step 2: simulate 200 OK with empty body (Confirmed handler logic)
-        let confirmed_resp = make_response_with_body(vec![]); // empty body
-        {
-            let mut cs = states.call_state.write().await;
-            cs.answer_time.replace(chrono::Utc::now());
-            cs.last_status_code = 200;
-        }
-        // The Confirmed handler in dialog_event_loop only calls update_remote_description
-        // when body is non-empty; it does NOT overwrite cs.answer.
-        let body = confirmed_resp.body();
-        let answer = String::from_utf8_lossy(body);
-        let answer_trimmed = answer.trim();
-        // Replicate Confirmed handler: only act on non-empty body
-        if states.is_client && !answer_trimmed.is_empty() {
-            // (Would call update_remote_description or update_remote_description_force)
-            // This branch should NOT execute for empty-body 200 OK
-            panic!("Confirmed handler should not update SDP for empty body");
-        }
+        states
+            .leg
+            .update_progress(|p| p.on_confirmed("dialog-1".to_string()));
+        // The Confirmed handler only calls update_remote_description when the body
+        // is non-empty; it does NOT overwrite the progress answer.
+        let confirmed_answer = String::new();
+        assert!(
+            confirmed_answer.trim().is_empty(),
+            "empty body must not be applied"
+        );
 
-        // Assert: call_state.answer still holds the early SDP
-        {
-            let cs = call_state.read().await;
-            assert!(
-                cs.answer.is_some(),
-                "call_state.answer must not be None after 200 OK with empty body"
-            );
-            let stored_answer = cs.answer.as_deref().unwrap();
-            assert!(
-                !stored_answer.is_empty(),
-                "call_state.answer must not be empty after 200 OK with empty body"
-            );
-            assert_eq!(
-                stored_answer, EARLY_MEDIA_SDP,
-                "call_state.answer should still be the early SDP after 200 OK with empty body"
-            );
-        }
+        // Assert: leg progress still holds the early SDP
+        let progress = states.leg.progress.load_full();
+        assert!(
+            progress.answer.is_some(),
+            "answer must not be None after 200 OK with empty body"
+        );
+        let stored_answer = progress.answer.as_deref().unwrap();
+        assert!(
+            !stored_answer.is_empty(),
+            "answer must not be empty after 200 OK with empty body"
+        );
+        assert_eq!(
+            stored_answer, EARLY_MEDIA_SDP,
+            "answer should still be the early SDP after 200 OK with empty body"
+        );
     }
 
     /// Verify that `create_outgoing_sip_track`'s fallback logic works:
-    /// when the 200 OK body is empty but `call_state.answer` has the early SDP,
+    /// when the 200 OK body is empty but the leg progress has the early SDP,
     /// the fallback path is taken and the early SDP is returned (not an empty string).
-    ///
-    /// This test directly validates the fix in `create_outgoing_sip_track` by
-    /// simulating the state that would exist after a 183+early-media exchange.
     #[tokio::test]
     async fn test_answer_fallback_to_early_sdp_when_200ok_empty() {
-        // Set up call state as it would be after early media (183 with SDP) was processed
-        let call_state: ActiveCallStateRef = Arc::new(RwLock::new(ActiveCallState::default()));
+        // Simulate what the Early (183) handler does: store the early SDP.
+        let states = make_states(true);
+        states
+            .leg
+            .update_progress(|p| p.try_set_answer(EARLY_MEDIA_SDP));
 
-        // Simulate what the Early (183) handler does: store the early SDP in cs.answer
-        {
-            let mut cs = call_state.write().await;
-            cs.answer = Some(EARLY_MEDIA_SDP.to_string());
-        }
-
-        // Simulate what create_outgoing_sip_track does when 200 OK has empty body:
-        //   answer = Some(vec![])  →  s = ""  →  s.trim().is_empty() → fallback
+        // Simulate what create_outgoing_sip_track does when 200 OK has empty body.
+        let early = states.leg.progress.load_full().answer.clone();
         let raw_answer: Option<Vec<u8>> = Some(vec![]); // empty body from 200 OK
 
-        let resolved_answer = match raw_answer {
-            Some(bytes) => {
-                let s = String::from_utf8_lossy(&bytes).to_string();
-                if s.trim().is_empty() {
-                    // Fallback: use early SDP stored by the 183 handler
-                    let cs = call_state.read().await;
-                    match cs.answer.clone() {
-                        Some(early_sdp) if !early_sdp.is_empty() => {
-                            (early_sdp, true /* already applied */)
-                        }
-                        _ => (s, false),
-                    }
-                } else {
-                    (s, false)
-                }
-            }
-            None => {
-                let cs = call_state.read().await;
-                match cs.answer.clone() {
-                    Some(early_sdp) if !early_sdp.is_empty() => (early_sdp, true),
-                    _ => panic!("Expected early SDP fallback"),
-                }
-            }
-        };
-
-        let (answer, already_applied) = resolved_answer;
+        let (answer, already_applied) =
+            crate::call::state::resolve_final_answer(raw_answer, early.as_ref()).unwrap();
 
         // The answer returned to setup_caller_track (and used in SessionEvent::Answer)
         // must be the early SDP, not an empty string.
@@ -816,33 +787,17 @@ mod tests {
             a=rtpmap:0 PCMU/8000\r\n\
             a=sendrecv\r\n";
 
-        let call_state: ActiveCallStateRef = Arc::new(RwLock::new(ActiveCallState::default()));
+        let states = make_states(true);
+        states
+            .leg
+            .update_progress(|p| p.try_set_answer(EARLY_MEDIA_SDP));
 
-        // Even with early SDP stored, when 200 OK has SDP body it should be used
-        {
-            let mut cs = call_state.write().await;
-            cs.answer = Some(EARLY_MEDIA_SDP.to_string());
-        }
-
-        let raw_answer: Option<Vec<u8>> = Some(FINAL_SDP.as_bytes().to_vec());
-
-        let resolved_answer = match raw_answer {
-            Some(bytes) => {
-                let s = String::from_utf8_lossy(&bytes).to_string();
-                if s.trim().is_empty() {
-                    let cs = call_state.read().await;
-                    match cs.answer.clone() {
-                        Some(early_sdp) if !early_sdp.is_empty() => (early_sdp, true),
-                        _ => (s, false),
-                    }
-                } else {
-                    (s, false) // ← normal case: use 200 OK SDP, apply it
-                }
-            }
-            None => panic!("Unexpected"),
-        };
-
-        let (answer, already_applied) = resolved_answer;
+        let early = states.leg.progress.load_full().answer.clone();
+        let (answer, already_applied) = crate::call::state::resolve_final_answer(
+            Some(FINAL_SDP.as_bytes().to_vec()),
+            early.as_ref(),
+        )
+        .unwrap();
 
         assert_eq!(
             answer, FINAL_SDP,
@@ -851,6 +806,321 @@ mod tests {
         assert!(
             !already_applied,
             "remote_description_already_applied should be false when 200 OK has SDP body"
+        );
+    }
+
+    /// Regression: `on_terminated` runs in a synchronous `Drop` context.
+    /// The old implementation used `try_write` and silently dropped the
+    /// status/reason updates AND the TrackEnd/Hangup events when the lock was
+    /// contended. The lock-free (ArcSwap) implementation must always emit both
+    /// events and record the termination, even while another task keeps
+    /// mutating the progress concurrently.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_on_terminated_always_emits_events_and_records_state() {
+        use crate::event::SessionEvent;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut states = make_states(false);
+        states.terminated_reason = Some(TerminatedReason::UacCancel);
+        let leg = states.leg.clone();
+        let event_sender = states.event_sender.clone();
+        let mut event_receiver = event_sender.subscribe();
+
+        // Hammer the progress concurrently, as a busy actor would.
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let progress = leg.progress.clone();
+        let writer = crate::spawn(async move {
+            while !stop2.load(Ordering::Relaxed) {
+                // Touch unrelated fields, like a busy actor would (never the
+                // termination fields), so writers don't clobber each other.
+                progress.rcu(|p| {
+                    let mut p = CallProgress::clone(p);
+                    p.answer_time.get_or_insert_with(chrono::Utc::now);
+                    p
+                });
+                tokio::task::yield_now().await;
+            }
+        });
+
+        // Give the writer a moment to start contending.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Synchronous drop, exactly like the real dialog task teardown.
+        drop(states);
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = writer.await;
+
+        // Both events must have been emitted despite the concurrent writer.
+        let mut saw_track_end = false;
+        let mut saw_hangup = false;
+        while let Ok(event) = event_receiver.try_recv() {
+            match event {
+                SessionEvent::TrackEnd { .. } => saw_track_end = true,
+                SessionEvent::Hangup { refer, .. } => {
+                    assert_eq!(refer, Some(true), "refer flag comes from the leg");
+                    saw_hangup = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_track_end,
+            "TrackEnd must be emitted from on_terminated even under contention"
+        );
+        assert!(
+            saw_hangup,
+            "Hangup must be emitted from on_terminated even under contention"
+        );
+
+        // The termination must be recorded (487 for UacCancel); the concurrent
+        // writer only ever writes 100, so observing 487 proves the rcu landed.
+        let progress = leg.progress.load_full();
+        assert_eq!(progress.last_status_code, 487);
+        assert_eq!(
+            progress.hangup_reason,
+            Some(crate::callrecord::CallRecordHangupReason::Canceled)
+        );
+    }
+
+    /// A minimal counting track that records how many times its remote
+    /// description was (force-)updated, without touching any real media.
+    struct CountingTrack {
+        id: TrackId,
+        config: crate::media::track::TrackConfig,
+        processor_chain: crate::media::processor::ProcessorChain,
+        updates: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::media::track::Track for CountingTrack {
+        fn ssrc(&self) -> u32 {
+            0
+        }
+        fn id(&self) -> &TrackId {
+            &self.id
+        }
+        fn config(&self) -> &crate::media::track::TrackConfig {
+            &self.config
+        }
+        fn processor_chain(&mut self) -> &mut crate::media::processor::ProcessorChain {
+            &mut self.processor_chain
+        }
+        async fn handshake(
+            &mut self,
+            _offer: String,
+            _timeout: Option<tokio::time::Duration>,
+        ) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn update_remote_description(&mut self, _answer: &String) -> Result<()> {
+            self.updates
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn update_remote_description_force(&mut self, _answer: &String) -> Result<()> {
+            self.updates
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn start(
+            &mut self,
+            _event_sender: EventSender,
+            _packet_sender: crate::media::track::TrackPacketSender,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn stop(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn send_packet(&mut self, _packet: &crate::media::AudioFrame) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Regression: a client dialog must apply its remote SDP answer exactly
+    /// once. The `initial_confirmed` guard exists because the final `Confirmed`
+    /// event fires both when the 200 OK is processed *and* again when the ACK
+    /// for the re-INVITE completes; without the guard the answer would be
+    /// re-applied (and a duplicate `TrackStart`/`SessionEvent::Answer` emitted).
+    #[tokio::test]
+    async fn test_confirmed_applies_remote_answer_only_once() {
+        let mut states = make_states(false);
+
+        let updates = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let track = CountingTrack {
+            id: states.track_id.clone(),
+            config: crate::media::track::TrackConfig::default(),
+            processor_chain: crate::media::processor::ProcessorChain::new(16000),
+            updates: updates.clone(),
+        };
+        states
+            .media_stream
+            .update_track(Box::new(track), None)
+            .await;
+
+        let endpoint = {
+            let mut builder = rsipstack::EndpointBuilder::new();
+            builder.build()
+        };
+        let dialog_layer = Arc::new(DialogLayer::new(endpoint.inner.clone()));
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DialogState>();
+        let mut guard = DialogStateReceiverGuard::new(dialog_layer, rx, None);
+
+        let dialog_id = DialogId {
+            call_id: "test-call-id".to_string(),
+            local_tag: "test-local-tag".to_string(),
+            remote_tag: "test-remote-tag".to_string(),
+        };
+
+        let mut resp = rsipstack::rsip::Response::default();
+        resp.body = EARLY_MEDIA_SDP.as_bytes().to_vec();
+
+        // Two Confirmed events (200 OK + re-INVITE ACK) must only apply once.
+        tx.send(DialogState::Confirmed(dialog_id.clone(), resp.clone()))
+            .unwrap();
+        tx.send(DialogState::Confirmed(dialog_id, resp)).unwrap();
+        drop(tx);
+
+        guard
+            .dialog_event_loop(&mut states)
+            .await
+            .expect("dialog event loop must complete");
+
+        assert_eq!(
+            updates.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "remote answer must be applied exactly once, not on the re-INVITE ACK Confirmed event"
+        );
+    }
+
+    #[test]
+    fn test_session_map_register_find_unregister() {
+        let endpoint = {
+            let mut builder = rsipstack::EndpointBuilder::new();
+            builder.build()
+        };
+        let invitation = Invitation::new(Arc::new(DialogLayer::new(endpoint.inner.clone())));
+
+        let dialog_id = DialogId {
+            call_id: "long-call-id-from-carrier".to_string(),
+            local_tag: String::new(),
+            remote_tag: "remote-tag".to_string(),
+        };
+
+        assert!(!invitation.session_exists("s.3f9a2b1c4d5e"));
+        assert!(
+            invitation
+                .find_dialog_id_by_session_id("s.3f9a2b1c4d5e")
+                .is_none()
+        );
+
+        invitation.register_session("s.3f9a2b1c4d5e", &dialog_id);
+        assert!(invitation.session_exists("s.3f9a2b1c4d5e"));
+        assert_eq!(
+            invitation
+                .find_dialog_id_by_session_id("s.3f9a2b1c4d5e")
+                .unwrap(),
+            dialog_id
+        );
+
+        invitation.unregister_session("s.3f9a2b1c4d5e");
+        assert!(!invitation.session_exists("s.3f9a2b1c4d5e"));
+        assert!(
+            invitation
+                .find_dialog_id_by_session_id("s.3f9a2b1c4d5e")
+                .is_none()
+        );
+        // Unregistering an unknown session is a no-op.
+        invitation.unregister_session("s.unknown");
+    }
+
+    /// The legacy fallback must keep resolving session ids that match a pending
+    /// dialog's dialog-id string (e.g. sessions registered before the mapping
+    /// table existed, or callers still using the raw dialog id).
+    #[test]
+    fn test_find_dialog_id_falls_back_to_pending_scan() {
+        use rsipstack::dialog::dialog::DialogInner;
+        use rsipstack::dialog::invite_dialog::InviteDialog;
+        use rsipstack::rsip::typed::{Contact, CSeq, From, To, Via};
+        use rsipstack::rsip::{Header, Request};
+        use rsipstack::transaction::key::TransactionRole;
+
+        let endpoint = {
+            let mut builder = rsipstack::EndpointBuilder::new();
+            builder.build()
+        };
+        let invitation = Invitation::new(Arc::new(DialogLayer::new(endpoint.inner.clone())));
+
+        let dialog_id = DialogId {
+            call_id: "legacy-call-id".to_string(),
+            local_tag: String::new(),
+            remote_tag: "remote-tag".to_string(),
+        };
+
+        let initial_request = Request {
+            method: rsipstack::rsip::Method::Invite,
+            uri: rsipstack::rsip::Uri::try_from("sip:bob@example.com:5060").unwrap(),
+            headers: vec![
+                Via::parse("SIP/2.0/UDP alice.example.com:5060;branch=z9hG4bKnashds")
+                    .unwrap()
+                    .into(),
+                CSeq::parse("1 INVITE").unwrap().into(),
+                From::parse("Alice <sip:alice@example.com>;tag=remote-tag")
+                    .unwrap()
+                    .into(),
+                To::parse("Bob <sip:bob@example.com>").unwrap().into(),
+                Header::CallId("legacy-call-id".into()),
+                Contact::parse("<sip:alice@alice.example.com:5060>").unwrap().into(),
+                Header::MaxForwards("70".into()),
+            ]
+            .into(),
+            version: rsipstack::rsip::Version::V2,
+            body: vec![],
+        };
+
+        let (state_sender, _state_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (tu_sender, _tu_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let inner = std::sync::Arc::new(
+            DialogInner::new(
+                TransactionRole::Server,
+                dialog_id.clone(),
+                initial_request,
+                endpoint.inner.clone(),
+                state_sender,
+                None,
+                None,
+                tu_sender,
+            )
+            .expect("failed to create dialog inner"),
+        );
+        let dialog = InviteDialog::from_inner(inner);
+
+        assert!(
+            invitation
+                .find_dialog_id_by_session_id(&dialog_id.to_string())
+                .is_none()
+        );
+
+        invitation.add_pending(
+            dialog_id.clone(),
+            PendingDialog {
+                token: tokio_util::sync::CancellationToken::new(),
+                dialog,
+                state_receiver: {
+                    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                    rx
+                },
+            },
+        );
+
+        assert_eq!(
+            invitation
+                .find_dialog_id_by_session_id(&dialog_id.to_string())
+                .unwrap(),
+            dialog_id
         );
     }
 }

@@ -19,6 +19,12 @@ mod dtmf_collector_tests;
 
 static RE_HANGUP: Lazy<Regex> = Lazy::new(|| Regex::new(r"<hangup\s*/>").unwrap());
 static RE_REFER: Lazy<Regex> = Lazy::new(|| Regex::new(r#"<refer\s+to="([^"]+)"\s*/>"#).unwrap());
+static RE_MESSAGE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"<message\s+(?:body|text)="([^"]+)"(?:\s+(?:content_type|contentType)="([^"]+)")?(?:\s+refer="(true|false)")?\s*/>"#,
+    )
+    .unwrap()
+});
 static RE_PLAY: Lazy<Regex> = Lazy::new(|| Regex::new(r#"<play\s+file="([^"]+)"\s*/>"#).unwrap());
 static RE_GOTO: Lazy<Regex> = Lazy::new(|| Regex::new(r#"<goto\s+scene="([^"]+)"\s*/>"#).unwrap());
 static RE_SET_VAR: Lazy<Regex> =
@@ -65,6 +71,7 @@ pub mod types;
 enum CommandKind {
     Hangup,
     Refer,
+    Message,
     Sentence,
     Play,
     Goto,
@@ -238,6 +245,7 @@ impl LlmHandler {
                             "Tool usage instructions:\n\
                             - To hang up the call, output: <hangup/>\n\
                             - To transfer the call, output: <refer to=\"sip:xxxx\"/>\n\
+                            - To send metadata body to the SIP peer, output: <message body=\"...\"/>\n\
                             - To play an audio file, output: <play file=\"path/to/file.wav\"/>\n\
                             - To switch to another scene, output: <goto scene=\"scene_id\"/>\n\
                             - To call an external HTTP API, output JSON:\n\
@@ -493,10 +501,7 @@ impl LlmHandler {
         );
 
         if let Some(call) = &self.call {
-            let mut state = call.call_state.write().await;
-            let mut extras = state.extras.take().unwrap_or_default();
-            extras.insert(var_name.clone(), serde_json::Value::String(buffer.clone()));
-            state.extras = Some(extras);
+            call.set_extra(&var_name, serde_json::Value::String(buffer.clone()));
         }
 
         // Notify LLM of the result
@@ -645,16 +650,16 @@ impl LlmHandler {
                     reason: Some("DTMF Hangup".to_string()),
                     initiator: Some("ai".to_string()),
                     headers,
+                    refer: None,
                 }])
             }
         }
     }
 
-    /// Get current extras (variables) from call_state for dynamic template rendering.
+    /// Get current extras (variables) from the call for dynamic template rendering.
     async fn get_current_extras(&self) -> HashMap<String, serde_json::Value> {
         if let Some(call) = &self.call {
-            let state = call.call_state.read().await;
-            state.extras.clone().unwrap_or_default()
+            call.extras.load_full().as_ref().clone()
         } else {
             HashMap::new()
         }
@@ -695,6 +700,7 @@ impl LlmHandler {
                     play_id: None,
                     auto_hangup: None,
                     wait_input_timeout: None,
+                    offset_ms: None,
                 });
             }
 
@@ -921,6 +927,7 @@ impl LlmHandler {
         loop {
             let hangup_pos = RE_HANGUP.find(buffer);
             let refer_pos = RE_REFER.captures(buffer);
+            let message_pos = RE_MESSAGE.captures(buffer);
             let play_pos = RE_PLAY.captures(buffer);
             let goto_pos = RE_GOTO.captures(buffer);
             let set_var_pos = RE_SET_VAR.captures(buffer);
@@ -935,6 +942,9 @@ impl LlmHandler {
             }
             if let Some(caps) = &refer_pos {
                 positions.push((caps.get(0).unwrap().start(), CommandKind::Refer));
+            }
+            if let Some(caps) = &message_pos {
+                positions.push((caps.get(0).unwrap().start(), CommandKind::Message));
             }
             if let Some(caps) = &play_pos {
                 positions.push((caps.get(0).unwrap().start(), CommandKind::Play));
@@ -976,10 +986,7 @@ impl LlmHandler {
                         }
 
                         if let Some(call) = &self.call {
-                            let mut state = call.call_state.write().await;
-                            let mut extras = state.extras.take().unwrap_or_default();
-                            extras.insert(key, serde_json::Value::String(value));
-                            state.extras = Some(extras);
+                            call.set_extra(&key, serde_json::Value::String(value));
                         }
 
                         buffer.drain(..mat.end());
@@ -1079,6 +1086,29 @@ impl LlmHandler {
                         });
                         buffer.drain(..mat.end());
                     }
+                    CommandKind::Message => {
+                        let caps = RE_MESSAGE.captures(buffer).unwrap();
+                        let mat = caps.get(0).unwrap();
+                        let body = caps.get(1).unwrap().as_str().to_string();
+                        let content_type = caps.get(2).map(|m| m.as_str().to_string());
+                        let refer = caps.get(3).map(|m| m.as_str() == "true");
+
+                        let prefix = buffer[..pos].to_string();
+                        if !prefix.trim().is_empty() {
+                            commands.push(self.create_tts_command_with_id(
+                                prefix,
+                                play_id.to_string(),
+                                None,
+                            ));
+                        }
+                        commands.push(Command::Message {
+                            body,
+                            content_type,
+                            headers: None,
+                            refer,
+                        });
+                        buffer.drain(..mat.end());
+                    }
                     CommandKind::Play => {
                         // Play audio
                         let caps = RE_PLAY.captures(buffer).unwrap();
@@ -1098,6 +1128,7 @@ impl LlmHandler {
                             play_id: None,
                             auto_hangup: None,
                             wait_input_timeout: None,
+                            offset_ms: None,
                         });
                         buffer.drain(..mat.end());
                     }
@@ -1205,10 +1236,7 @@ impl LlmHandler {
 
             if let Some(call) = &self.call {
                 let h_val = serde_json::to_value(&headers).unwrap_or_default();
-                let mut state = call.call_state.write().await;
-                let mut extras = state.extras.take().unwrap_or_default();
-                extras.insert("_hangup_headers".to_string(), h_val);
-                state.extras = Some(extras);
+                call.set_extra("_hangup_headers", h_val);
             }
 
             if !prefix.trim().is_empty() {
@@ -1316,6 +1344,7 @@ impl LlmHandler {
                     reason: reason.clone(),
                     initiator: initiator.clone(),
                     headers,
+                    refer: None,
                 });
                 Ok(false)
             }
@@ -1389,31 +1418,27 @@ impl LlmHandler {
     async fn render_sip_headers(&self) -> Option<HashMap<String, String>> {
         let hangup_template = self.sip_config.as_ref()?.hangup_headers.as_ref()?;
         let call = self.call.as_ref()?;
-        let state = call.call_state.read().await;
+        let extras = call.extras.load_full();
 
         let mut context = HashMap::new();
         let mut sip_headers = HashMap::new();
 
         // Get the list of SIP header keys stored during extraction
         // If not present, sip dict will be empty (no headers were configured for extraction)
-        let sip_header_keys: Vec<String> = state
-            .extras
-            .as_ref()
-            .and_then(|e| e.get("_sip_header_keys"))
+        let sip_header_keys: Vec<String> = extras
+            .get("_sip_header_keys")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
 
-        if let Some(extras) = &state.extras {
-            for (k, v) in extras {
-                // Skip internal keys
-                if k.starts_with('_') {
-                    continue;
-                }
-                context.insert(k.clone(), v.clone());
-                // Only include keys that were extracted as SIP headers
-                if sip_header_keys.contains(k) {
-                    sip_headers.insert(k.clone(), v.clone());
-                }
+        for (k, v) in extras.iter() {
+            // Skip internal keys
+            if k.starts_with('_') {
+                continue;
+            }
+            context.insert(k.clone(), v.clone());
+            // Only include keys that were extracted as SIP headers
+            if sip_header_keys.contains(k) {
+                sip_headers.insert(k.clone(), v.clone());
             }
         }
 
@@ -1509,7 +1534,10 @@ impl LlmHandler {
                 let text = res.text().await.unwrap_or_default();
                 self.history.push(ChatMessage {
                     role: "system".to_string(),
-                    content: format!("HTTP tool response ({}): {}", status, text),
+                    content: format!(
+                        "HTTP tool response ({}): {}\nThe HTTP request has already completed. Answer the user from this result in natural language; do not emit another http tool call for the same user request.",
+                        status, text
+                    ),
                 });
             }
             Err(e) => {
@@ -1726,6 +1754,7 @@ impl LlmHandler {
                 reason: Some("Max follow-up reached".to_string()),
                 initiator: Some("system".to_string()),
                 headers,
+                refer: None,
             }]);
         }
 
@@ -1754,6 +1783,7 @@ impl LlmHandler {
                     reason: args["reason"].as_str().map(|s| s.to_string()),
                     initiator: Some("ai".to_string()),
                     headers,
+                    refer: None,
                 }])
             }
             "transfer_call" | "refer_call" => {
@@ -1800,6 +1830,26 @@ impl LlmHandler {
 
             if wait_input_timeout.is_none() {
                 wait_input_timeout = structured.wait_input_timeout;
+            }
+
+            let has_tools = structured
+                .tools
+                .as_ref()
+                .map(|tools| !tools.is_empty())
+                .unwrap_or(false);
+
+            if attempts >= MAX_RAG_ATTEMPTS
+                && has_tools
+                && structured
+                    .text
+                    .as_ref()
+                    .map(|text| text.trim().is_empty())
+                    .unwrap_or(true)
+            {
+                warn!(
+                    "Reached RAG iteration limit with tool-only response; suppressing raw tool JSON"
+                );
+                break None;
             }
 
             let mut rerun_for_rag = false;
@@ -1905,6 +1955,7 @@ impl DialogueHandler for LlmHandler {
                         play_id: None,
                         auto_hangup: None,
                         wait_input_timeout: None,
+                        offset_ms: None,
                     });
                 }
             }

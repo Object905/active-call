@@ -1,8 +1,10 @@
+use crate::media::cache;
+use crate::synthesis::{SynthesisEvent, SynthesisOption};
 use crate::{
     app::AppState,
     call::{
         ActiveCall, ActiveCallType, Command,
-        active_call::{ActiveCallGuard, CallParams},
+        active_call::{ActiveCallGuard, CallParams, CallSpec},
     },
     handler::playbook,
     playbook::{Playbook, PlaybookRunner},
@@ -42,7 +44,8 @@ pub fn call_router() -> Router<AppState> {
         .route("/list", get(list_active_calls))
         .route("/kill/{id}", get(kill_active_call))
         .route("/events/{id}", get(stream_events))
-        .route("/command/{id}", post(send_command));
+        .route("/command/{id}", post(send_command))
+        .route("/precache", post(precache));
     r
 }
 
@@ -112,19 +115,18 @@ pub async fn call_handler_core(
     let _cancel_guard = cancel_token.clone().drop_guard();
     let track_config = TrackConfig::default();
 
-    let active_call = Arc::new(ActiveCall::new(
-        call_type.clone(),
-        cancel_token.clone(),
-        session_id.clone(),
-        app_state.invitation.clone(),
-        app_state.clone(),
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: call_type.clone(),
+        cancel_token: cancel_token.clone(),
+        session_id: session_id.clone(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
         track_config,
-        Some(audio_receiver),
+        audio_receiver: Some(audio_receiver),
         dump_events,
-        server_side_track,
+        server_side_track_id: server_side_track.clone(),
         extras,
-        None,
-    ));
+    }));
 
     // Load playbook: prefer direct parameter, fall back to pending_playbooks
     // (pending_playbooks is used by the run_playbook HTTP endpoint)
@@ -155,22 +157,24 @@ pub async fn call_handler_core(
                     if call_type == ActiveCallType::Sip {
                         if let Some(sip_config) = &playbook.config.sip {
                             if let Some(allowed_headers) = &sip_config.extract_headers {
-                                let mut state = active_call.call_state.write().await;
-                                if let Some(extras) = &mut state.extras {
-                                    filter_headers(extras, allowed_headers);
-                                    // Store the list of SIP header keys for later template rendering
-                                    let header_keys: Vec<String> = extras
-                                        .keys()
-                                        .filter(|k| !k.starts_with('_'))
-                                        .cloned()
-                                        .collect();
-                                    extras.insert(
-                                        "_sip_header_keys".to_string(),
-                                        serde_json::to_value(&header_keys).unwrap_or_default(),
-                                    );
-                                    if let Ok(result) = playbook.render(extras) {
-                                        playbook = result;
-                                    }
+                                let extras = active_call.extras.rcu(|e| {
+                                    let mut e = HashMap::clone(e);
+                                    filter_headers(&mut e, allowed_headers);
+                                    e
+                                });
+                                // Store the list of SIP header keys for later template rendering
+                                let header_keys: Vec<String> = extras
+                                    .keys()
+                                    .filter(|k| !k.starts_with('_'))
+                                    .cloned()
+                                    .collect();
+                                active_call.set_extra(
+                                    "_sip_header_keys",
+                                    serde_json::to_value(&header_keys).unwrap_or_default(),
+                                );
+                                if let Ok(result) = playbook.render(&active_call.extras.load_full())
+                                {
+                                    playbook = result;
                                 }
                             }
                         }
@@ -277,7 +281,7 @@ pub async fn call_handler_core(
     let receiver = active_call.new_receiver();
 
     let (r, _) = join! {
-        active_call.serve(receiver),
+        active_call.clone().serve(receiver),
         async {
             select!{
                 _ = send_ping_loop => {},
@@ -302,7 +306,7 @@ pub async fn call_handler_core(
     }
 
     // Capture final extras (including _hangup_headers) before cleanup
-    let final_extras = active_call.call_state.read().await.extras.clone();
+    let final_extras = Some(active_call.extras.load_full().as_ref().clone());
 
     active_call.cleanup().await.ok();
     debug!(session_id, "Call handler core completed");
@@ -316,12 +320,56 @@ pub async fn call_handler(
     app_state: AppState,
     params: CallParams,
 ) -> Response {
+    let has_explicit_id = params.id.is_some();
     let session_id = params
         .id
+        .clone()
         .unwrap_or_else(|| format!("s.{}", Uuid::new_v4().to_string()));
     let server_side_track = params.server_side_track.clone();
     let dump_events = params.dump_events.unwrap_or(true);
     let ping_interval = params.ping_interval.unwrap_or(20);
+
+    // Only an empty `forward` may hop to peers. Any present value is local-only.
+    // `forward=true` probes 404 if the call is absent so the originator can try
+    // the next peer instead of creating a new call.
+    //
+    // A ringing inbound SIP call only exists as a pending dialog (registered by
+    // the INVITE handler), not yet in `active_calls` — the ActiveCall is
+    // created by the websocket attach below. Treat pending dialogs as hosted
+    // locally so the attach neither probes peers nor 404s (same predicate the
+    // ActiveCall itself uses to resolve its SIP dialog).
+    if has_explicit_id {
+        let found_locally = {
+            let active_calls = app_state.active_calls.lock().unwrap();
+            active_calls.contains_key(&session_id)
+        } || app_state
+            .invitation
+            .find_dialog_id_by_session_id(&session_id)
+            .is_some();
+        if !found_locally {
+            if params.forward.is_none() {
+                if let Some(peer_ws) =
+                    crate::handler::peer::try_forward(&app_state, &session_id, &params).await
+                {
+                    info!(session_id, "forwarding websocket to peer hosting the call");
+                    return ws.on_upgrade(move |socket| async move {
+                        crate::handler::peer::tunnel(socket, peer_ws).await;
+                    });
+                }
+            }
+            if params.forward == Some(true) {
+                warn!(
+                    session_id,
+                    "call not found on this node, rejecting forwarded request"
+                );
+                return (
+                    axum::http::StatusCode::NOT_FOUND,
+                    "call not found on this node",
+                )
+                    .into_response();
+            }
+        }
+    }
 
     let resp = ws.on_upgrade(move |socket| async move {
         let (mut ws_sender, mut ws_receiver) = socket.split();
@@ -427,30 +475,29 @@ pub(crate) async fn get_iceservers(State(state): State<AppState>) -> Response {
 }
 
 pub(crate) async fn list_active_calls(State(state): State<AppState>) -> Response {
+    // Clone the call handles out of the registry lock first, then read each
+    // call's lock-free progress snapshot without holding the registry lock.
     let calls = state
         .active_calls
         .lock()
         .unwrap()
         .iter()
-        .map(|(_, c)| {
-            if let Ok(cs) = c.call_state.try_read() {
-                json!({
-                    "id": c.session_id,
-                    "callType": c.call_type,
-                    "cs.option": cs.option,
-                    "ringTime": cs.ring_time,
-                    "startTime": cs.answer_time,
-                })
-            } else {
-                json!({
-                    "id": c.session_id,
-                    "callType": c.call_type,
-                    "status": "locked",
-                })
-            }
+        .map(|(_, c)| c.clone())
+        .collect::<Vec<_>>();
+    let list = calls
+        .iter()
+        .map(|c| {
+            let progress = c.progress.load_full();
+            json!({
+                "id": c.session_id,
+                "callType": c.call_type,
+                "cs.option": progress.option,
+                "ringTime": progress.ring_time,
+                "startTime": progress.answer_time,
+            })
         })
         .collect::<Vec<_>>();
-    Json(serde_json::json!({ "active_calls": calls })).into_response()
+    Json(serde_json::json!({ "active_calls": list })).into_response()
 }
 
 pub(crate) async fn kill_active_call(
@@ -528,6 +575,112 @@ pub(crate) async fn send_command(
         Json(serde_json::json!({ "status": "not_found", "id": id })),
     )
         .into_response()
+}
+
+/// Pre-generate and cache TTS audio without an active call.
+///
+/// Accepts a `Tts` command (same shape as `/command/{id}`): it synthesizes the
+/// text and stores the audio under the exact cache key the real `do_tts` would
+/// use. A later `Tts` with the same parameters then hits the cache instead of
+/// regenerating.
+///
+/// NOTE: the cache key is derived from the command parameters. For a cache hit
+/// the real command must use the same effective `option` (provider, samplerate,
+/// speaker, speed) — or pass an explicit `cacheKey`.
+pub(crate) async fn precache(
+    State(state): State<AppState>,
+    Json(command): Json<Command>,
+) -> Response {
+    let result = match command {
+        Command::Tts {
+            text,
+            speaker,
+            option,
+            cache_key,
+            ..
+        } => precache_tts(&state, text, speaker, option, cache_key).await,
+        _ => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({ "status": "error", "error": "precache only accepts tts commands" })),
+            )
+                .into_response();
+        }
+    };
+
+    match result {
+        Ok((cache_key, bytes, existed)) => Json(json!({
+            "status": if existed { "exists" } else { "cached" },
+            "cacheKey": cache_key,
+            "bytes": bytes,
+        }))
+        .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error", "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// Synthesize `text` and store the audio under the same cache key `do_tts` uses.
+/// Returns (cache_key, bytes_stored, already_existed).
+async fn precache_tts(
+    state: &AppState,
+    text: String,
+    speaker: Option<String>,
+    option: Option<SynthesisOption>,
+    cache_key: Option<String>,
+) -> anyhow::Result<(String, usize, bool)> {
+    let mut opt = option.ok_or_else(|| anyhow::anyhow!("tts precache requires an option"))?;
+    // Fold the top-level speaker into the option (same precedence as do_tts)
+    opt.speaker = speaker.or(opt.speaker);
+    opt.check_default();
+
+    let mut client = state.stream_engine.create_tts_client(false, &opt).await?;
+    // Cache key must match tts.rs::handle_cache exactly.
+    let sample_rate = opt.samplerate.unwrap_or(16000) as u32;
+    let cache_key = cache_key.unwrap_or_else(|| {
+        cache::generate_cache_key(
+            &format!("tts:{}{}", client.provider(), text),
+            sample_rate,
+            opt.speaker.as_ref(),
+            opt.speed,
+        )
+    });
+    if cache::is_cached(&cache_key).await.unwrap_or(false) {
+        return Ok((cache_key, 0, true));
+    }
+
+    let mut stream = client.start().await?;
+    client.synthesize(&text, Some(0), Some(opt.clone())).await?;
+    client.stop().await?;
+
+    let mut chunks: Vec<Bytes> = Vec::new();
+    let mut first_chunk = true;
+    while let Some((_seq, res)) = stream.next().await {
+        match res? {
+            SynthesisEvent::AudioChunk(mut chunk) => {
+                // Strip the 44-byte WAV header off the first chunk (same as tts.rs).
+                if first_chunk {
+                    if chunk.len() > 44 && chunk[..4] == [0x52, 0x49, 0x46, 0x46] {
+                        let _ = chunk.split_to(44);
+                    }
+                    first_chunk = false;
+                }
+                chunks.push(chunk);
+            }
+            SynthesisEvent::Finished => break,
+            _ => {}
+        }
+    }
+    if chunks.is_empty() {
+        return Err(anyhow::anyhow!("tts produced no audio"));
+    }
+    let bytes: usize = chunks.iter().map(|c| c.len()).sum();
+    cache::store_in_cache_vectored(&cache_key, &chunks).await?;
+    info!(cache_key = %cache_key, bytes, "precache: stored tts audio");
+    Ok((cache_key, bytes, false))
 }
 
 trait IntoWsMessage {
@@ -608,6 +761,7 @@ mod tests {
                 reason: None,
                 initiator: None,
                 headers: None,
+                refer: None,
             })
             .ok();
         drop(command_sender);

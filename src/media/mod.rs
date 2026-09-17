@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+pub mod agc;
 pub mod ambiance;
 pub mod asr_processor;
 pub mod cache;
@@ -12,6 +13,8 @@ pub mod negotiate;
 pub mod processor;
 pub mod realtime_processor;
 pub mod recorder;
+#[cfg(feature = "ringback-detection")]
+pub mod ringback_detection;
 pub mod stream;
 #[cfg(test)]
 mod tests;
@@ -51,6 +54,8 @@ pub struct AudioFrame {
     pub timestamp: u64,
     pub sample_rate: u32,
     pub channels: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speech_probability: Option<f32>,
 }
 
 impl Samples {

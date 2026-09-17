@@ -1,15 +1,16 @@
 use crate::{media::AudioFrame, media::PcmBuf, media::Samples};
 use audio_codec::{
-    CodecType, Decoder, Encoder, Resampler, bytes_to_samples,
+    bytes_to_samples,
     g722::{G722Decoder, G722Encoder},
     pcma::{PcmaDecoder, PcmaEncoder},
     pcmu::{PcmuDecoder, PcmuEncoder},
-    samples_to_bytes,
+    samples_to_bytes, BoxedResampler, CodecType, Decoder, Encoder,
 };
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+use tracing::warn;
 
 use audio_codec::g729::{G729Decoder, G729Encoder};
-#[cfg(feature = "opus")]
 use audio_codec::opus::{OpusDecoder, OpusEncoder};
 
 pub struct TrackCodec {
@@ -24,35 +25,34 @@ pub struct TrackCodec {
     g729_encoder: Option<Box<G729Encoder>>,
     g729_decoder: Option<Box<G729Decoder>>,
 
-    #[cfg(feature = "opus")]
     opus_encoder: Option<OpusEncoder>,
-    #[cfg(feature = "opus")]
     opus_decoder: Option<OpusDecoder>,
 
-    resampler: Option<Resampler>,
+    resampler: Option<BoxedResampler>,
     resampler_in_rate: u32,
     resampler_out_rate: u32,
-    pub payload_type_map: HashMap<u8, CodecType>,
+    pub payload_type_map: Arc<RwLock<HashMap<u8, CodecType>>>,
 }
 
 impl Clone for TrackCodec {
     fn clone(&self) -> Self {
         let mut new = Self::new();
-        new.payload_type_map = self.payload_type_map.clone();
+        // Share the same underlying map so reinvite PT updates are visible to all clones.
+        new.payload_type_map = Arc::clone(&self.payload_type_map);
         new
     }
 }
 
 impl TrackCodec {
     pub fn new() -> Self {
-        let mut payload_type_map = HashMap::new();
-        payload_type_map.insert(0, CodecType::PCMU);
-        payload_type_map.insert(8, CodecType::PCMA);
-        payload_type_map.insert(9, CodecType::G722);
-        payload_type_map.insert(18, CodecType::G729);
-        payload_type_map.insert(101, CodecType::TelephoneEvent);
-        #[cfg(feature = "opus")]
-        payload_type_map.insert(111, CodecType::Opus);
+        let mut map = HashMap::new();
+        map.insert(0, CodecType::PCMU);
+        map.insert(8, CodecType::PCMA);
+        map.insert(9, CodecType::G722);
+        map.insert(18, CodecType::G729);
+        map.insert(101, CodecType::TelephoneEvent);
+        map.insert(111, CodecType::Opus);
+        let payload_type_map = Arc::new(RwLock::new(map));
 
         Self {
             pcmu_encoder: PcmuEncoder::new(),
@@ -63,9 +63,7 @@ impl TrackCodec {
             g722_decoder: None,
             g729_encoder: None,
             g729_decoder: None,
-            #[cfg(feature = "opus")]
             opus_encoder: None,
-            #[cfg(feature = "opus")]
             opus_decoder: None,
             resampler: None,
             resampler_in_rate: 0,
@@ -75,7 +73,18 @@ impl TrackCodec {
     }
 
     pub fn set_payload_type(&mut self, pt: u8, codec: CodecType) {
-        self.payload_type_map.insert(pt, codec);
+        self.payload_type_map.write().unwrap().insert(pt, codec);
+    }
+
+    /// Look up the codec for a given RTP payload type, consulting the negotiated map first
+    /// and falling back to the static payload type registry.
+    pub fn get_codec_for_pt(&self, pt: u8) -> Option<CodecType> {
+        self.payload_type_map
+            .read()
+            .unwrap()
+            .get(&pt)
+            .cloned()
+            .or_else(|| CodecType::try_from(pt).ok())
     }
 
     pub fn is_audio(payload_type: u8) -> bool {
@@ -87,14 +96,14 @@ impl TrackCodec {
         }
     }
 
-    pub fn decode(
-        &mut self,
-        payload_type: u8,
-        payload: &[u8],
-        target_sample_rate: u32,
-    ) -> (u32, u16, PcmBuf) {
+    /// Decode an RTP payload into PCM at the codec's native sample rate.
+    /// Returns `(native_sample_rate, channels, samples)`; resampling to the
+    /// pipeline rate is the caller's responsibility (see ProcessorChain).
+    pub fn decode(&mut self, payload_type: u8, payload: &[u8]) -> (u32, u16, PcmBuf) {
         let codec = self
             .payload_type_map
+            .read()
+            .unwrap()
             .get(&payload_type)
             .cloned()
             .unwrap_or_else(|| match payload_type {
@@ -102,7 +111,6 @@ impl TrackCodec {
                 8 => CodecType::PCMA,
                 9 => CodecType::G722,
                 18 => CodecType::G729,
-                #[cfg(feature = "opus")]
                 111 => CodecType::Opus,
                 _ => CodecType::PCMU,
             });
@@ -118,7 +126,6 @@ impl TrackCodec {
                 .g729_decoder
                 .get_or_insert_with(|| Box::new(G729Decoder::new()))
                 .decode(payload),
-            #[cfg(feature = "opus")]
             CodecType::Opus => self
                 .opus_decoder
                 .get_or_insert_with(OpusDecoder::new_default)
@@ -131,7 +138,6 @@ impl TrackCodec {
             CodecType::PCMA => (8000, 1),
             CodecType::G722 => (16000, 1),
             CodecType::G729 => (8000, 1),
-            #[cfg(feature = "opus")]
             CodecType::Opus => {
                 if pcm.len() >= 1920 {
                     (48000, 2)
@@ -142,15 +148,17 @@ impl TrackCodec {
             _ => (8000, 1),
         };
 
-        (
-            target_sample_rate,
-            channels,
-            self.resample(pcm, in_rate, target_sample_rate),
-        )
+        (in_rate, channels, pcm)
     }
 
     pub fn resample(&mut self, pcm: PcmBuf, in_rate: u32, out_rate: u32) -> PcmBuf {
-        if in_rate == out_rate {
+        // A zero rate means the caller has no valid source rate (e.g. a
+        // media-pass track created without an explicit input sample rate).
+        // There is nothing sensible to resample from, so pass the samples
+        // through instead of panicking: `BoxedResampler::new` rejects zero
+        // rates, and unwinding here poisons the `ProcessorChain` mutex,
+        // permanently breaking every subsequent frame on the track.
+        if in_rate == 0 || out_rate == 0 || in_rate == out_rate {
             return pcm;
         }
 
@@ -158,9 +166,20 @@ impl TrackCodec {
             || self.resampler_in_rate != in_rate
             || self.resampler_out_rate != out_rate
         {
-            self.resampler = Some(Resampler::new(in_rate as usize, out_rate as usize));
-            self.resampler_in_rate = in_rate;
-            self.resampler_out_rate = out_rate;
+            match BoxedResampler::new(in_rate as usize, out_rate as usize) {
+                Ok(resampler) => {
+                    self.resampler = Some(resampler);
+                    self.resampler_in_rate = in_rate;
+                    self.resampler_out_rate = out_rate;
+                }
+                Err(e) => {
+                    warn!(in_rate, out_rate, "failed to build resampler: {e}");
+                    self.resampler = None;
+                    self.resampler_in_rate = 0;
+                    self.resampler_out_rate = 0;
+                    return pcm;
+                }
+            }
         }
         self.resampler.as_mut().unwrap().resample(&pcm)
     }
@@ -170,24 +189,15 @@ impl TrackCodec {
             Samples::PCM { samples: mut pcm } => {
                 let codec = self
                     .payload_type_map
+                    .read()
+                    .unwrap()
                     .get(&payload_type)
                     .cloned()
                     .or_else(|| CodecType::try_from(payload_type).ok());
 
                 let target_samplerate = codec.map(|c| c.samplerate()).unwrap_or(8000);
                 if frame.sample_rate != target_samplerate {
-                    if self.resampler.is_none()
-                        || self.resampler_in_rate != frame.sample_rate
-                        || self.resampler_out_rate != target_samplerate
-                    {
-                        self.resampler = Some(Resampler::new(
-                            frame.sample_rate as usize,
-                            target_samplerate as usize,
-                        ));
-                        self.resampler_in_rate = frame.sample_rate;
-                        self.resampler_out_rate = target_samplerate;
-                    }
-                    pcm = self.resampler.as_mut().unwrap().resample(&pcm);
+                    pcm = self.resample(pcm, frame.sample_rate, target_samplerate);
                 }
 
                 let payload = match codec {
@@ -201,7 +211,6 @@ impl TrackCodec {
                         .g729_encoder
                         .get_or_insert_with(|| Box::new(G729Encoder::new()))
                         .encode(&pcm),
-                    #[cfg(feature = "opus")]
                     Some(CodecType::Opus) => self
                         .opus_encoder
                         .get_or_insert_with(OpusEncoder::new_default)
@@ -224,7 +233,6 @@ impl TrackCodec {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "opus")]
     #[test]
     fn test_encode_dynamic_opus_payload_type_uses_opus_encoder() {
         let mut codec = TrackCodec::new();
@@ -245,5 +253,15 @@ mod tests {
         assert!(!payload.is_empty());
         // If this were raw PCM bytes, it would be 640 bytes.
         assert!(payload.len() < 640);
+    }
+
+    #[test]
+    fn test_resample_zero_rate_passes_through_without_panic() {
+        let mut codec = TrackCodec::new();
+        let samples = vec![1000i16; 160];
+
+        assert_eq!(codec.resample(samples.clone(), 0, 16000), samples);
+        assert_eq!(codec.resample(samples.clone(), 16000, 0), samples);
+        assert_eq!(codec.resample(samples.clone(), 0, 0), samples);
     }
 }

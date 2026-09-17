@@ -1,216 +1,460 @@
 use super::Command;
 use crate::{
     CallOption, ReferOption,
+    call::state::{ActorMsg, CallProgress, CallRuntime, Extras, LegShared, build_callrecord},
     event::{EventReceiver, EventSender, SessionEvent},
     media::{
         TrackId,
-        ambiance::AmbianceProcessor,
         engine::StreamEngine,
-        negotiate::strip_ipv6_candidates,
-        processor::SubscribeProcessor,
         recorder::RecorderOption,
-        stream::{MediaStream, MediaStreamBuilder},
+        stream::{MediaStream, MediaStreamBuilder, SERVER_SIDE_TRACK_ID},
         track::{
-            Track, TrackConfig,
-            file::FileTrack,
-            media_pass::MediaPassTrack,
-            rtc::{RtcTrack, RtcTrackConfig},
-            tts::SynthesisHandle,
-            websocket::{WebsocketBytesReceiver, WebsocketTrack},
+            Track, TrackConfig, forwarding::ForwardingTrack, media_pass::MediaPassTrack,
+            tts::SynthesisHandle, websocket::WebsocketBytesReceiver,
         },
     },
-    synthesis::{SynthesisCommand, SynthesisOption},
+    synthesis::SynthesisCommand,
     transcription::TranscriptionOption,
 };
 use crate::{
     app::AppState,
-    call::{
-        CommandReceiver, CommandSender,
-        sip::{DialogStateReceiverGuard, Invitation, InviteDialogStates},
-    },
+    call::{CommandReceiver, CommandSender, sip::Invitation},
     callrecord::{CallRecord, CallRecordEvent, CallRecordEventType, CallRecordHangupReason},
-    useragent::{
-        invitation::PendingDialog,
-        public_address::{
-            build_public_contact_uri, contact_needs_public_resolution, find_local_addr_for_uri,
-        },
-    },
 };
 use anyhow::Result;
-use audio_codec::CodecType;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use chrono::{DateTime, Utc};
-use rsipstack::dialog::{invitation::InviteOption, server_dialog::ServerInviteDialog};
+use rsipstack::dialog::invite_dialog::InviteDialog;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
-use tokio::{fs::File, select, sync::Mutex, sync::RwLock, time::sleep};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
+use tokio::{fs::File, select, sync::mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+
+/// Describes the state of the caller track when an incoming SIP call is waiting to be answered.
+pub enum PendingCallerTrack {
+    /// The track has been started in the media stream during ringing (early media).
+    /// Processors must be built from the accept option and appended to it.
+    StartedForEarlyMedia,
+    /// The track has not been added to the media stream yet.
+    /// setup_track_with_stream will start it and build processors from the accept option.
+    NotStarted(Box<dyn Track>),
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::AppStateBuilder;
-    use crate::callrecord::CallRecordHangupReason;
     use crate::config::Config;
     use crate::media::track::tts::SynthesisHandle;
     use crate::synthesis::SynthesisCommand;
     use tokio::sync::mpsc;
 
-    #[tokio::test]
-    async fn test_tts_ssrc_reuse_for_autohangup() -> Result<()> {
+    async fn make_active_call_with_option(option: CallOption) -> Arc<ActiveCall> {
         let mut config = Config::default();
         config.udp_port = 0; // Use random port
         config.media_cache_path = "/tmp/mediacache".to_string();
-        let stream_engine = Arc::new(StreamEngine::default());
         let app_state = AppStateBuilder::new()
             .with_config(config)
-            .with_stream_engine(stream_engine)
+            .with_stream_engine(Arc::new(StreamEngine::default()))
             .build()
-            .await?;
+            .await
+            .unwrap();
+        let active_call = Arc::new(ActiveCall::new(CallSpec {
+            call_type: ActiveCallType::Sip,
+            cancel_token: CancellationToken::new(),
+            session_id: "test-session".to_string(),
+            invitation: app_state.invitation.clone(),
+            app_state: app_state.clone(),
+            track_config: TrackConfig::default(),
+            audio_receiver: None,
+            dump_events: false,
+            server_side_track_id: None,
+            extras: None,
+        }));
+        active_call.set_option(option);
+        active_call
+    }
 
-        let cancel_token = CancellationToken::new();
-        let session_id = "test-session".to_string();
-        let track_config = TrackConfig::default();
-
+    #[tokio::test]
+    async fn test_tts_ssrc_reuse_for_autohangup() -> Result<()> {
         let mut option = crate::CallOption::default();
         option.tts = Some(crate::synthesis::SynthesisOption::default());
-
-        let active_call = Arc::new(ActiveCall::new(
-            ActiveCallType::Sip,
-            cancel_token.clone(),
-            session_id.clone(),
-            app_state.invitation.clone(),
-            app_state.clone(),
-            track_config,
-            None,
-            false,
-            None,
-            None,
-            None,
-        ));
-
-        {
-            let mut state = active_call.call_state.write().await;
-            state.option = Some(option);
-        }
+        let active_call = make_active_call_with_option(option).await;
 
         let (tx, mut rx) = mpsc::unbounded_channel::<SynthesisCommand>();
         let initial_ssrc = 12345;
         let handle = SynthesisHandle::new(tx, Some("play_1".to_string()), initial_ssrc);
 
         // 1. Set initial TTS handle
-        {
-            let mut state = active_call.call_state.write().await;
-            state.tts_handle = Some(handle);
-            state.current_play_id = Some("play_1".to_string());
-        }
+        active_call.tts_handle.store(Some(Arc::new(handle)));
+        active_call.set_current_play(Some("play_1".to_string()));
 
         // 2. Call do_tts with auto_hangup=true and same play_id
         active_call
-            .do_tts(
-                "hangup now".to_string(),
-                None,
-                Some("play_1".to_string()),
-                Some(true),
-                false,
-                true,
-                None,
-                None,
-                false,
-                None,
-            )
+            .do_tts(Command::Tts {
+                text: "hangup now".to_string(),
+                speaker: None,
+                play_id: Some("play_1".to_string()),
+                auto_hangup: Some(true),
+                streaming: Some(false),
+                end_of_stream: Some(true),
+                option: None,
+                wait_input_timeout: None,
+                base64: Some(false),
+                cache_key: None,
+            })
             .await?;
 
-        // 3. Verify auto_hangup state uses the EXISTING SSRC
-        {
-            let state = active_call.call_state.read().await;
-            assert!(state.auto_hangup.is_some());
-            let (h_ssrc, reason) = state.auto_hangup.clone().unwrap();
-            assert_eq!(
-                h_ssrc, initial_ssrc,
-                "SSRC should be reused from existing handle"
-            );
-            assert_eq!(reason, CallRecordHangupReason::BySystem);
-        }
-
-        // 4. Verify command was sent to existing channel
+        // 3. Verify the hangup intent rides on the command sent to the existing track
         let cmd = rx.try_recv().expect("Should have received tts command");
         assert_eq!(cmd.text, "hangup now");
+        assert_eq!(cmd.auto_hangup, Some(true));
 
         Ok(())
     }
 
     #[tokio::test]
     async fn test_tts_new_ssrc_for_different_play_id() -> Result<()> {
-        let mut config = Config::default();
-        config.udp_port = 0; // Use random port
-        config.media_cache_path = "/tmp/mediacache".to_string();
-        let stream_engine = Arc::new(StreamEngine::default());
-        let app_state = AppStateBuilder::new()
-            .with_config(config)
-            .with_stream_engine(stream_engine)
-            .build()
-            .await?;
-
-        let active_call = Arc::new(ActiveCall::new(
-            ActiveCallType::Sip,
-            CancellationToken::new(),
-            "test-session".to_string(),
-            app_state.invitation.clone(),
-            app_state.clone(),
-            TrackConfig::default(),
-            None,
-            false,
-            None,
-            None,
-            None,
-        ));
-
         let mut tts_opt = crate::synthesis::SynthesisOption::default();
         tts_opt.provider = Some(crate::synthesis::SynthesisType::Aliyun);
         let mut option = crate::CallOption::default();
         option.tts = Some(tts_opt);
-        {
-            let mut state = active_call.call_state.write().await;
-            state.option = Some(option);
-        }
+        let active_call = make_active_call_with_option(option).await;
 
         let (tx, _rx) = mpsc::unbounded_channel();
         let initial_ssrc = 111;
         let handle = SynthesisHandle::new(tx, Some("play_1".to_string()), initial_ssrc);
 
-        {
-            let mut state = active_call.call_state.write().await;
-            state.tts_handle = Some(handle);
-            state.current_play_id = Some("play_1".to_string());
-        }
+        active_call.tts_handle.store(Some(Arc::new(handle)));
+        active_call.set_current_play(Some("play_1".to_string()));
 
         // Call do_tts with DIFFERENT play_id
         active_call
-            .do_tts(
-                "new play".to_string(),
-                None,
-                Some("play_2".to_string()),
-                Some(true),
-                false,
-                true,
-                None,
-                None,
-                false,
-                None,
-            )
+            .do_tts(Command::Tts {
+                text: "new play".to_string(),
+                speaker: None,
+                play_id: Some("play_2".to_string()),
+                auto_hangup: Some(true),
+                streaming: Some(false),
+                end_of_stream: Some(true),
+                option: None,
+                wait_input_timeout: None,
+                base64: Some(false),
+                cache_key: None,
+            })
             .await?;
 
-        // Verify auto_hangup uses a NEW SSRC (because it should interrupt and start fresh)
+        // Verify a NEW track was started (new handle with a different ssrc,
+        // because a different play_id interrupts and starts fresh)
         {
-            let state = active_call.call_state.read().await;
-            let (h_ssrc, _) = state.auto_hangup.clone().unwrap();
+            let handle = active_call.tts_handle.load_full();
+            assert!(handle.is_some(), "new tts handle should be stored");
+            let handle = handle.unwrap();
             assert_ne!(
-                h_ssrc, initial_ssrc,
+                handle.ssrc, initial_ssrc,
                 "Should use a new SSRC for different play_id"
             );
         }
 
+        Ok(())
+    }
+
+    // refer=Some(true): only the refer call is cancelled, media stream stays alive.
+    #[tokio::test]
+    async fn test_hangup_refer_true_cancels_refer_only() -> Result<()> {
+        let active_call = make_active_call_with_option(crate::CallOption::default()).await;
+
+        let refer_token = active_call.cancel_token.child_token();
+        let refer_leg = LegShared::new(1, true, CallProgress::default());
+        active_call.set_refer_call_token(refer_token.clone());
+        active_call.set_refer_leg(Some(refer_leg.clone()));
+
+        active_call.do_hangup(None, None, None, Some(true)).await?;
+
+        assert!(
+            refer_token.is_cancelled(),
+            "refer token should be cancelled"
+        );
+        assert!(
+            !active_call.media_stream.cancel_token.is_cancelled(),
+            "media stream should NOT stop"
+        );
+        assert!(
+            refer_leg.progress.load_full().hangup_reason.is_some(),
+            "hangup_reason should be set on refer leg"
+        );
+        Ok(())
+    }
+
+    // refer=None: media stream stops and the refer token is also cancelled.
+    #[tokio::test]
+    async fn test_hangup_none_cancels_refer_too() -> Result<()> {
+        let active_call = make_active_call_with_option(crate::CallOption::default()).await;
+
+        let refer_token = active_call.cancel_token.child_token();
+        active_call.set_refer_call_token(refer_token.clone());
+
+        active_call.do_hangup(None, None, None, None).await?;
+
+        assert!(
+            refer_token.is_cancelled(),
+            "refer token should be cancelled"
+        );
+        assert!(
+            active_call.media_stream.cancel_token.is_cancelled(),
+            "media stream should stop"
+        );
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression: ringing-before-accept leaves caller track without processors
+    // ---------------------------------------------------------------------------
+    //
+    // When Ringing is issued before Accept on an incoming SIP call,
+    // prepare_incoming_sip_track starts the caller track in the media stream
+    // (needed for early-media ringtone) with the empty ringing option — no
+    // VAD/ASR/AGC processors.  It stores PendingCallerTrack::StartedForEarlyMedia
+    // in ready_to_answer.  At accept time, finish_caller_stack matches that variant
+    // and calls create_processors + append_processor with the real accept option.
+    //
+    // This test verifies that setup_track_with_stream (same processor-creation path)
+    // fires the ASR builder when given the accept option, proving the fix is sound.
+
+    struct MockCallerTrack {
+        id: TrackId,
+        config: crate::media::track::TrackConfig,
+        processor_chain: crate::media::processor::ProcessorChain,
+    }
+
+    impl MockCallerTrack {
+        fn new(id: TrackId) -> Self {
+            Self {
+                id,
+                config: crate::media::track::TrackConfig::default(),
+                processor_chain: crate::media::processor::ProcessorChain::new(16000),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::media::track::Track for MockCallerTrack {
+        fn ssrc(&self) -> u32 {
+            0
+        }
+        fn id(&self) -> &TrackId {
+            &self.id
+        }
+        fn config(&self) -> &crate::media::track::TrackConfig {
+            &self.config
+        }
+        fn processor_chain(&mut self) -> &mut crate::media::processor::ProcessorChain {
+            &mut self.processor_chain
+        }
+        async fn handshake(
+            &mut self,
+            _o: String,
+            _t: Option<tokio::time::Duration>,
+        ) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn update_remote_description(&mut self, _a: &String) -> Result<()> {
+            Ok(())
+        }
+        async fn start(
+            &mut self,
+            _e: crate::event::EventSender,
+            _p: crate::media::track::TrackPacketSender,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn stop(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn send_packet(&mut self, _f: &crate::media::AudioFrame) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct MockAsrClient;
+
+    #[async_trait::async_trait]
+    impl crate::transcription::TranscriptionClient for MockAsrClient {
+        fn send_audio(
+            &self,
+            _s: &[crate::media::Sample],
+            _src: Option<&crate::media::SourcePacket>,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn make_active_call_with_engine_and_option(
+        engine: Arc<StreamEngine>,
+        cache_dir: &str,
+        option: crate::CallOption,
+    ) -> Arc<ActiveCall> {
+        let mut config = Config::default();
+        config.udp_port = 0;
+        config.media_cache_path = cache_dir.to_string();
+        let app_state = AppStateBuilder::new()
+            .with_config(config)
+            .with_stream_engine(engine)
+            .build()
+            .await
+            .unwrap();
+        let session_id = format!("test-{}-{}", cache_dir, uuid::Uuid::new_v4());
+        let active_call = Arc::new(ActiveCall::new(CallSpec {
+            call_type: ActiveCallType::Sip,
+            cancel_token: CancellationToken::new(),
+            session_id: session_id.clone(),
+            invitation: app_state.invitation.clone(),
+            app_state: app_state.clone(),
+            track_config: TrackConfig::default(),
+            audio_receiver: None,
+            dump_events: false,
+            server_side_track_id: None,
+            extras: None,
+        }));
+        active_call.set_option(option);
+        active_call
+    }
+
+    #[tokio::test]
+    async fn test_setup_track_with_stream_builds_processors_from_accept_option() -> Result<()> {
+        let (asr_created_tx, mut asr_created_rx) = mpsc::channel::<()>(1);
+
+        let mock_provider =
+            crate::transcription::TranscriptionType::Other("mock-ringing-asr".to_string());
+
+        let mut engine = StreamEngine::new();
+        engine.register_asr(
+            mock_provider.clone(),
+            Box::new(move |_tid, _tok, _opt, _es| {
+                let tx = asr_created_tx.clone();
+                Box::pin(async move {
+                    let _ = tx.send(()).await;
+                    Ok(Box::new(MockAsrClient)
+                        as Box<dyn crate::transcription::TranscriptionClient>)
+                })
+            }),
+        );
+        let engine = Arc::new(engine);
+
+        let accept_option = crate::CallOption {
+            asr: Some(crate::transcription::TranscriptionOption {
+                provider: Some(mock_provider),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let active_call = make_active_call_with_engine_and_option(
+            engine,
+            "mediacache_ringing_accept_test",
+            accept_option,
+        )
+        .await;
+        let cancel_token = active_call.cancel_token.clone();
+
+        // Simulate the fixed prepare_incoming_sip_track: track is held in
+        // ready_to_answer, NOT yet added to the media stream.
+        let mock_track = Box::new(MockCallerTrack::new(active_call.session_id.clone()));
+
+        // Simulate finish_caller_stack at accept time: setup_track_with_stream
+        // is called with the full accept option (the code path under test).
+        let accept_option = active_call.progress.load_full().option.clone().unwrap();
+        active_call
+            .setup_track_with_stream(&accept_option, mock_track)
+            .await?;
+
+        // The mock ASR builder must have fired, proving processors were built
+        // from the accept option and attached to the caller track.
+        let received =
+            tokio::time::timeout(std::time::Duration::from_secs(3), asr_created_rx.recv()).await;
+        assert!(
+            received.is_ok() && received.unwrap().is_some(),
+            "ASR processor was NOT created — setup_track_with_stream did not build \
+             processors from the accept option (regression: ringing-before-accept)"
+        );
+
+        cancel_token.cancel();
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression: double-ASR when Accept arrives without a prior Ringing
+    // ---------------------------------------------------------------------------
+    //
+    // prepare_incoming_sip_track starts the caller track during ringing. It must
+    // NOT build VAD/ASR/AGC processors at that point: the stored option already
+    // carries `asr` in the accept-first path, so finish_caller_stack would build a
+    // second set at accept time, producing two ASR clients (two WebSocket
+    // connections) on the same track.
+    //
+    // This test verifies that update_track_wrapper (the prepare-time path) never
+    // fires the ASR builder even when the option carries an asr config.
+
+    #[tokio::test]
+    async fn test_update_track_wrapper_does_not_build_asr_processor() -> Result<()> {
+        let (asr_created_tx, mut asr_created_rx) = mpsc::channel::<()>(1);
+
+        let mock_provider =
+            crate::transcription::TranscriptionType::Other("mock-ringing-asr".to_string());
+
+        let mut engine = StreamEngine::new();
+        engine.register_asr(
+            mock_provider.clone(),
+            Box::new(move |_tid, _tok, _opt, _es| {
+                let tx = asr_created_tx.clone();
+                Box::pin(async move {
+                    let _ = tx.send(()).await;
+                    Ok(Box::new(MockAsrClient)
+                        as Box<dyn crate::transcription::TranscriptionClient>)
+                })
+            }),
+        );
+        let engine = Arc::new(engine);
+
+        // Simulate the accept-first path: setup_caller_track has already stored the
+        // full accept option (with asr) before the track is prepared.
+        let accept_option = crate::CallOption {
+            asr: Some(crate::transcription::TranscriptionOption {
+                provider: Some(mock_provider),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let active_call = make_active_call_with_engine_and_option(
+            engine,
+            "mediacache_update_track_wrapper_test",
+            accept_option,
+        )
+        .await;
+        let cancel_token = active_call.cancel_token.clone();
+
+        let mock_track = Box::new(MockCallerTrack::new(active_call.session_id.clone()));
+        active_call.update_track_wrapper(mock_track, None).await;
+
+        // update_track_wrapper must NOT fire the ASR builder; the processors are
+        // deferred to finish_caller_stack(StartedForEarlyMedia) at accept time.
+        let received =
+            tokio::time::timeout(std::time::Duration::from_millis(500), asr_created_rx.recv())
+                .await;
+        assert!(
+            received.is_err(),
+            "ASR builder fired during track preparation — double-ASR regression"
+        );
+
+        cancel_token.cancel();
         Ok(())
     }
 }
@@ -224,6 +468,37 @@ pub struct CallParams {
     #[serde(rename = "ping")]
     pub ping_interval: Option<u32>,
     pub server_side_track: Option<String>,
+    /// Set when this connection is a one-hop find from another node.
+    /// Only an empty `forward` may be forwarded. A present value is answered
+    /// locally only and must never hop again. `forward=true` must 404 if the
+    /// session is absent (do not create a new call).
+    #[serde(default)]
+    pub forward: Option<bool>,
+    /// Ignored. Kept so older nodes that still send `visited=` can deserialize.
+    #[serde(default)]
+    pub visited: Option<String>,
+}
+
+impl CallParams {
+    /// Build the query string used when forwarding this request to a peer.
+    /// Sets `forward=true` so the peer will not hop (`forward` is no longer empty).
+    pub fn to_forward_query(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(id) = &self.id {
+            parts.push(format!("id={}", urlencoding::encode(id)));
+        }
+        if let Some(dump) = self.dump_events {
+            parts.push(format!("dump={}", dump));
+        }
+        if let Some(ping) = self.ping_interval {
+            parts.push(format!("ping={}", ping));
+        }
+        if let Some(track) = &self.server_side_track {
+            parts.push(format!("server_side_track={}", urlencoding::encode(track)));
+        }
+        parts.push("forward=true".to_string());
+        parts.join("&")
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
@@ -236,41 +511,16 @@ pub enum ActiveCallType {
     Sip,
 }
 
-#[derive(Default)]
-pub struct ActiveCallState {
-    pub session_id: String,
-    pub start_time: DateTime<Utc>,
-    pub ring_time: Option<DateTime<Utc>>,
-    pub answer_time: Option<DateTime<Utc>>,
-    pub hangup_reason: Option<CallRecordHangupReason>,
-    pub last_status_code: u16,
-    pub option: Option<CallOption>,
-    pub answer: Option<String>,
-    pub ssrc: u32,
-    pub refer_callstate: Option<ActiveCallStateRef>,
-    pub extras: Option<HashMap<String, serde_json::Value>>,
-    pub is_refer: bool,
-    pub sip_hangup_headers_template: Option<HashMap<String, String>>,
-
-    // Runtime state (migrated from ActiveCall to reduce multiple locks)
-    pub tts_handle: Option<SynthesisHandle>,
-    pub auto_hangup: Option<(u32, CallRecordHangupReason)>,
-    pub wait_input_timeout: Option<u32>,
-    pub moh: Option<String>,
-    pub current_play_id: Option<String>,
-    pub audio_receiver: Option<WebsocketBytesReceiver>,
-    pub ready_to_answer: Option<(String, Option<Box<dyn Track>>, ServerInviteDialog)>,
-    pub pending_asr_resume: Option<(u32, TranscriptionOption)>,
-}
-
 pub type ActiveCallRef = Arc<ActiveCall>;
-pub type ActiveCallStateRef = Arc<RwLock<ActiveCallState>>;
 
+/// A call: immutable identity + lock-free shared state (see `call::state`)
+/// plus the infrastructure handles. Actor-owned mutable state lives in
+/// [`CallRuntime`] inside `serve`.
 pub struct ActiveCall {
-    pub call_state: ActiveCallStateRef,
     pub cancel_token: CancellationToken,
     pub call_type: ActiveCallType,
     pub session_id: String,
+    pub start_time: DateTime<Utc>,
     pub media_stream: Arc<MediaStream>,
     pub track_config: TrackConfig,
     pub event_sender: EventSender,
@@ -279,6 +529,174 @@ pub struct ActiveCall {
     pub cmd_sender: CommandSender,
     pub dump_events: bool,
     pub server_side_track_id: TrackId,
+
+    /// Immutable main-leg SSRC.
+    pub ssrc: u32,
+    /// Bridge pause flag shared with the peer call during bridging.
+    pub bridge_paused: Arc<AtomicBool>,
+    /// Main-leg lifecycle progress (dialog id, ring/answer times, answer SDP, option...).
+    pub progress: Arc<ArcSwap<CallProgress>>,
+    /// Main-leg variables (playbook set_var, SIP headers, hangup headers).
+    pub extras: Extras,
+    /// Active music-on-hold path (shared with the spawned refer task).
+    pub moh: ArcSwapOption<String>,
+    /// play id of the current server-side playback (shared for TrackEnd matching).
+    pub current_play_id: ArcSwapOption<String>,
+    /// Live TTS handle (shared so spawned tasks and post-serve cleanup can drop it).
+    pub tts_handle: ArcSwapOption<SynthesisHandle>,
+    /// Shared state of the refer leg, when one is active.
+    pub refer_leg: ArcSwapOption<LegShared>,
+    /// Answer prepared during ringing (SDP + running track + dialog); taken
+    /// by accept/reject. Shared so post-serve `cleanup` can still reject.
+    pub ready_to_answer: ArcSwapOption<ReadyAnswer>,
+    /// Answer prepared for the underlying SIP dialog of non-SIP call types
+    /// (WebSocket/Webrtc); taken by accept, rejected on reject/cleanup.
+    /// Same slot family as `ready_to_answer`: lock-free set/take on the
+    /// actor path, with ownership recoverable from `cleanup`.
+    pub pending_sip_answer: ArcSwapOption<PendingSipAnswer>,
+    /// Cancel this token to hang up only the refer call, leaving the main call alive.
+    pub refer_call_token: ArcSwapOption<CancellationToken>,
+    /// Pending wait-input timeout set by the last Tts/Play command.
+    pub wait_input_timeout: ArcSwapOption<u32>,
+    /// ASR config to resume on the parent leg once the refer leg ends.
+    pub pending_asr_resume: ArcSwapOption<(u32, TranscriptionOption)>,
+    /// WebSocket audio receiver injected at construction, taken once by setup.
+    pub audio_receiver: std::sync::Mutex<Option<WebsocketBytesReceiver>>,
+}
+
+impl ActiveCall {
+    /// Lock-free shared state of the main leg.
+    pub fn leg(&self) -> LegShared {
+        LegShared {
+            ssrc: self.ssrc,
+            is_refer: false,
+            progress: self.progress.clone(),
+            extras: self.extras.clone(),
+        }
+    }
+
+    /// Store/replace the main-leg option in the progress snapshot.
+    pub fn set_option(&self, option: CallOption) {
+        self.progress.rcu(|p| {
+            let mut p = CallProgress::clone(p);
+            p.option = Some(option.clone());
+            p
+        });
+    }
+
+    pub fn moh_path(&self) -> Option<String> {
+        self.moh.load_full().map(|s| s.to_string())
+    }
+
+    pub fn set_moh(&self, v: Option<String>) {
+        self.moh.store(v.map(Arc::new));
+    }
+
+    pub fn current_play(&self) -> Option<String> {
+        self.current_play_id.load_full().map(|s| s.to_string())
+    }
+
+    pub fn set_current_play(&self, v: Option<String>) {
+        self.current_play_id.store(v.map(Arc::new));
+    }
+
+    pub fn refer_leg_value(&self) -> Option<LegShared> {
+        self.refer_leg.load_full().map(|l| l.as_ref().clone())
+    }
+
+    pub fn set_refer_leg(&self, v: Option<LegShared>) {
+        self.refer_leg.store(v.map(Arc::new));
+    }
+
+    /// Prepared answer during ringing; taken once by accept/reject.
+    pub fn set_ready_to_answer(&self, ready: ReadyAnswer) {
+        self.ready_to_answer.store(Some(Arc::new(ready)));
+    }
+
+    pub fn take_ready_to_answer(&self) -> Option<Arc<ReadyAnswer>> {
+        self.ready_to_answer.swap(None)
+    }
+
+    pub fn has_ready_to_answer(&self) -> bool {
+        self.ready_to_answer.load().is_some()
+    }
+
+    /// Prepared 200 OK for the underlying SIP dialog of non-SIP call types.
+    pub fn set_pending_sip_answer(&self, pending: PendingSipAnswer) {
+        self.pending_sip_answer.store(Some(Arc::new(pending)));
+    }
+
+    pub fn take_pending_sip_answer(&self) -> Option<Arc<PendingSipAnswer>> {
+        self.pending_sip_answer.swap(None)
+    }
+
+    /// Cancel token that hangs up only the refer leg, leaving the main call
+    /// alive; set by `do_refer`, taken by hangup.
+    pub fn take_refer_call_token(&self) -> Option<CancellationToken> {
+        self.refer_call_token.swap(None).map(|t| (*t).clone())
+    }
+
+    pub fn set_refer_call_token(&self, token: CancellationToken) {
+        self.refer_call_token.store(Some(Arc::new(token)));
+    }
+
+    /// Pending wait-input timeout set by the last Tts/Play command, consumed
+    /// when the track ends.
+    pub fn take_wait_input_timeout(&self) -> Option<u32> {
+        self.wait_input_timeout.swap(None).map(|t| *t)
+    }
+
+    pub fn set_wait_input_timeout(&self, v: Option<u32>) {
+        self.wait_input_timeout.store(v.map(Arc::new));
+    }
+
+    /// ASR config to resume on the parent leg once the refer leg ends.
+    pub fn set_pending_asr_resume(&self, v: (u32, TranscriptionOption)) {
+        self.pending_asr_resume.store(Some(Arc::new(v)));
+    }
+
+    pub fn take_pending_asr_resume(&self) -> Option<(u32, TranscriptionOption)> {
+        self.pending_asr_resume.swap(None).map(|a| (*a).clone())
+    }
+
+    /// Insert/overwrite one main-leg extras variable.
+    pub fn set_extra(&self, key: &str, value: serde_json::Value) {
+        self.leg().set_extra(key, value);
+    }
+
+    /// Whether a pending (not yet answered) incoming dialog exists for this call.
+    fn has_pending_invite(&self) -> bool {
+        self.invitation
+            .find_dialog_id_by_session_id(&self.session_id)
+            .is_some()
+    }
+
+    /// One-shot hangup for error-cleanup paths outside the actor loop.
+    async fn hangup_now(&self, reason: Option<CallRecordHangupReason>) {
+        self.do_hangup(reason, None, None, None).await.ok();
+    }
+
+    /// One-shot reject for teardown paths outside the actor loop.
+    async fn reject_now(&self, code: Option<rsipstack::rsip::StatusCode>, reason: Option<String>) {
+        self.do_reject(code, reason).await.ok();
+    }
+}
+
+/// Answer prepared during ringing: the SDP to answer with, the already
+/// running caller track (started for early media), and the dialog to accept.
+pub struct ReadyAnswer {
+    pub answer: String,
+    pub track: PendingCallerTrack,
+    pub dialog: InviteDialog,
+}
+
+/// Answer prepared for the underlying inbound SIP dialog of a non-SIP call
+/// type (WebSocket/Webrtc): the 200 OK SDP, the dialog to accept, and the RTP
+/// track that bridges the SIP leg into the media stream.
+pub struct PendingSipAnswer {
+    pub answer: String,
+    pub dialog: InviteDialog,
+    pub track: Box<dyn Track>,
 }
 
 pub struct ActiveCallGuard {
@@ -308,6 +726,11 @@ impl Drop for ActiveCallGuard {
             .lock()
             .unwrap()
             .remove(&self.call.session_id);
+        // Idempotent cleanup of the incoming-call session-id mapping (no-op
+        // for outgoing/websocket sessions that were never registered).
+        self.call
+            .invitation
+            .unregister_session(&self.call.session_id);
     }
 }
 
@@ -317,22 +740,41 @@ pub struct ActiveCallReceiver {
     pub dump_event_receiver: EventReceiver,
 }
 
+/// Construction parameters for [`ActiveCall::new`].
+pub struct CallSpec {
+    pub call_type: ActiveCallType,
+    pub cancel_token: CancellationToken,
+    pub session_id: String,
+    pub invitation: Invitation,
+    pub app_state: AppState,
+    pub track_config: TrackConfig,
+    /// WebSocket audio receiver (WebSocket calls only), taken once by setup.
+    pub audio_receiver: Option<WebsocketBytesReceiver>,
+    pub dump_events: bool,
+    /// Overrides the default server-side track id.
+    pub server_side_track_id: Option<TrackId>,
+    /// Initial session variables; built-ins (session id, call type, start
+    /// time) are injected for missing keys.
+    pub extras: Option<HashMap<String, serde_json::Value>>,
+}
+
 impl ActiveCall {
-    pub fn new(
-        call_type: ActiveCallType,
-        cancel_token: CancellationToken,
-        session_id: String,
-        invitation: Invitation,
-        app_state: AppState,
-        track_config: TrackConfig,
-        audio_receiver: Option<WebsocketBytesReceiver>,
-        dump_events: bool,
-        server_side_track_id: Option<TrackId>,
-        extras: Option<HashMap<String, serde_json::Value>>,
-        sip_hangup_headers_template: Option<HashMap<String, String>>,
-    ) -> Self {
+    pub fn new(spec: CallSpec) -> Self {
+        let CallSpec {
+            call_type,
+            cancel_token,
+            session_id,
+            invitation,
+            app_state,
+            track_config,
+            audio_receiver,
+            dump_events,
+            server_side_track_id,
+            extras,
+        } = spec;
         let event_sender = crate::event::create_event_sender();
         let cmd_sender = tokio::sync::broadcast::Sender::<Command>::new(32);
+        let server_side_track_id = server_side_track_id.unwrap_or(SERVER_SIDE_TRACK_ID.to_string());
         let media_stream_builder = MediaStreamBuilder::new(event_sender.clone())
             .with_id(session_id.clone())
             .with_cancel_token(cancel_token.child_token());
@@ -345,30 +787,28 @@ impl ActiveCall {
             ActiveCallType::Webrtc => "webrtc",
             ActiveCallType::B2bua => "b2bua",
         };
-        let extras = {
-            let mut e = extras.unwrap_or_default();
-            e.entry(crate::playbook::BUILTIN_SESSION_ID.to_string())
-                .or_insert_with(|| serde_json::Value::String(session_id.clone()));
-            e.entry(crate::playbook::BUILTIN_CALL_TYPE.to_string())
-                .or_insert_with(|| serde_json::Value::String(call_type_str.to_string()));
-            e.entry(crate::playbook::BUILTIN_START_TIME.to_string())
-                .or_insert_with(|| serde_json::Value::String(start_time.to_rfc3339()));
-            Some(e)
-        };
-        let call_state = Arc::new(RwLock::new(ActiveCallState {
+        let mut extras = extras.unwrap_or_default();
+        extras
+            .entry(crate::playbook::BUILTIN_SESSION_ID.to_string())
+            .or_insert_with(|| serde_json::Value::String(session_id.clone()));
+        extras
+            .entry(crate::playbook::BUILTIN_CALL_TYPE.to_string())
+            .or_insert_with(|| serde_json::Value::String(call_type_str.to_string()));
+        extras
+            .entry(crate::playbook::BUILTIN_START_TIME.to_string())
+            .or_insert_with(|| serde_json::Value::String(start_time.to_rfc3339()));
+
+        let progress = CallProgress {
             session_id: session_id.clone(),
-            start_time,
-            ssrc: rand::random::<u32>(),
-            extras,
-            audio_receiver,
-            sip_hangup_headers_template,
+            start_time: Some(start_time),
             ..Default::default()
-        }));
+        };
+
         Self {
             cancel_token,
             call_type,
             session_id,
-            call_state,
+            start_time,
             media_stream,
             track_config,
             event_sender,
@@ -376,7 +816,21 @@ impl ActiveCall {
             invitation,
             cmd_sender,
             dump_events,
-            server_side_track_id: server_side_track_id.unwrap_or("server-side-track".to_string()),
+            server_side_track_id,
+            ssrc: rand::random::<u32>(),
+            bridge_paused: Arc::new(AtomicBool::new(false)),
+            progress: Arc::new(ArcSwap::from_pointee(progress)),
+            extras: Arc::new(ArcSwap::from_pointee(extras)),
+            moh: ArcSwapOption::new(None),
+            current_play_id: ArcSwapOption::new(None),
+            tts_handle: ArcSwapOption::new(None),
+            refer_leg: ArcSwapOption::new(None),
+            ready_to_answer: ArcSwapOption::new(None),
+            pending_sip_answer: ArcSwapOption::new(None),
+            refer_call_token: ArcSwapOption::new(None),
+            wait_input_timeout: ArcSwapOption::new(None),
+            pending_asr_resume: ArcSwapOption::new(None),
+            audio_receiver: std::sync::Mutex::new(audio_receiver),
         }
     }
 
@@ -398,360 +852,383 @@ impl ActiveCall {
         }
     }
 
-    pub async fn serve(&self, receiver: ActiveCallReceiver) -> Result<()> {
+    /// The call actor: a single select loop owning the [`CallRuntime`].
+    ///
+    /// Commands, session events, background-completion messages, the
+    /// wait-input timeout tick, the media stream and cancellation all meet in
+    /// one place, so runtime state is plain (lock-free) data owned by this
+    /// task — mirroring the concurrency of the previous separate
+    /// command/event loops without their shared locks.
+    pub async fn serve(self: Arc<Self>, receiver: ActiveCallReceiver) -> Result<()> {
         let ActiveCallReceiver {
             mut cmd_receiver,
             dump_cmd_receiver,
             dump_event_receiver,
         } = receiver;
 
-        let process_command_loop = async move {
-            while let Ok(command) = cmd_receiver.recv().await {
-                match self.dispatch(command).await {
-                    Ok(_) => (),
-                    Err(e) => {
-                        warn!(session_id = self.session_id, "{}", e);
-                        self.event_sender
-                            .send(SessionEvent::Error {
-                                track_id: self.session_id.clone(),
-                                timestamp: crate::media::get_timestamp(),
-                                sender: "command".to_string(),
-                                error: e.to_string(),
-                                code: None,
-                            })
-                            .ok();
-                    }
-                }
-            }
-        };
+        let mut event_receiver = self.event_sender.subscribe();
+        let (actor_tx, mut actor_rx) = mpsc::channel::<ActorMsg>(16);
+        let mut runtime = CallRuntime::new(actor_tx);
+        runtime.me = Some(self.clone());
+
         self.app_state
             .total_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        tokio::join!(
-            self.dump_loop(self.dump_events, dump_cmd_receiver, dump_event_receiver),
-            async {
-                select! {
-                    _ = process_command_loop => {
-                        info!(session_id = self.session_id, "command loop done");
+        let me = self.clone();
+        let actor = async move {
+            // RAII: whatever way the loop exits (break, panic, early drop),
+            // the call's cancel token fires so every child task and the media
+            // stream shut down.
+            let _cancel_on_exit = CancelOnExit(&me.cancel_token);
+            let mut ticker = tokio::time::interval(Duration::from_millis(100));
+            // Keep the media-serve future alive across select iterations.
+            let mut media_serve = Box::pin(me.media_stream.serve());
+            loop {
+                tokio::select! {
+                    cmd = cmd_receiver.recv() => {
+                        match cmd {
+                            Ok(command) => {
+                                // Box::pin keeps the deep do_* future tree off
+                                // the select's stack frame (debug builds overflow
+                                // otherwise).
+                                if let Err(e) = Box::pin(me.dispatch(&mut runtime, command)).await {
+                                    warn!(session_id = me.session_id, "{}", e);
+                                    me.event_sender
+                                        .send(SessionEvent::Error {
+                                            track_id: me.session_id.clone(),
+                                            timestamp: crate::media::get_timestamp(),
+                                            sender: "command".to_string(),
+                                            error: e.to_string(),
+                                            code: None,
+                                        })
+                                        .ok();
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(_) => {
+                                info!(session_id = me.session_id, "command loop done");
+                                break;
+                            }
+                        }
                     }
-                    _ = self.process() => {
-                        info!(session_id = self.session_id, "call serve done");
+                    ev = event_receiver.recv() => {
+                        match ev {
+                            Ok(event) => Box::pin(me.handle_event(&mut runtime, event)).await,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(_) => {
+                                info!(session_id = me.session_id, "event loop done");
+                                break;
+                            }
+                        }
                     }
-                    _ = self.cancel_token.cancelled() => {
-                        info!(session_id = self.session_id, "call cancelled - cleaning up resources");
+                    Some(msg) = actor_rx.recv() => {
+                        if let Err(e) = Box::pin(me.handle_actor_msg(msg)).await {
+                            warn!(session_id = me.session_id, "{}", e);
+                            me.event_sender
+                                .send(SessionEvent::Error {
+                                    track_id: me.session_id.clone(),
+                                    timestamp: crate::media::get_timestamp(),
+                                    sender: "command".to_string(),
+                                    error: e.to_string(),
+                                    code: None,
+                                })
+                                .ok();
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        Box::pin(me.check_input_timeout(&mut runtime)).await;
+                    }
+                    _ = &mut media_serve => {
+                        info!(session_id = me.session_id, "media stream loop done");
+                        break;
+                    }
+                    _ = me.cancel_token.cancelled() => {
+                        info!(session_id = me.session_id, "call cancelled - cleaning up resources");
+                        break;
                     }
                 }
-                self.cancel_token.cancel();
             }
+        };
+
+        tokio::join!(
+            self.dump_loop(self.dump_events, dump_cmd_receiver, dump_event_receiver),
+            actor
         );
         Ok(())
     }
 
-    async fn process(&self) -> Result<()> {
-        let mut event_receiver = self.event_sender.subscribe();
+    /// Wait-input silence timeout tick (formerly its own loop + mutex).
+    async fn check_input_timeout(&self, runtime: &mut CallRuntime) {
+        let (start_time, expire) = runtime.input_timeout_expire;
+        if expire > 0 && crate::media::get_timestamp() >= start_time + expire as u64 {
+            info!(session_id = self.session_id, "wait input timeout reached");
+            runtime.input_timeout_expire = (0, 0);
+            self.event_sender
+                .send(SessionEvent::Silence {
+                    track_id: self.server_side_track_id.clone(),
+                    timestamp: crate::media::get_timestamp(),
+                    start_time,
+                    duration: expire as u64,
+                    samples: None,
+                    refer: Some(false),
+                })
+                .ok();
+        }
+    }
 
-        let input_timeout_expire = Arc::new(Mutex::new((0u64, 0u32)));
-        let input_timeout_expire_ref = input_timeout_expire.clone();
-        let event_sender = self.event_sender.clone();
-        let wait_input_timeout_loop = async {
-            loop {
-                let (start_time, expire) = { *input_timeout_expire.lock().await };
-                if expire > 0 && crate::media::get_timestamp() >= start_time + expire as u64 {
-                    info!(session_id = self.session_id, "wait input timeout reached");
-                    *input_timeout_expire.lock().await = (0, 0);
-                    event_sender
-                        .send(SessionEvent::Silence {
-                            track_id: self.server_side_track_id.clone(),
-                            timestamp: crate::media::get_timestamp(),
-                            start_time,
-                            duration: expire as u64,
-                            samples: None,
-                        })
+    /// Handle a session event (formerly the concurrent event-hook loop).
+    async fn handle_event(&self, runtime: &mut CallRuntime, event: SessionEvent) {
+        match event {
+            SessionEvent::Speaking { .. }
+            | SessionEvent::Dtmf { .. }
+            | SessionEvent::AsrDelta { .. }
+            | SessionEvent::AsrFinal { .. }
+            | SessionEvent::TrackStart { .. } => {
+                runtime.input_timeout_expire = (0, 0);
+            }
+            SessionEvent::TrackEnd {
+                track_id,
+                play_id,
+                ssrc,
+                auto_hangup,
+                ..
+            } => {
+                if track_id != self.server_side_track_id {
+                    return;
+                }
+
+                if play_id != self.current_play() {
+                    debug!(
+                        session_id = self.session_id,
+                        ?play_id,
+                        current = ?self.current_play(),
+                        "ignoring interrupted track end"
+                    );
+                    return;
+                }
+                self.set_current_play(None);
+                let moh_path = self.moh_path();
+                let wait_timeout_val = self.take_wait_input_timeout();
+
+                if let Some(path) = moh_path {
+                    info!(session_id = self.session_id, "looping moh: {}", path);
+                    let ssrc = rand::random::<u32>();
+                    let file_track = self.make_file_track(path.clone(), ssrc);
+                    self.update_track_wrapper(Box::new(file_track), Some(path))
+                        .await;
+                    return;
+                }
+
+                if let Some(hangup_reason) = auto_hangup {
+                    info!(
+                        session_id = self.session_id,
+                        ssrc, "auto hangup when track end track_id:{}", track_id
+                    );
+                    self.do_hangup(Some(hangup_reason), None, None, None)
+                        .await
                         .ok();
                 }
-                sleep(Duration::from_millis(100)).await;
+
+                if let Some(timeout) = wait_timeout_val {
+                    runtime.input_timeout_expire = if timeout > 0 {
+                        (crate::media::get_timestamp(), timeout)
+                    } else {
+                        (0, 0)
+                    };
+                }
             }
-        };
-        let server_side_track_id = self.server_side_track_id.clone();
-        let event_hook_loop = async move {
-            while let Ok(event) = event_receiver.recv().await {
-                match event {
-                    SessionEvent::Speaking { .. }
-                    | SessionEvent::Dtmf { .. }
-                    | SessionEvent::AsrDelta { .. }
-                    | SessionEvent::AsrFinal { .. }
-                    | SessionEvent::TrackStart { .. } => {
-                        *input_timeout_expire_ref.lock().await = (0, 0);
-                    }
-                    SessionEvent::TrackEnd {
-                        track_id,
-                        play_id,
-                        ssrc,
-                        ..
-                    } => {
-                        if track_id != server_side_track_id {
-                            continue;
-                        }
+            SessionEvent::Interrupt { receiver } => {
+                let track_id = receiver.unwrap_or_else(|| self.server_side_track_id.clone());
+                if track_id == self.server_side_track_id {
+                    debug!(
+                        session_id = self.session_id,
+                        "received interrupt event, stopping playback"
+                    );
+                    self.do_interrupt(true).await.ok();
+                }
+            }
+            SessionEvent::Inactivity { track_id, .. } => {
+                info!(
+                    session_id = self.session_id,
+                    track_id, "inactivity timeout reached, hanging up"
+                );
+                self.do_hangup(
+                    Some(CallRecordHangupReason::InactivityTimeout),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .ok();
+            }
+            SessionEvent::Hangup { refer, .. } => {
+                // Check if we need to resume ASR after refer hangup
+                if refer == Some(true) {
+                    if let Some((refer_ssrc, asr_option)) = self.take_pending_asr_resume() {
+                        // Verify it's the refer call that ended
+                        let is_refer_hangup = self
+                            .refer_leg
+                            .load_full()
+                            .map(|leg| leg.ssrc == refer_ssrc)
+                            .unwrap_or(false);
 
-                        let (moh_path, auto_hangup, wait_timeout_val) = {
-                            let mut state = self.call_state.write().await;
-                            if play_id != state.current_play_id {
-                                debug!(
-                                    session_id = self.session_id,
-                                    ?play_id,
-                                    current = ?state.current_play_id,
-                                    "ignoring interrupted track end"
-                                );
-                                continue;
-                            }
-                            state.current_play_id = None;
-                            (
-                                state.moh.clone(),
-                                state.auto_hangup.clone(),
-                                state.wait_input_timeout.take(),
-                            )
-                        };
-
-                        if let Some(path) = moh_path {
-                            info!(session_id = self.session_id, "looping moh: {}", path);
-                            let ssrc = rand::random::<u32>();
-                            let file_track = FileTrack::new(self.server_side_track_id.clone())
-                                .with_play_id(Some(path.clone()))
-                                .with_ssrc(ssrc)
-                                .with_path(path.clone())
-                                .with_cancel_token(self.cancel_token.child_token());
-                            self.update_track_wrapper(Box::new(file_track), Some(path))
-                                .await;
-                            continue;
-                        }
-
-                        if let Some((hangup_ssrc, hangup_reason)) = auto_hangup {
-                            if hangup_ssrc == ssrc {
-                                info!(
-                                    session_id = self.session_id,
-                                    ssrc, "auto hangup when track end track_id:{}", track_id
-                                );
-                                self.do_hangup(Some(hangup_reason), None, None).await.ok();
-                            }
-                        }
-
-                        if let Some(timeout) = wait_timeout_val {
-                            let expire = if timeout > 0 {
-                                (crate::media::get_timestamp(), timeout)
-                            } else {
-                                (0, 0)
-                            };
-                            *input_timeout_expire_ref.lock().await = expire;
-                        }
-                    }
-                    SessionEvent::Interrupt { receiver } => {
-                        let track_id =
-                            receiver.unwrap_or_else(|| self.server_side_track_id.clone());
-                        if track_id == self.server_side_track_id {
-                            debug!(
+                        if is_refer_hangup {
+                            info!(
                                 session_id = self.session_id,
-                                "received interrupt event, stopping playback"
+                                "Refer call ended, resuming parent ASR"
                             );
-                            self.do_interrupt(true).await.ok();
-                        }
-                    }
-                    SessionEvent::Inactivity { track_id, .. } => {
-                        info!(
-                            session_id = self.session_id,
-                            track_id, "inactivity timeout reached, hanging up"
-                        );
-                        self.do_hangup(Some(CallRecordHangupReason::InactivityTimeout), None, None)
-                            .await
-                            .ok();
-                    }
-                    SessionEvent::Hangup { refer, .. } => {
-                        // Check if we need to resume ASR after refer hangup
-                        if refer == Some(true) {
-                            let mut cs = self.call_state.write().await;
-                            if let Some((refer_ssrc, asr_option)) = cs.pending_asr_resume.take() {
-                                // Verify it's the refer call that ended
-                                let is_refer_hangup = cs
-                                    .refer_callstate
-                                    .as_ref()
-                                    .map(|rcs| {
-                                        rcs.try_read()
-                                            .map(|g| g.ssrc == refer_ssrc)
-                                            .unwrap_or(false)
-                                    })
-                                    .unwrap_or(false);
 
-                                if is_refer_hangup {
-                                    drop(cs); // Release lock before async operations
-                                    info!(
-                                        session_id = self.session_id,
-                                        "Refer call ended, resuming parent ASR"
-                                    );
-
-                                    // Resume ASR
-                                    match self
-                                        .app_state
-                                        .stream_engine
-                                        .create_asr_processor(
-                                            self.server_side_track_id.clone(),
-                                            self.cancel_token.child_token(),
-                                            asr_option,
-                                            self.event_sender.clone(),
-                                        )
+                            // Resume ASR
+                            match self
+                                .app_state
+                                .stream_engine
+                                .create_asr_processor(
+                                    self.server_side_track_id.clone(),
+                                    self.cancel_token.child_token(),
+                                    asr_option,
+                                    self.event_sender.clone(),
+                                )
+                                .await
+                            {
+                                Ok(asr_processor) => {
+                                    if let Err(e) = self
+                                        .media_stream
+                                        .append_processor(&self.server_side_track_id, asr_processor)
                                         .await
                                     {
-                                        Ok(asr_processor) => {
-                                            if let Err(e) = self
-                                                .media_stream
-                                                .append_processor(
-                                                    &self.server_side_track_id,
-                                                    asr_processor,
-                                                )
-                                                .await
-                                            {
-                                                warn!(
-                                                    session_id = self.session_id,
-                                                    "Failed to resume ASR after refer: {}", e
-                                                );
-                                            }
-                                        }
-                                        Err(e) => {
-                                            warn!(
-                                                session_id = self.session_id,
-                                                "Failed to create ASR processor for resume: {}", e
-                                            );
-                                        }
+                                        warn!(
+                                            session_id = self.session_id,
+                                            "Failed to resume ASR after refer: {}", e
+                                        );
                                     }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        session_id = self.session_id,
+                                        "Failed to create ASR processor for resume: {}", e
+                                    );
                                 }
                             }
                         }
                     }
-                    SessionEvent::Error { track_id, .. } => {
-                        if track_id != server_side_track_id {
-                            continue;
-                        }
-
-                        let moh_info = {
-                            let mut state = self.call_state.write().await;
-                            if let Some(path) = state.moh.clone() {
-                                let fallback = "./config/sounds/refer_moh.wav".to_string();
-                                let next_path = if path != fallback
-                                    && std::path::Path::new(&fallback).exists()
-                                {
-                                    info!(
-                                        session_id = self.session_id,
-                                        "moh error, switching to fallback: {}", fallback
-                                    );
-                                    state.moh = Some(fallback.clone());
-                                    fallback
-                                } else {
-                                    info!(
-                                        session_id = self.session_id,
-                                        "looping moh on error: {}", path
-                                    );
-                                    path
-                                };
-                                Some(next_path)
-                            } else {
-                                None
-                            }
-                        };
-
-                        if let Some(next_path) = moh_info {
-                            let ssrc = rand::random::<u32>();
-                            let file_track = FileTrack::new(self.server_side_track_id.clone())
-                                .with_play_id(Some(next_path.clone()))
-                                .with_ssrc(ssrc)
-                                .with_path(next_path.clone())
-                                .with_cancel_token(self.cancel_token.child_token());
-                            self.update_track_wrapper(Box::new(file_track), Some(next_path))
-                                .await;
-                            continue;
-                        }
-                    }
-                    _ => {}
                 }
             }
-        };
+            SessionEvent::Error { track_id, .. } => {
+                if track_id != self.server_side_track_id {
+                    return;
+                }
 
-        select! {
-            _ = wait_input_timeout_loop=>{
-                info!(session_id = self.session_id, "wait input timeout loop done");
+                let moh_info = {
+                    let path = self.moh_path();
+                    path.map(|path| {
+                        let fallback = "./config/sounds/refer_moh.wav".to_string();
+                        if path != fallback && std::path::Path::new(&fallback).exists() {
+                            info!(
+                                session_id = self.session_id,
+                                "moh error, switching to fallback: {}", fallback
+                            );
+                            self.set_moh(Some(fallback.clone()));
+                            fallback
+                        } else {
+                            info!(
+                                session_id = self.session_id,
+                                "looping moh on error: {}", path
+                            );
+                            path
+                        }
+                    })
+                };
+
+                if let Some(next_path) = moh_info {
+                    let ssrc = rand::random::<u32>();
+                    let file_track = self.make_file_track(next_path.clone(), ssrc);
+                    self.update_track_wrapper(Box::new(file_track), Some(next_path))
+                        .await;
+                }
             }
-            _ = self.media_stream.serve() => {
-                info!(session_id = self.session_id, "media stream loop done");
+            SessionEvent::Hold { on_hold, .. } => {
+                self.bridge_paused.store(on_hold, Ordering::Relaxed);
             }
-            _ = event_hook_loop => {
-                info!(session_id = self.session_id, "event loop done");
-            }
+            _ => {}
         }
-        Ok(())
     }
 
-    async fn dispatch(&self, command: Command) -> Result<()> {
+    /// Completion of background work spawned by a `do_*` command.
+    async fn handle_actor_msg(&self, msg: ActorMsg) -> Result<()> {
+        match msg {
+            ActorMsg::ReferDone {
+                track_id,
+                forward_dtmf,
+                result,
+            } => match result {
+                Ok(answer) => {
+                    self.media_stream
+                        .set_track_refer(&track_id, Some(true))
+                        .await;
+                    if !forward_dtmf {
+                        self.media_stream
+                            .set_track_dtmf_forward(&track_id, false)
+                            .await;
+                    }
+                    self.event_sender
+                        .send(SessionEvent::Answer {
+                            timestamp: crate::media::get_timestamp(),
+                            track_id,
+                            sdp: answer,
+                            refer: Some(true),
+                        })
+                        .ok();
+                    Ok(())
+                }
+                Err(e) => {
+                    warn!(
+                        session_id = self.session_id,
+                        "failed to create refer sip track: {}", e
+                    );
+                    self.emit_reject_from_rsip_error(track_id, true, &e);
+                    Err(e.into())
+                }
+            },
+        }
+    }
+
+    async fn dispatch(&self, runtime: &mut CallRuntime, command: Command) -> Result<()> {
         match command {
-            Command::Invite { option } => self.do_invite(option).await,
+            Command::Invite { option } => self.do_invite(runtime, option).await,
             Command::Accept { option } => self.do_accept(option).await,
             Command::Reject { reason, code } => {
                 self.do_reject(code.map(|c| (c as u16).into()), Some(reason))
                     .await
             }
-            Command::Ringing {
-                ringtone,
-                recorder,
-                early_media,
-            } => self.do_ringing(ringtone, recorder, early_media).await,
-            Command::Tts {
-                text,
-                speaker,
-                play_id,
-                auto_hangup,
-                streaming,
-                end_of_stream,
-                option,
-                wait_input_timeout,
-                base64,
-                cache_key,
-            } => {
-                self.do_tts(
-                    text,
-                    speaker,
-                    play_id,
-                    auto_hangup,
-                    streaming.unwrap_or_default(),
-                    end_of_stream.unwrap_or_default(),
-                    option,
-                    wait_input_timeout,
-                    base64.unwrap_or_default(),
-                    cache_key,
-                )
-                .await
-            }
-            Command::Play {
-                url,
-                play_id,
-                auto_hangup,
-                wait_input_timeout,
-            } => {
-                self.do_play(url, play_id, auto_hangup, wait_input_timeout)
-                    .await
-            }
+            Command::Ringing { .. } => self.do_ringing(command).await,
+            Command::Tts { .. } => self.do_tts(command).await,
+            Command::Play { .. } => self.do_play(command).await,
             Command::Hangup {
                 reason,
                 initiator,
                 headers,
+                refer,
             } => {
                 let reason = reason.map(|r| {
                     r.parse::<CallRecordHangupReason>()
                         .unwrap_or(CallRecordHangupReason::BySystem)
                 });
-                self.do_hangup(reason, initiator, headers).await
+                self.do_hangup(reason, initiator, headers, refer).await
             }
             Command::Refer {
                 caller,
                 callee,
                 options,
-            } => self.do_refer(caller, callee, options).await,
+            } => self.do_refer(runtime, caller, callee, options).await,
+            Command::Message {
+                body,
+                content_type,
+                headers,
+                refer,
+            } => self.do_message(body, content_type, headers, refer).await,
+            Command::Bridge { target_session_id } => self.do_bridge(target_session_id).await,
+            Command::Unbridge { target_session_id } => self.do_unbridge(target_session_id).await,
             Command::Mute { track_id } => self.do_mute(track_id).await,
             Command::Unmute { track_id } => self.do_unmute(track_id).await,
             Command::Pause {} => self.do_pause().await,
@@ -762,6 +1239,15 @@ impl ActiveCall {
             } => self.do_interrupt(passage.unwrap_or_default()).await,
             Command::History { speaker, text } => self.do_history(speaker, text).await,
             Command::Custom { sender, data } => self.do_custom(sender, data),
+            Command::AddIceCandidate {
+                candidate,
+                sdp_mid,
+                sdp_mline_index,
+            } => {
+                self.media_stream
+                    .add_ice_candidate(&candidate, sdp_mid.as_deref(), sdp_mline_index)
+                    .await
+            }
         }
     }
 
@@ -812,6 +1298,10 @@ impl ActiveCall {
                 samplerate: recorder_samplerate,
                 ptime: recorder_ptime,
                 format: Some(format),
+                native_samplerate: Some(
+                    recorder_option.native_samplerate.unwrap_or(false)
+                        || self.app_state.config.recorder_native_samplerate(),
+                ),
             };
             recorder_config.ensure_path_extension(format);
             Some(recorder_config)
@@ -823,7 +1313,7 @@ impl ActiveCall {
     async fn invite_or_accept(&self, mut option: CallOption, sender: String) -> Result<CallOption> {
         // Merge with existing configuration (e.g., from playbook)
         {
-            let state = self.call_state.read().await;
+            let state = self.progress.load_full();
             option = state.merge_option(option);
         }
 
@@ -831,6 +1321,7 @@ impl ActiveCall {
         if let Some(opt) = self.build_record_option(&option) {
             self.media_stream.update_recorder_option(opt).await;
         }
+        self.ensure_call_ambiance(&option).await;
 
         if let Some(opt) = &option.media_pass {
             let track_id = self.server_side_track_id.clone();
@@ -869,29 +1360,44 @@ impl ActiveCall {
                     code: None,
                 };
                 self.event_sender.send(error_event).ok();
-                self.do_hangup(Some(CallRecordHangupReason::BySystem), None, None)
-                    .await
-                    .ok();
+                self.hangup_now(Some(CallRecordHangupReason::BySystem))
+                    .await;
                 return Err(e);
             }
         }
     }
 
-    async fn do_invite(&self, option: CallOption) -> Result<()> {
-        self.invite_or_accept(option, "invite".to_string())
-            .await
-            .map(|_| ())
+    async fn do_invite(&self, runtime: &mut CallRuntime, option: CallOption) -> Result<()> {
+        // Run the INVITE handshake in the background so the actor keeps
+        // serving media (and everything else) while the call rings - same
+        // reasoning as do_refer below. invite_or_accept blocks on the SIP
+        // transaction for the entire ring duration; handling that inline on
+        // the actor's own select loop would freeze media_stream.serve() (and
+        // therefore all live audio bridging for this leg) for just as long.
+        let me = runtime
+            .me
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("invite is only supported inside serve()"))?;
+        crate::spawn(async move {
+            if let Err(e) = me.invite_or_accept(option, "invite".to_string()).await {
+                warn!(session_id = me.session_id, "{}", e);
+                me.event_sender
+                    .send(SessionEvent::Error {
+                        track_id: me.session_id.clone(),
+                        timestamp: crate::media::get_timestamp(),
+                        sender: "command".to_string(),
+                        error: e.to_string(),
+                        code: None,
+                    })
+                    .ok();
+            }
+        });
+        Ok(())
     }
 
     async fn do_accept(&self, mut option: CallOption) -> Result<()> {
-        let has_pending = self
-            .invitation
-            .find_dialog_id_by_session_id(&self.session_id)
-            .is_some();
-        let ready_to_answer_val = {
-            let state = self.call_state.read().await;
-            state.ready_to_answer.is_none()
-        };
+        let has_pending = self.has_pending_invite();
+        let ready_to_answer_val = !self.has_ready_to_answer();
 
         if ready_to_answer_val {
             if !has_pending {
@@ -905,24 +1411,39 @@ impl ActiveCall {
                     code: Some(486),
                 };
                 self.event_sender.send(rejet_event).ok();
-                self.do_hangup(Some(CallRecordHangupReason::BySystem), None, None)
-                    .await
-                    .ok();
+                self.hangup_now(Some(CallRecordHangupReason::BySystem))
+                    .await;
                 return Err(anyhow::anyhow!("no pending call to accept"));
             }
             option = self.invite_or_accept(option, "accept".to_string()).await?;
         } else {
             option.check_default();
-            self.call_state.write().await.option = Some(option.clone());
+            if let Some(opt) = self.build_record_option(&option) {
+                self.media_stream.update_recorder_option(opt).await;
+            }
+            self.set_option(option.clone());
+            self.ensure_call_ambiance(&option).await;
         }
         info!(session_id = self.session_id, ?option, "accepting call");
-        let ready = self.call_state.write().await.ready_to_answer.take();
-        if let Some((answer, track, dialog)) = ready {
-            info!(
-                session_id = self.session_id,
-                track_id = track.as_ref().map(|t| t.id()),
-                "ready to answer with track"
-            );
+        let ready = self.take_ready_to_answer();
+        if let Some(ready) = ready {
+            // Exclusive since `take` swapped it out and the actor serializes
+            // commands, so the unwrap cannot race another holder.
+            let ReadyAnswer {
+                answer,
+                track: pending_track,
+                dialog,
+            } = match Arc::try_unwrap(ready) {
+                Ok(ready) => ready,
+                Err(_) => {
+                    warn!(
+                        session_id = self.session_id,
+                        "ready_to_answer held elsewhere; skipping accept"
+                    );
+                    return Ok(());
+                }
+            };
+            info!(session_id = self.session_id, "ready to answer with track");
 
             let headers = vec![rsipstack::rsip::Header::ContentType(
                 "application/sdp".to_string().into(),
@@ -930,12 +1451,11 @@ impl ActiveCall {
 
             match dialog.accept(Some(headers), Some(answer.as_bytes().to_vec())) {
                 Ok(_) => {
-                    {
-                        let mut state = self.call_state.write().await;
-                        state.answer = Some(answer);
-                        state.answer_time = Some(Utc::now());
-                    }
-                    self.finish_caller_stack(&option, track).await?;
+                    self.leg().update_progress(|p| {
+                        p.answer = Some(answer.clone());
+                        p.answer_time.get_or_insert_with(Utc::now);
+                    });
+                    self.finish_caller_stack(&option, pending_track).await?;
                 }
                 Err(e) => {
                     warn!(session_id = self.session_id, "failed to accept call: {}", e);
@@ -943,7 +1463,48 @@ impl ActiveCall {
                 }
             }
         }
-        return Ok(());
+
+        // Non-SIP call types (WebSocket/Webrtc) created by an inbound SIP
+        // INVITE never go through `ready_to_answer`; the underlying dialog is
+        // answered here. Without this the carrier leg stays in `Trying` until
+        // the far end times out and CANCELs (production: VOS3000 20s timeout).
+        if let Some(pending) = self.take_pending_sip_answer() {
+            let Ok(pending) = Arc::try_unwrap(pending) else {
+                warn!(
+                    session_id = self.session_id,
+                    "pending sip answer held elsewhere; skipping sip accept"
+                );
+                return Ok(());
+            };
+            let headers = vec![rsipstack::rsip::Header::ContentType(
+                "application/sdp".to_string().into(),
+            )];
+            match pending
+                .dialog
+                .accept(Some(headers), Some(pending.answer.as_bytes().to_vec()))
+            {
+                Ok(_) => {
+                    info!(
+                        session_id = self.session_id,
+                        "answered underlying sip dialog"
+                    );
+                    self.leg().update_progress(|p| {
+                        p.answer = Some(pending.answer.clone());
+                        p.answer_time.get_or_insert_with(Utc::now);
+                    });
+                    // Register the SIP leg so customer audio is bridged with
+                    // the caller track (and later the refer leg).
+                    self.media_stream.update_track(pending.track, None).await;
+                }
+                Err(e) => {
+                    warn!(
+                        session_id = self.session_id,
+                        "failed to accept underlying sip dialog: {}", e
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn do_reject(
@@ -951,6 +1512,18 @@ impl ActiveCall {
         code: Option<rsipstack::rsip::StatusCode>,
         reason: Option<String>,
     ) -> Result<()> {
+        if let Some(pending) = self.take_pending_sip_answer() {
+            info!(
+                session_id = self.session_id,
+                ?reason,
+                ?code,
+                "rejecting underlying sip dialog"
+            );
+            if let Ok(pending) = Arc::try_unwrap(pending) {
+                pending.dialog.reject(code.clone(), reason.clone()).ok();
+                self.invitation.dialog_layer.remove_dialog(&pending.dialog.id());
+            }
+        }
         match self
             .invitation
             .find_dialog_id_by_session_id(&self.session_id)
@@ -962,20 +1535,42 @@ impl ActiveCall {
                     ?code,
                     "rejecting call"
                 );
-                self.invitation.hangup(id, code, reason).await
+                let result = self.invitation.hangup(id, code, reason).await;
+                if result.is_ok() {
+                    self.cancel_token.cancel();
+                }
+                result
             }
-            None => Ok(()),
+            None => {
+                if let Some(ready) = self.take_ready_to_answer() {
+                    info!(
+                        session_id = self.session_id,
+                        ?reason,
+                        ?code,
+                        "rejecting call from ready_to_answer"
+                    );
+                    let dialog = &ready.dialog;
+                    let dialog_id = dialog.id();
+                    dialog.reject(code, reason).ok();
+                    self.invitation.dialog_layer.remove_dialog(&dialog_id);
+                    self.cancel_token.cancel();
+                }
+                Ok(())
+            }
         }
     }
 
-    async fn do_ringing(
-        &self,
-        ringtone: Option<String>,
-        recorder: Option<RecorderOption>,
-        early_media: Option<bool>,
-    ) -> Result<()> {
-        let ready_to_answer_val = self.call_state.read().await.ready_to_answer.is_none();
-        if ready_to_answer_val {
+    async fn do_ringing(&self, command: Command) -> Result<()> {
+        let Command::Ringing {
+            ringtone,
+            recorder,
+            early_media,
+        } = command
+        else {
+            unreachable!("do_ringing called with non-Ringing command");
+        };
+
+        if !self.has_ready_to_answer() {
             let option = CallOption {
                 recorder,
                 ..Default::default()
@@ -983,25 +1578,31 @@ impl ActiveCall {
             let _ = self.invite_or_accept(option, "ringing".to_string()).await?;
         }
 
-        let state = self.call_state.read().await;
-        if let Some((answer, _, dialog)) = state.ready_to_answer.as_ref() {
+        if let Some(ready) = self.ready_to_answer.load_full() {
             let (headers, body) = if early_media.unwrap_or_default() || ringtone.is_some() {
                 let headers = vec![rsipstack::rsip::Header::ContentType(
                     "application/sdp".to_string().into(),
                 )];
-                (Some(headers), Some(answer.as_bytes().to_vec()))
+                (Some(headers), Some(ready.answer.as_bytes().to_vec()))
             } else {
                 (None, None)
             };
 
-            dialog.ringing(headers, body).ok();
+            ready.dialog.ringing(headers, body).ok();
             info!(
                 session_id = self.session_id,
                 ringtone, early_media, "playing ringtone"
             );
             if let Some(ringtone_url) = ringtone {
-                drop(state);
-                self.do_play(ringtone_url, None, None, None).await.ok();
+                self.do_play(Command::Play {
+                    url: ringtone_url,
+                    play_id: None,
+                    auto_hangup: None,
+                    wait_input_timeout: None,
+                    offset_ms: None,
+                })
+                .await
+                .ok();
             } else {
                 info!(session_id = self.session_id, "no ringtone to play");
             }
@@ -1009,21 +1610,28 @@ impl ActiveCall {
         Ok(())
     }
 
-    async fn do_tts(
-        &self,
-        text: String,
-        speaker: Option<String>,
-        play_id: Option<String>,
-        auto_hangup: Option<bool>,
-        streaming: bool,
-        end_of_stream: bool,
-        option: Option<SynthesisOption>,
-        wait_input_timeout: Option<u32>,
-        base64: bool,
-        cache_key: Option<String>,
-    ) -> Result<()> {
+    async fn do_tts(&self, command: Command) -> Result<()> {
+        let Command::Tts {
+            text,
+            speaker,
+            play_id,
+            auto_hangup,
+            streaming,
+            end_of_stream,
+            option,
+            wait_input_timeout,
+            base64,
+            cache_key,
+        } = command
+        else {
+            unreachable!("do_tts called with non-Tts command");
+        };
+        let streaming = streaming.unwrap_or_default();
+        let end_of_stream = end_of_stream.unwrap_or_default();
+        let base64 = base64.unwrap_or_default();
+
         let tts_option = {
-            let call_state = self.call_state.read().await;
+            let call_state = self.progress.load_full();
             match call_state.option.clone().unwrap_or_default().tts {
                 Some(opt) => opt.merge_with(option),
                 None => {
@@ -1049,6 +1657,7 @@ impl ActiveCall {
             option: tts_option,
             base64,
             cache_key,
+            auto_hangup,
         };
         info!(
             session_id = self.session_id,
@@ -1067,10 +1676,11 @@ impl ActiveCall {
 
         let ssrc = rand::random::<u32>();
         let (should_interrupt, picked_ssrc) = {
-            let mut state = self.call_state.write().await;
+            let existing_handle = self.tts_handle.load_full();
+            let current_play_id = self.current_play();
 
-            let (target_ssrc, changed) = if let Some(handle) = &state.tts_handle {
-                if play_id.is_some() && state.current_play_id != play_id {
+            let (target_ssrc, changed) = if let Some(handle) = &existing_handle {
+                if play_id.is_some() && current_play_id != play_id {
                     (ssrc, true)
                 } else {
                     (handle.ssrc, false)
@@ -1081,9 +1691,9 @@ impl ActiveCall {
 
             // Defer auto_hangup setting until after potential interrupt.
             // auto_hangup will be set below after do_interrupt() to avoid being cleared.
-            state.wait_input_timeout = wait_input_timeout;
+            self.set_wait_input_timeout(wait_input_timeout);
 
-            state.current_play_id = play_id.clone();
+            self.set_current_play(play_id.clone());
             (changed, target_ssrc)
         };
 
@@ -1091,27 +1701,10 @@ impl ActiveCall {
             let _ = self.do_interrupt(false).await;
         }
 
-        // Set auto_hangup AFTER potential interrupt to avoid it being cleared by do_interrupt().
-        // Only preserve auto_hangup when reusing the same handle (same play_id).
-        // When starting a new track or interrupting, clear stale auto_hangup.
-        {
-            let mut state = self.call_state.write().await;
-            state.auto_hangup = match auto_hangup {
-                Some(true) => Some((picked_ssrc, CallRecordHangupReason::BySystem)),
-                _ => {
-                    // Only preserve auto_hangup when reusing the same handle (same play_id).
-                    // When starting a new track (different play_id or no existing handle),
-                    // clear stale auto_hangup to prevent orphaned hangup.
-                    if state.tts_handle.is_some() && !should_interrupt {
-                        state.auto_hangup.clone()
-                    } else {
-                        None
-                    }
-                }
-            };
-        }
+        // auto_hangup rides on the track: armed via `with_auto_hangup` when a
+        // new track is created, or by the command itself for an existing track.
 
-        let existing_handle = self.call_state.read().await.tts_handle.clone();
+        let existing_handle = self.tts_handle.load_full();
         if let Some(tts_handle) = existing_handle {
             match tts_handle.try_send(play_command) {
                 Ok(_) => return Ok(()),
@@ -1130,22 +1723,27 @@ impl ActiveCall {
             play_id.clone(),
             streaming,
             &play_command.option,
+            play_command.auto_hangup,
         )
         .await?;
 
         new_handle.try_send(play_command)?;
-        self.call_state.write().await.tts_handle = Some(new_handle);
+        self.tts_handle.store(Some(Arc::new(new_handle)));
         self.update_track_wrapper(tts_track, play_id).await;
         Ok(())
     }
 
-    async fn do_play(
-        &self,
-        url: String,
-        play_id: Option<String>,
-        auto_hangup: Option<bool>,
-        wait_input_timeout: Option<u32>,
-    ) -> Result<()> {
+    async fn do_play(&self, command: Command) -> Result<()> {
+        let Command::Play {
+            url,
+            play_id,
+            auto_hangup,
+            wait_input_timeout,
+            offset_ms,
+        } = command
+        else {
+            unreachable!("do_play called with non-Play command");
+        };
         let ssrc = rand::random::<u32>();
         info!(
             session_id = self.session_id,
@@ -1154,20 +1752,19 @@ impl ActiveCall {
 
         let play_id = play_id.or(Some(url.clone()));
 
-        let file_track = FileTrack::new(self.server_side_track_id.clone())
+        // make_file_track uses the path as play_id; honor an explicit play_id here.
+        let mut file_track = self
+            .make_file_track(url, ssrc)
             .with_play_id(play_id.clone())
-            .with_ssrc(ssrc)
-            .with_path(url)
-            .with_cancel_token(self.cancel_token.child_token());
+            .with_auto_hangup(auto_hangup);
+
+        if let Some(offset) = offset_ms {
+            file_track = file_track.with_offset_ms(offset);
+        }
 
         {
-            let mut state = self.call_state.write().await;
-            state.tts_handle = None;
-            state.auto_hangup = match auto_hangup {
-                Some(true) => Some((ssrc, CallRecordHangupReason::BySystem)),
-                _ => None,
-            };
-            state.wait_input_timeout = wait_input_timeout;
+            self.tts_handle.store(None);
+            self.set_wait_input_timeout(wait_input_timeout);
         }
 
         self.update_track_wrapper(Box::new(file_track), play_id)
@@ -1200,10 +1797,8 @@ impl ActiveCall {
 
     async fn do_interrupt(&self, graceful: bool) -> Result<()> {
         {
-            let mut state = self.call_state.write().await;
-            state.tts_handle = None;
-            state.moh = None;
-            state.auto_hangup = None;
+            self.tts_handle.store(None);
+            self.set_moh(None);
         }
         self.media_stream
             .remove_track(&self.server_side_track_id, graceful)
@@ -1211,9 +1806,15 @@ impl ActiveCall {
         Ok(())
     }
     async fn do_pause(&self) -> Result<()> {
+        self.media_stream
+            .pause_playback(self.server_side_track_id.clone())
+            .await?;
         Ok(())
     }
     async fn do_resume(&self) -> Result<()> {
+        self.media_stream
+            .resume_playback(self.server_side_track_id.clone())
+            .await?;
         Ok(())
     }
     async fn do_hangup(
@@ -1221,27 +1822,16 @@ impl ActiveCall {
         reason: Option<CallRecordHangupReason>,
         initiator: Option<String>,
         headers: Option<HashMap<String, String>>,
+        refer: Option<bool>,
     ) -> Result<()> {
         info!(
             session_id = self.session_id,
             ?reason,
             ?initiator,
             ?headers,
+            ?refer,
             "do_hangup"
         );
-
-        // Store headers in extras if provided
-        if let Some(headers) = headers {
-            let h_val = serde_json::to_value(&headers).unwrap_or_default();
-
-            {
-                let mut state = self.call_state.write().await;
-                let mut extras = state.extras.take().unwrap_or_default();
-                extras.insert("_hangup_headers".to_string(), h_val.clone());
-                state.extras = Some(extras);
-            }
-        } else {
-        }
 
         let hangup_reason = match initiator.as_deref() {
             Some("caller") => CallRecordHangupReason::ByCaller,
@@ -1250,18 +1840,57 @@ impl ActiveCall {
             _ => reason.unwrap_or(CallRecordHangupReason::BySystem),
         };
 
-        self.media_stream
-            .stop(Some(hangup_reason.to_string()), initiator);
-
-        self.call_state
-            .write()
-            .await
-            .set_hangup_reason(hangup_reason);
+        match refer {
+            Some(true) => {
+                // Hang up only the refer call, leaving the main call alive.
+                let refer_token = self.take_refer_call_token();
+                let refer_leg = self.refer_leg_value();
+                let has_refer_leg = refer_leg.is_some();
+                if let Some(leg) = refer_leg {
+                    if let Some(headers) = headers {
+                        let h_val = serde_json::to_value(&headers).unwrap_or_default();
+                        leg.set_extra("_hangup_headers", h_val);
+                    }
+                    // Set reason before cancelling so on_terminated() sees it.
+                    let reason = hangup_reason.clone();
+                    leg.update_progress(|p| p.set_hangup_reason(reason.clone()));
+                }
+                if let Some(token) = refer_token {
+                    token.cancel();
+                }
+                if has_refer_leg {
+                    self.media_stream
+                        .remove_track(&self.server_side_track_id, false)
+                        .await;
+                }
+            }
+            _ => {
+                if let Some(headers) = headers {
+                    let h_val = serde_json::to_value(&headers).unwrap_or_default();
+                    self.leg().set_extra("_hangup_headers", h_val);
+                }
+                self.leg()
+                    .update_progress(|p| p.set_hangup_reason(hangup_reason.clone()));
+                let refer_token = self.take_refer_call_token();
+                self.media_stream
+                    .stop(Some(hangup_reason.to_string()), initiator);
+                if let Some(token) = refer_token {
+                    token.cancel();
+                }
+            }
+        }
+        tokio::task::yield_now().await;
         Ok(())
     }
 
+    /// Initiate a refer (attended transfer) leg.
+    ///
+    /// The INVITE handshake can take up to `timeout` seconds, so it runs in a
+    /// spawned task and reports back through [`ActorMsg::ReferDone`]; the
+    /// actor loop keeps serving events (e.g. MOH looping) meanwhile.
     async fn do_refer(
         &self,
+        runtime: &mut CallRuntime,
         caller: String,
         callee: String,
         refer_option: Option<ReferOption>,
@@ -1276,8 +1905,11 @@ impl ActiveCall {
 
         // Save original ASR option for later resume
         let original_asr_option = if pause_parent_asr {
-            let cs = self.call_state.read().await;
-            cs.option.as_ref().and_then(|o| o.asr.clone())
+            self.progress
+                .load_full()
+                .option
+                .as_ref()
+                .and_then(|o| o.asr.clone())
         } else {
             None
         };
@@ -1317,32 +1949,53 @@ impl ActiveCall {
         let session_id = self.session_id.clone();
         let track_id = self.server_side_track_id.clone();
 
-        let recorder = {
-            let cs = self.call_state.read().await;
-            cs.option
-                .as_ref()
-                .map(|o| o.recorder.clone())
-                .unwrap_or_default()
+        let (recorder, parent_caller) = {
+            let progress = self.progress.load_full();
+            let option = progress.option.as_ref();
+            (
+                option.map(|o| o.recorder.clone()).unwrap_or_default(),
+                option.and_then(|o| o.caller.clone()),
+            )
+        };
+        let caller = if caller.trim().is_empty() {
+            parent_caller.unwrap_or_default()
+        } else {
+            caller
         };
 
-        let call_option = CallOption {
+        let mut call_option = CallOption {
             caller: Some(caller),
             callee: Some(callee.clone()),
             sip: refer_option.as_ref().and_then(|o| o.sip.clone()),
-            asr: refer_option.as_ref().and_then(|o| o.asr.clone()),
+            vad: refer_option
+                .as_ref()
+                .and_then(|o| o.vad.clone())
+                .map(|mut opts| {
+                    opts.refer = Some(true);
+                    opts
+                }),
+            asr: refer_option
+                .as_ref()
+                .and_then(|o| o.asr.clone())
+                .map(|mut opts| {
+                    opts.refer = Some(true);
+                    opts
+                }),
             denoise: refer_option.as_ref().and_then(|o| o.denoise.clone()),
+            agc: refer_option.as_ref().and_then(|o| o.agc.clone()),
             recorder,
             ..Default::default()
         };
+        call_option.check_default();
 
         let mut invite_option = call_option.build_invite_option()?;
-        invite_option.call_id = Some(ref_call_id);
+        invite_option.call_id = Some(ref_call_id.clone());
 
         let headers = invite_option.headers.get_or_insert_with(|| Vec::new());
 
         {
-            let cs = self.call_state.read().await;
-            if let Some(opt) = cs.option.as_ref() {
+            let progress = self.progress.load_full();
+            if let Some(opt) = progress.option.as_ref() {
                 if let Some(callee) = opt.callee.as_ref() {
                     headers.push(rsipstack::rsip::Header::Other(
                         "X-Referred-To".to_string(),
@@ -1364,38 +2017,36 @@ impl ActiveCall {
         ));
 
         let ssrc = rand::random::<u32>();
-        let refer_call_state = Arc::new(RwLock::new(ActiveCallState {
-            start_time: Utc::now(),
+        let refer_leg = LegShared::new(
             ssrc,
-            option: Some(call_option.clone()),
-            is_refer: true,
-            ..Default::default()
-        }));
-
-        {
-            let mut cs = self.call_state.write().await;
-            cs.refer_callstate.replace(refer_call_state.clone());
-        }
+            true,
+            CallProgress {
+                session_id: ref_call_id.clone(),
+                start_time: Some(Utc::now()),
+                option: Some(call_option.clone()),
+                ..Default::default()
+            },
+        );
+        self.set_refer_leg(Some(refer_leg.clone()));
 
         let auto_hangup_requested = refer_option
             .as_ref()
             .and_then(|o| o.auto_hangup)
             .unwrap_or(true);
 
-        if auto_hangup_requested {
-            self.call_state.write().await.auto_hangup =
-                Some((ssrc, CallRecordHangupReason::ByRefer));
-        } else {
-            self.call_state.write().await.auto_hangup = None;
-        }
+        // auto_hangup rides on the refer leg's TrackEnd (InviteDialogStates).
 
         // Setup ASR resume after refer ends (if not auto_hangup and ASR was paused)
         if !auto_hangup_requested && pause_parent_asr && original_asr_option.is_some() {
             let asr_option = original_asr_option.unwrap();
-            self.call_state.write().await.pending_asr_resume = Some((ssrc, asr_option));
+            self.set_pending_asr_resume((ssrc, asr_option));
         }
 
         let timeout_secs = refer_option.as_ref().and_then(|o| o.timeout).unwrap_or(30);
+        let forward_dtmf = refer_option
+            .as_ref()
+            .and_then(|o| o.forward_dtmf)
+            .unwrap_or(true);
 
         info!(
             session_id = self.session_id,
@@ -1406,77 +2057,294 @@ impl ActiveCall {
             "do_refer"
         );
 
-        let r = tokio::time::timeout(
-            Duration::from_secs(timeout_secs as u64),
-            self.create_outgoing_sip_track(
-                self.cancel_token.child_token(),
-                refer_call_state.clone(),
-                &track_id,
-                invite_option,
-                &call_option,
-                moh,
-                auto_hangup_requested,
-            ),
-        )
-        .await;
+        let refer_cancel_token = self.cancel_token.child_token();
+        self.set_refer_call_token(refer_cancel_token.clone());
 
-        {
-            self.call_state.write().await.moh = None;
+        // Run the INVITE handshake in the background so the actor keeps
+        // serving events (MOH looping, auto-hangup...) while it is in flight.
+        let me = runtime
+            .me
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("refer is only supported inside serve()"))?;
+        let actor_tx = runtime.actor_tx.clone();
+        let event_sender = self.event_sender.clone();
+        let log_session_id = session_id.clone();
+        let reject_track_id = track_id.clone();
+        crate::spawn(async move {
+            let out = crate::call::tracks::OutgoingLeg {
+                cancel_token: refer_cancel_token,
+                leg: refer_leg,
+                track_id: track_id.clone(),
+                invite_option,
+                call_option,
+                moh,
+                auto_hangup: auto_hangup_requested,
+            };
+            let result = match tokio::time::timeout(
+                Duration::from_secs(timeout_secs as u64),
+                me.create_outgoing_sip_track(out),
+            )
+            .await
+            {
+                Ok(res) => res,
+                Err(_) => {
+                    warn!(
+                        session_id = log_session_id,
+                        "refer sip track creation timed out after {} seconds", timeout_secs
+                    );
+                    event_sender
+                        .send(SessionEvent::Reject {
+                            track_id: reject_track_id,
+                            timestamp: crate::media::get_timestamp(),
+                            reason: "Timeout when refer".into(),
+                            code: Some(408),
+                            refer: Some(true),
+                        })
+                        .ok();
+                    Err(rsipstack::Error::Error(
+                        "refer sip track creation timed out".to_string(),
+                    ))
+                }
+            };
+            me.set_moh(None);
+            actor_tx
+                .send(ActorMsg::ReferDone {
+                    track_id,
+                    forward_dtmf,
+                    result,
+                })
+                .await
+                .ok();
+        });
+
+        Ok(())
+    }
+
+    async fn do_message(
+        &self,
+        body: String,
+        content_type: Option<String>,
+        headers: Option<HashMap<String, String>>,
+        refer: Option<bool>,
+    ) -> Result<()> {
+        if !matches!(self.call_type, ActiveCallType::Sip | ActiveCallType::B2bua) {
+            return Err(anyhow::anyhow!(
+                "message command is only supported for SIP calls"
+            ));
         }
 
-        let result = match r {
-            Ok(res) => res,
-            Err(_) => {
-                warn!(
-                    session_id = session_id,
-                    "refer sip track creation timed out after {} seconds", timeout_secs
-                );
-                self.event_sender
-                    .send(SessionEvent::Reject {
-                        track_id,
-                        timestamp: crate::media::get_timestamp(),
-                        reason: "Timeout when refer".into(),
-                        code: Some(408),
-                        refer: Some(true),
-                    })
-                    .ok();
-                return Err(anyhow::anyhow!("refer sip track creation timed out").into());
-            }
+        let dialog_key = if refer == Some(true) {
+            self.refer_leg_value()
+                .map(|leg| leg.progress.load_full().session_id.clone())
+        } else {
+            Some(self.progress.load_full().session_id.clone())
         };
 
-        match result {
-            Ok(answer) => {
-                self.event_sender
-                    .send(SessionEvent::Answer {
-                        timestamp: crate::media::get_timestamp(),
-                        track_id,
-                        sdp: answer,
-                        refer: Some(true),
-                    })
-                    .ok();
-            }
-            Err(e) => {
-                warn!(
-                    session_id = session_id,
-                    "failed to create refer sip track: {}", e
-                );
-                match &e {
-                    rsipstack::Error::DialogError(reason, _, code) => {
-                        self.event_sender
-                            .send(SessionEvent::Reject {
-                                track_id,
-                                timestamp: crate::media::get_timestamp(),
-                                reason: reason.clone(),
-                                code: Some(code.code() as u32),
-                                refer: Some(true),
-                            })
-                            .ok();
-                    }
-                    _ => {}
-                }
-                return Err(e.into());
+        let mut dialog = dialog_key
+            .as_ref()
+            .filter(|id| !id.is_empty())
+            .and_then(|id| self.invitation.dialog_layer.get_dialog_with(id));
+
+        // Incoming sessions use short session ids, so resolve them through the
+        // session-id mapping before falling back to a dialog-id string scan.
+        if dialog.is_none() {
+            if let Some(target_id) = dialog_key.as_ref().filter(|id| !id.is_empty()) {
+                dialog = self
+                    .invitation
+                    .find_dialog_id_by_session_id(target_id)
+                    .and_then(|dialog_id| self.invitation.dialog_layer.get_dialog(&dialog_id));
             }
         }
+
+        if dialog.is_none() {
+            if let Some(target_id) = dialog_key.as_ref().filter(|id| !id.is_empty()) {
+                dialog = self
+                    .invitation
+                    .dialog_layer
+                    .all_dialog_ids()
+                    .into_iter()
+                    .filter_map(|id| self.invitation.dialog_layer.get_dialog_with(&id))
+                    .find(|dialog| dialog.id().to_string() == *target_id);
+            }
+        }
+
+        // Last resort: look up a confirmed client dialog by call id (the
+        // dialog id for refer legs, the session id otherwise).
+        if dialog.is_none() {
+            let call_id = match (refer == Some(true), dialog_key.as_deref()) {
+                (true, Some(id)) if !id.is_empty() => Some(id),
+                (false, _) => Some(self.session_id.as_str()),
+                _ => None,
+            };
+            if let Some(call_id) = call_id {
+                dialog = self
+                    .invitation
+                    .dialog_layer
+                    .get_client_dialog_by_call_id(call_id)
+                    .into_iter()
+                    .find(|d| {
+                        matches!(
+                            d.state(),
+                            rsipstack::dialog::dialog::DialogState::Confirmed(_, _)
+                        )
+                    })
+                    .map(rsipstack::dialog::dialog::Dialog::Invite);
+            }
+        }
+
+        let dialog = dialog.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no established SIP dialog found for message command, refer={}",
+                refer.unwrap_or_default()
+            )
+        })?;
+
+        let mut sip_headers = vec![rsipstack::rsip::Header::ContentType(
+            content_type
+                .clone()
+                .unwrap_or_else(|| "text/plain;charset=utf-8".to_string())
+                .into(),
+        )];
+        if let Some(headers) = &headers {
+            sip_headers.extend(crate::sip_util::sip_headers_from_map(headers));
+        }
+
+        info!(
+            session_id = self.session_id,
+            dialog_id = %dialog.id(),
+            content_type = content_type.as_deref().unwrap_or("text/plain;charset=utf-8"),
+            refer = refer.unwrap_or_default(),
+            body = %body.chars().take(64).collect::<String>(),
+            "sending SIP MESSAGE"
+        );
+
+        let response = dialog
+            .message(Some(sip_headers), Some(body.into_bytes()))
+            .await?;
+        match response {
+            Some(resp)
+                if resp.status_code.kind() == rsipstack::rsip::StatusCodeKind::Successful =>
+            {
+                Ok(())
+            }
+            Some(resp) => Err(anyhow::anyhow!(
+                "SIP MESSAGE rejected with status {}",
+                resp.status_code
+            )),
+            None => Err(anyhow::anyhow!(
+                "SIP MESSAGE was not sent because dialog is not confirmed"
+            )),
+        }
+    }
+
+    fn bridge_track_id(source_session_id: &str, target_session_id: &str) -> TrackId {
+        format!("bridge:{}:to:{}", source_session_id, target_session_id)
+    }
+
+    async fn do_bridge(&self, target_session_id: String) -> Result<()> {
+        let target = {
+            let calls = self.app_state.active_calls.lock().unwrap();
+            calls.get(&target_session_id).cloned()
+        };
+        let target = target.ok_or_else(|| {
+            anyhow::anyhow!("bridge target session not found: {}", target_session_id)
+        })?;
+
+        if target.session_id == self.session_id {
+            return Err(anyhow::anyhow!("cannot bridge a call to itself").into());
+        }
+
+        let self_bridge_track_id = Self::bridge_track_id(&self.session_id, &target.session_id);
+        let target_bridge_track_id = Self::bridge_track_id(&target.session_id, &self.session_id);
+
+        self.media_stream
+            .remove_track(&self_bridge_track_id, false)
+            .await;
+        target
+            .media_stream
+            .remove_track(&target_bridge_track_id, false)
+            .await;
+
+        let (self_bridge_sender, self_bridge_receiver) = mpsc::channel(25);
+        let (target_bridge_sender, target_bridge_receiver) = mpsc::channel(25);
+
+        let self_paused = self.bridge_paused.clone();
+        let target_paused = target.bridge_paused.clone();
+
+        let self_forwarding_track = ForwardingTrack::new(
+            self_bridge_track_id.clone(),
+            self.session_id.clone(),
+            target_bridge_sender,
+            self_bridge_receiver,
+            self.track_config.clone(),
+            self.cancel_token.child_token(),
+            rand::random::<u32>(),
+            self_paused,
+        );
+
+        let target_forwarding_track = ForwardingTrack::new(
+            target_bridge_track_id.clone(),
+            target.session_id.clone(),
+            self_bridge_sender,
+            target_bridge_receiver,
+            target.track_config.clone(),
+            target.cancel_token.child_token(),
+            rand::random::<u32>(),
+            target_paused,
+        );
+
+        self.media_stream
+            .update_track(Box::new(self_forwarding_track), None)
+            .await;
+        target
+            .media_stream
+            .update_track(Box::new(target_forwarding_track), None)
+            .await;
+
+        info!(
+            session_id = self.session_id,
+            target = target_session_id,
+            self_bridge_track_id,
+            target_bridge_track_id,
+            "audio bridge established"
+        );
+        Ok(())
+    }
+
+    async fn do_unbridge(&self, target_session_id: String) -> Result<()> {
+        let target = {
+            let calls = self.app_state.active_calls.lock().unwrap();
+            calls.get(&target_session_id).cloned()
+        };
+
+        let self_bridge_track_id = Self::bridge_track_id(&self.session_id, &target_session_id);
+        self.media_stream
+            .remove_track(&self_bridge_track_id, false)
+            .await;
+
+        if let Some(target) = target {
+            let target_bridge_track_id =
+                Self::bridge_track_id(&target.session_id, &self.session_id);
+            target
+                .media_stream
+                .remove_track(&target_bridge_track_id, false)
+                .await;
+            info!(
+                session_id = self.session_id,
+                target = target.session_id,
+                self_bridge_track_id,
+                target_bridge_track_id,
+                "audio bridge removed"
+            );
+        } else {
+            info!(
+                session_id = self.session_id,
+                target = target_session_id,
+                self_bridge_track_id,
+                "audio bridge removed locally; target session not active"
+            );
+        }
+
         Ok(())
     }
 
@@ -1491,19 +2359,48 @@ impl ActiveCall {
     }
 
     pub async fn cleanup(&self) -> Result<()> {
-        self.call_state.write().await.tts_handle = None;
+        if matches!(self.call_type, ActiveCallType::Sip | ActiveCallType::B2bua) {
+            self.reject_now(
+                Some(rsipstack::rsip::StatusCode::Decline),
+                Some("handler disconnected".to_string()),
+            )
+            .await;
+        }
+        // A prepared-but-unaccepted SIP answer (non-SIP call types) must not
+        // leave the carrier leg ringing forever.
+        if let Some(pending) = self.take_pending_sip_answer() {
+            if let Ok(pending) = Arc::try_unwrap(pending) {
+                pending
+                    .dialog
+                    .reject(
+                        Some(rsipstack::rsip::StatusCode::Decline),
+                        Some("handler disconnected".to_string()),
+                    )
+                    .ok();
+                self.invitation
+                    .dialog_layer
+                    .remove_dialog(&pending.dialog.id());
+            }
+        }
+        self.tts_handle.store(None);
         self.media_stream.cleanup().await.ok();
         Ok(())
     }
 
+    /// Build the call record from lock-free snapshots; never blocks, so it is
+    /// safe (and lossless) from synchronous `Drop`.
     pub fn get_callrecord(&self) -> Option<CallRecord> {
-        self.call_state.try_read().ok().map(|call_state| {
-            call_state.build_callrecord(
-                self.app_state.clone(),
-                self.session_id.clone(),
-                self.call_type.clone(),
-            )
-        })
+        let progress = self.progress.load_full();
+        let extras = self.extras.load_full();
+        let refer_leg = self.refer_leg_value();
+        Some(build_callrecord(
+            &progress,
+            &extras,
+            refer_leg.as_ref(),
+            &self.app_state,
+            self.session_id.clone(),
+            self.call_type.clone(),
+        ))
     }
 
     async fn dump_to_file(
@@ -1572,825 +2469,15 @@ impl ActiveCall {
             CallRecordEvent::write(CallRecordEventType::Event, event, &mut dump_file).await;
         }
     }
-
-    pub async fn create_rtp_track(
-        &self,
-        track_id: TrackId,
-        ssrc: u32,
-        enable_srtp: Option<bool>,
-    ) -> Result<RtcTrack> {
-        let mut rtc_config = RtcTrackConfig::default();
-        // Per-call flag takes precedence over global config.
-        let use_srtp = enable_srtp
-            .or(self.app_state.config.enable_srtp)
-            .unwrap_or(false);
-        rtc_config.mode = if use_srtp {
-            rustrtc::TransportMode::Srtp
-        } else {
-            rustrtc::TransportMode::Rtp
-        };
-
-        if let Some(codecs) = &self.app_state.config.codecs {
-            let mut codec_types = Vec::new();
-            for c in codecs {
-                match c.to_lowercase().as_str() {
-                    "pcmu" => codec_types.push(CodecType::PCMU),
-                    "pcma" => codec_types.push(CodecType::PCMA),
-                    "g722" => codec_types.push(CodecType::G722),
-                    "g729" => codec_types.push(CodecType::G729),
-                    #[cfg(feature = "opus")]
-                    "opus" => codec_types.push(CodecType::Opus),
-                    "dtmf" | "2833" | "telephone_event" => {
-                        codec_types.push(CodecType::TelephoneEvent)
-                    }
-                    _ => {}
-                }
-            }
-            if !codec_types.is_empty() {
-                rtc_config.preferred_codec = Some(codec_types[0].clone());
-                rtc_config.codecs = codec_types;
-            }
-        }
-
-        if rtc_config.preferred_codec.is_none() {
-            rtc_config.preferred_codec = Some(self.track_config.codec.clone());
-        }
-
-        rtc_config.rtp_port_range = self
-            .app_state
-            .config
-            .rtp_start_port
-            .zip(self.app_state.config.rtp_end_port);
-
-        if let Some(ref external_ip) = self.app_state.config.external_ip {
-            rtc_config.external_ip = Some(external_ip.clone());
-        }
-        if let Some(ref bind_ip) = self.app_state.config.rtp_bind_ip {
-            rtc_config.bind_ip = Some(bind_ip.clone());
-        }
-
-        rtc_config.enable_latching = self.app_state.config.enable_rtp_latching;
-        rtc_config.enable_ice_lite = self.app_state.config.enable_ice_lite;
-
-        let mut track = RtcTrack::new(
-            self.cancel_token.child_token(),
-            track_id,
-            self.track_config.clone(),
-            rtc_config,
-        )
-        .with_ssrc(ssrc);
-
-        track.create().await?;
-
-        Ok(track)
-    }
-
-    async fn setup_caller_track(&self, option: &CallOption) -> Result<()> {
-        let hangup_headers = option
-            .sip
-            .as_ref()
-            .and_then(|s| s.hangup_headers.as_ref())
-            .map(|headers_map| {
-                headers_map
-                    .iter()
-                    .map(|(k, v)| rsipstack::rsip::Header::Other(k.clone(), v.clone()))
-                    .collect::<Vec<rsipstack::rsip::Header>>()
-            });
-        self.call_state.write().await.option = Some(option.clone());
-        info!(
-            session_id = self.session_id,
-            call_type = ?self.call_type,
-            "setup caller track"
-        );
-
-        let track = match self.call_type {
-            ActiveCallType::Webrtc => Some(self.create_webrtc_track().await?),
-            ActiveCallType::WebSocket => {
-                let audio_receiver = self.call_state.write().await.audio_receiver.take();
-                if let Some(receiver) = audio_receiver {
-                    Some(self.create_websocket_track(receiver).await?)
-                } else {
-                    None
-                }
-            }
-            ActiveCallType::Sip => {
-                if let Some(dialog_id) = self
-                    .invitation
-                    .find_dialog_id_by_session_id(&self.session_id)
-                {
-                    if let Some(pending_dialog) = self.invitation.get_pending_call(&dialog_id) {
-                        return self
-                            .prepare_incoming_sip_track(
-                                self.cancel_token.clone(),
-                                self.call_state.clone(),
-                                &self.session_id,
-                                pending_dialog,
-                                hangup_headers,
-                            )
-                            .await;
-                    }
-                }
-
-                // Auto-inject credentials from registered users if not already provided
-                let mut option = option.clone();
-                if option.sip.is_none()
-                    || option
-                        .sip
-                        .as_ref()
-                        .and_then(|s| s.username.as_ref())
-                        .is_none()
-                {
-                    if let Some(callee) = &option.callee {
-                        if let Some(cred) = self.app_state.find_credentials_for_callee(callee) {
-                            if option.sip.is_none() {
-                                option.sip = Some(crate::SipOption {
-                                    username: Some(cred.username.clone()),
-                                    password: Some(cred.password.clone()),
-                                    realm: cred.realm.clone(),
-                                    ..Default::default()
-                                });
-                            }
-                        }
-                    }
-                }
-
-                let mut invite_option = option.build_invite_option()?;
-                invite_option.call_id = Some(self.session_id.clone());
-
-                match self
-                    .create_outgoing_sip_track(
-                        self.cancel_token.clone(),
-                        self.call_state.clone(),
-                        &self.session_id,
-                        invite_option,
-                        &option,
-                        None,
-                        false,
-                    )
-                    .await
-                {
-                    Ok(answer) => {
-                        self.event_sender
-                            .send(SessionEvent::Answer {
-                                timestamp: crate::media::get_timestamp(),
-                                track_id: self.session_id.clone(),
-                                sdp: answer,
-                                refer: Some(false),
-                            })
-                            .ok();
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        warn!(
-                            session_id = self.session_id,
-                            "failed to create sip track: {}", e
-                        );
-                        match &e {
-                            rsipstack::Error::DialogError(reason, _, code) => {
-                                self.event_sender
-                                    .send(SessionEvent::Reject {
-                                        track_id: self.session_id.clone(),
-                                        timestamp: crate::media::get_timestamp(),
-                                        reason: reason.clone(),
-                                        code: Some(code.code() as u32),
-                                        refer: Some(false),
-                                    })
-                                    .ok();
-                            }
-                            _ => {}
-                        }
-                        return Err(e.into());
-                    }
-                }
-            }
-            ActiveCallType::B2bua => {
-                if let Some(dialog_id) = self
-                    .invitation
-                    .find_dialog_id_by_session_id(&self.session_id)
-                {
-                    if let Some(pending_dialog) = self.invitation.get_pending_call(&dialog_id) {
-                        return self
-                            .prepare_incoming_sip_track(
-                                self.cancel_token.clone(),
-                                self.call_state.clone(),
-                                &self.session_id,
-                                pending_dialog,
-                                hangup_headers,
-                            )
-                            .await;
-                    }
-                }
-
-                warn!(
-                    session_id = self.session_id,
-                    "no pending dialog found for B2BUA call"
-                );
-                return Err(anyhow::anyhow!(
-                    "no pending dialog found for session_id: {}",
-                    self.session_id
-                ));
-            }
-        };
-        match track {
-            Some(track) => {
-                self.finish_caller_stack(&option, Some(track)).await?;
-            }
-            None => {
-                warn!(session_id = self.session_id, "no track created for caller");
-                return Err(anyhow::anyhow!("no track created for caller"));
-            }
-        }
-        Ok(())
-    }
-
-    async fn finish_caller_stack(
-        &self,
-        option: &CallOption,
-        track: Option<Box<dyn Track>>,
-    ) -> Result<()> {
-        if let Some(track) = track {
-            self.setup_track_with_stream(&option, track).await?;
-        }
-
-        {
-            let call_state = self.call_state.read().await;
-            if let Some(ref answer) = call_state.answer {
-                info!(
-                    session_id = self.session_id,
-                    "sending answer event: {}", answer,
-                );
-                self.event_sender
-                    .send(SessionEvent::Answer {
-                        timestamp: crate::media::get_timestamp(),
-                        track_id: self.session_id.clone(),
-                        sdp: answer.clone(),
-                        refer: Some(false),
-                    })
-                    .ok();
-            } else {
-                warn!(
-                    session_id = self.session_id,
-                    "no answer in state to send event"
-                );
-            }
-        }
-        Ok(())
-    }
-
-    pub async fn setup_track_with_stream(
-        &self,
-        option: &CallOption,
-        mut track: Box<dyn Track>,
-    ) -> Result<()> {
-        let processors = match StreamEngine::create_processors(
-            self.app_state.stream_engine.clone(),
-            track.as_ref(),
-            self.cancel_token.child_token(),
-            self.event_sender.clone(),
-            self.media_stream.packet_sender.clone(),
-            option,
-        )
-        .await
-        {
-            Ok(processors) => processors,
-            Err(e) => {
-                warn!(
-                    session_id = self.session_id,
-                    "failed to prepare stream processors: {}", e
-                );
-                vec![]
-            }
-        };
-
-        // Add all processors from the hook
-        for processor in processors {
-            track.append_processor(processor);
-        }
-
-        self.update_track_wrapper(track, None).await;
-        Ok(())
-    }
-
-    pub async fn update_track_wrapper(&self, mut track: Box<dyn Track>, play_id: Option<String>) {
-        let (ambiance_opt, subscribe) = {
-            let state = self.call_state.read().await;
-            let mut opt = state
-                .option
-                .as_ref()
-                .and_then(|o| o.ambiance.clone())
-                .unwrap_or_default();
-
-            if let Some(global) = &self.app_state.config.ambiance {
-                opt.merge(global);
-            }
-
-            let subscribe = state
-                .option
-                .as_ref()
-                .and_then(|o| o.subscribe)
-                .unwrap_or_default();
-
-            (opt, subscribe)
-        };
-        if track.id() == &self.server_side_track_id && ambiance_opt.path.is_some() {
-            match AmbianceProcessor::new(ambiance_opt).await {
-                Ok(ambiance) => {
-                    info!(session_id = self.session_id, "loaded ambiance processor");
-                    track.append_processor(Box::new(ambiance));
-                }
-                Err(e) => {
-                    tracing::error!("failed to load ambiance wav {}", e);
-                }
-            }
-        }
-
-        if subscribe && self.call_type != ActiveCallType::WebSocket {
-            let (track_index, sub_track_id) = if track.id() == &self.server_side_track_id {
-                (0, self.server_side_track_id.clone())
-            } else {
-                (1, self.session_id.clone())
-            };
-            let sub_processor =
-                SubscribeProcessor::new(self.event_sender.clone(), sub_track_id, track_index);
-            track.append_processor(Box::new(sub_processor));
-        }
-
-        self.call_state.write().await.current_play_id = play_id.clone();
-        self.media_stream.update_track(track, play_id).await;
-    }
-
-    pub async fn create_websocket_track(
-        &self,
-        audio_receiver: WebsocketBytesReceiver,
-    ) -> Result<Box<dyn Track>> {
-        let (ssrc, codec) = {
-            let call_state = self.call_state.read().await;
-            (
-                call_state.ssrc,
-                call_state
-                    .option
-                    .as_ref()
-                    .map(|o| o.codec.clone())
-                    .unwrap_or_default(),
-            )
-        };
-
-        let ws_track = WebsocketTrack::new(
-            self.cancel_token.child_token(),
-            self.session_id.clone(),
-            self.track_config.clone(),
-            self.event_sender.clone(),
-            audio_receiver,
-            codec,
-            ssrc,
-        );
-
-        {
-            let mut call_state = self.call_state.write().await;
-            call_state.answer_time = Some(Utc::now());
-            call_state.answer = Some("".to_string());
-            call_state.last_status_code = 200;
-        }
-
-        Ok(Box::new(ws_track))
-    }
-
-    pub(super) async fn create_webrtc_track(&self) -> Result<Box<dyn Track>> {
-        let (ssrc, option) = {
-            let call_state = self.call_state.read().await;
-            (
-                call_state.ssrc,
-                call_state.option.clone().unwrap_or_default(),
-            )
-        };
-
-        let mut rtc_config = RtcTrackConfig::default();
-        rtc_config.mode = rustrtc::TransportMode::WebRtc; // WebRTC
-        rtc_config.ice_servers = self.app_state.config.ice_servers.clone();
-
-        if let Some(codecs) = &self.app_state.config.codecs {
-            let mut codec_types = Vec::new();
-            for c in codecs {
-                match c.to_lowercase().as_str() {
-                    "pcmu" => codec_types.push(CodecType::PCMU),
-                    "pcma" => codec_types.push(CodecType::PCMA),
-                    "g722" => codec_types.push(CodecType::G722),
-                    "g729" => codec_types.push(CodecType::G729),
-                    #[cfg(feature = "opus")]
-                    "opus" => codec_types.push(CodecType::Opus),
-                    "dtmf" | "2833" | "telephone_event" => {
-                        codec_types.push(CodecType::TelephoneEvent)
-                    }
-                    _ => {}
-                }
-            }
-            if !codec_types.is_empty() {
-                rtc_config.preferred_codec = Some(codec_types[0].clone());
-                rtc_config.codecs = codec_types;
-            }
-        }
-
-        if let Some(ref external_ip) = self.app_state.config.external_ip {
-            rtc_config.external_ip = Some(external_ip.clone());
-        }
-        if let Some(ref bind_ip) = self.app_state.config.rtp_bind_ip {
-            rtc_config.bind_ip = Some(bind_ip.clone());
-        }
-
-        let mut webrtc_track = RtcTrack::new(
-            self.cancel_token.child_token(),
-            self.session_id.clone(),
-            self.track_config.clone(),
-            rtc_config,
-        )
-        .with_ssrc(ssrc);
-
-        let timeout = option.handshake_timeout.map(|t| Duration::from_secs(t));
-        let offer = match option.enable_ipv6 {
-            Some(false) | None => {
-                strip_ipv6_candidates(option.offer.as_ref().unwrap_or(&"".to_string()))
-            }
-            _ => option.offer.clone().unwrap_or("".to_string()),
-        };
-        let answer: Option<String>;
-        match webrtc_track.handshake(offer, timeout).await {
-            Ok(answer_sdp) => {
-                answer = match option.enable_ipv6 {
-                    Some(false) | None => Some(strip_ipv6_candidates(&answer_sdp)),
-                    Some(true) => Some(answer_sdp.to_string()),
-                };
-            }
-            Err(e) => {
-                warn!(session_id = self.session_id, "failed to setup track: {}", e);
-                return Err(anyhow::anyhow!("Failed to setup track: {}", e));
-            }
-        }
-
-        {
-            let mut call_state = self.call_state.write().await;
-            call_state.answer_time = Some(Utc::now());
-            call_state.answer = answer;
-            call_state.last_status_code = 200;
-        }
-        Ok(Box::new(webrtc_track))
-    }
-
-    async fn create_outgoing_sip_track(
-        &self,
-        cancel_token: CancellationToken,
-        call_state_ref: ActiveCallStateRef,
-        track_id: &String,
-        mut invite_option: InviteOption,
-        call_option: &CallOption,
-        moh: Option<String>,
-        auto_hangup: bool,
-    ) -> Result<String, rsipstack::Error> {
-        let ssrc = call_state_ref.read().await.ssrc;
-        let per_call_srtp = call_option.sip.as_ref().and_then(|s| s.enable_srtp);
-        let rtp_track = self
-            .create_rtp_track(track_id.clone(), ssrc, per_call_srtp)
-            .await
-            .map_err(|e| rsipstack::Error::Error(e.to_string()))?;
-
-        let offer = Some(
-            rtp_track
-                .local_description()
-                .await
-                .map_err(|e| rsipstack::Error::Error(e.to_string()))?,
-        );
-
-        {
-            let mut cs = call_state_ref.write().await;
-            if let Some(o) = cs.option.as_mut() {
-                o.offer = offer.clone();
-            }
-            cs.start_time = Utc::now();
-        };
-
-        invite_option.offer = offer.clone().map(|s| s.into());
-
-        // Set contact to local SIP endpoint address if not already set explicitly
-        // Check if contact is still default (no scheme set) or if host is localhost-like
-        let needs_contact = contact_needs_public_resolution(&invite_option.contact);
-
-        if needs_contact {
-            let addrs = self.invitation.dialog_layer.endpoint.get_addrs();
-            if let Some(addr) = find_local_addr_for_uri(&addrs, &invite_option.callee) {
-                let contact_username = invite_option
-                    .contact
-                    .auth
-                    .as_ref()
-                    .map(|auth| auth.user.as_str())
-                    .or_else(|| {
-                        invite_option
-                            .caller
-                            .auth
-                            .as_ref()
-                            .map(|auth| auth.user.as_str())
-                    });
-                invite_option.contact = build_public_contact_uri(
-                    &self.app_state.learned_public_address,
-                    self.app_state.auto_learn_public_address_enabled(),
-                    &addr,
-                    contact_username,
-                    Some(&invite_option.contact),
-                );
-            } else {
-                return Err(rsipstack::Error::Error(format!(
-                    "missing local SIP address for callee transport: {}",
-                    invite_option.callee
-                )));
-            }
-        }
-
-        let mut rtp_track_to_setup = Some(Box::new(rtp_track) as Box<dyn Track>);
-
-        if let Some(moh) = moh {
-            let ssrc_and_moh = {
-                let mut state = call_state_ref.write().await;
-                state.moh = Some(moh.clone());
-                if state.current_play_id.is_none() {
-                    let ssrc = rand::random::<u32>();
-                    Some((ssrc, moh.clone()))
-                } else {
-                    info!(
-                        session_id = self.session_id,
-                        "Something is playing, MOH will start after it ends"
-                    );
-                    None
-                }
-            };
-
-            if let Some((ssrc, moh_path)) = ssrc_and_moh {
-                let file_track = FileTrack::new(self.server_side_track_id.clone())
-                    .with_play_id(Some(moh_path.clone()))
-                    .with_ssrc(ssrc)
-                    .with_path(moh_path.clone())
-                    .with_cancel_token(self.cancel_token.child_token());
-                self.update_track_wrapper(Box::new(file_track), Some(moh_path))
-                    .await;
-            }
-        } else {
-            let track = rtp_track_to_setup.take().unwrap();
-            self.setup_track_with_stream(&call_option, track)
-                .await
-                .map_err(|e| rsipstack::Error::Error(e.to_string()))?;
-        }
-
-        info!(
-            session_id = self.session_id,
-            track_id,
-            contact = %invite_option.contact,
-            "invite {} -> {} offer: \n{}",
-            invite_option.caller,
-            invite_option.callee,
-            offer.as_ref().map(|s| s.as_str()).unwrap_or("<NO OFFER>")
-        );
-
-        let (dlg_state_sender, dlg_state_receiver) =
-            self.invitation.dialog_layer.new_dialog_state_channel();
-
-        let states = InviteDialogStates {
-            is_client: true,
-            session_id: self.session_id.clone(),
-            track_id: track_id.clone(),
-            event_sender: self.event_sender.clone(),
-            media_stream: self.media_stream.clone(),
-            call_state: call_state_ref.clone(),
-            cancel_token,
-            terminated_reason: None,
-            has_early_media: false,
-        };
-
-        let hangup_headers = call_option
-            .sip
-            .as_ref()
-            .and_then(|s| s.hangup_headers.as_ref())
-            .map(|headers_map| {
-                headers_map
-                    .iter()
-                    .map(|(k, v)| rsipstack::rsip::Header::Other(k.clone(), v.clone()))
-                    .collect::<Vec<rsipstack::rsip::Header>>()
-            });
-
-        let mut client_dialog_handler = DialogStateReceiverGuard::new(
-            self.invitation.dialog_layer.clone(),
-            dlg_state_receiver,
-            hangup_headers,
-        );
-
-        crate::spawn(async move {
-            client_dialog_handler.process_dialog(states).await;
-        });
-
-        let (dialog_id, answer) = self
-            .invitation
-            .invite(invite_option, dlg_state_sender)
-            .await?;
-
-        self.call_state.write().await.moh = None;
-
-        if let Some(track) = rtp_track_to_setup {
-            info!(
-                session_id = self.session_id,
-                track_id, "Stopping MOH and setting up RTP track"
-            );
-            self.media_stream
-                .remove_track(&self.server_side_track_id, false)
-                .await;
-
-            self.setup_track_with_stream(&call_option, track)
-                .await
-                .map_err(|e| rsipstack::Error::Error(e.to_string()))?;
-        }
-
-        let answer = match answer {
-            Some(answer) => {
-                let s = String::from_utf8_lossy(&answer).to_string();
-                if s.trim().is_empty() {
-                    // 200 OK had no body — this is valid per RFC 3261 when the answer was
-                    // already negotiated in a 183 Session Progress (early media).
-                    // Fall back to the early SDP stored by the Early handler.
-                    let cs = call_state_ref.read().await;
-                    match cs.answer.clone() {
-                        Some(early_sdp) if !early_sdp.is_empty() => {
-                            info!(
-                                session_id = self.session_id,
-                                "200 OK has empty body; using early-media SDP from 183"
-                            );
-                            (early_sdp, true /* already applied */)
-                        }
-                        _ => {
-                            warn!(
-                                session_id = self.session_id,
-                                "200 OK has empty body and no early-media SDP available"
-                            );
-                            (s, false)
-                        }
-                    }
-                } else {
-                    (s, false)
-                }
-            }
-            None => {
-                // No answer body at all — check if early media SDP is available before failing
-                let cs = call_state_ref.read().await;
-                match cs.answer.clone() {
-                    Some(early_sdp) if !early_sdp.is_empty() => {
-                        info!(
-                            session_id = self.session_id,
-                            "200 OK had no answer; using early-media SDP from 183"
-                        );
-                        (early_sdp, true /* already applied */)
-                    }
-                    _ => {
-                        warn!(session_id = self.session_id, "no answer received");
-                        return Err(rsipstack::Error::DialogError(
-                            "No answer received".to_string(),
-                            dialog_id,
-                            rsipstack::rsip::StatusCode::NotAcceptableHere,
-                        ));
-                    }
-                }
-            }
-        };
-        let (answer, remote_description_already_applied) = answer;
-
-        {
-            let mut cs = call_state_ref.write().await;
-            if cs.answer.is_none() {
-                cs.answer = Some(answer.clone());
-            }
-            if auto_hangup {
-                cs.auto_hangup = Some((ssrc, CallRecordHangupReason::ByRefer));
-            }
-        }
-        if !remote_description_already_applied {
-            self.media_stream
-                .update_remote_description(&track_id, &answer)
-                .await
-                .ok();
-        }
-
-        Ok(answer)
-    }
-
-    /// Detect if SDP is WebRTC format
-    pub fn is_webrtc_sdp(sdp: &str) -> bool {
-        (sdp.contains("a=ice-ufrag:") || sdp.contains("a=ice-pwd:"))
-            && sdp.contains("a=fingerprint:")
-    }
-
-    pub async fn setup_answer_track(
-        &self,
-        ssrc: u32,
-        option: &CallOption,
-        offer: String,
-    ) -> Result<(String, Box<dyn Track>)> {
-        let offer = match option.enable_ipv6 {
-            Some(false) | None => strip_ipv6_candidates(&offer),
-            _ => offer.clone(),
-        };
-
-        let timeout = option.handshake_timeout.map(|t| Duration::from_secs(t));
-
-        let mut media_track = if Self::is_webrtc_sdp(&offer) {
-            let mut rtc_config = RtcTrackConfig::default();
-            rtc_config.mode = rustrtc::TransportMode::WebRtc;
-            rtc_config.ice_servers = self.app_state.config.ice_servers.clone();
-            if let Some(ref external_ip) = self.app_state.config.external_ip {
-                rtc_config.external_ip = Some(external_ip.clone());
-            }
-            if let Some(ref bind_ip) = self.app_state.config.rtp_bind_ip {
-                rtc_config.bind_ip = Some(bind_ip.clone());
-            }
-            rtc_config.enable_latching = self.app_state.config.enable_rtp_latching;
-            rtc_config.enable_ice_lite = self.app_state.config.enable_ice_lite;
-
-            let webrtc_track = RtcTrack::new(
-                self.cancel_token.child_token(),
-                self.session_id.clone(),
-                self.track_config.clone(),
-                rtc_config,
-            )
-            .with_ssrc(ssrc);
-
-            Box::new(webrtc_track) as Box<dyn Track>
-        } else {
-            let per_call_srtp = option.sip.as_ref().and_then(|s| s.enable_srtp);
-            let rtp_track = self
-                .create_rtp_track(self.session_id.clone(), ssrc, per_call_srtp)
-                .await?;
-            Box::new(rtp_track) as Box<dyn Track>
-        };
-
-        let answer = match media_track.handshake(offer.clone(), timeout).await {
-            Ok(answer) => answer,
-            Err(e) => {
-                return Err(anyhow::anyhow!("handshake failed: {e}"));
-            }
-        };
-
-        return Ok((answer, media_track));
-    }
-
-    pub async fn prepare_incoming_sip_track(
-        &self,
-        cancel_token: CancellationToken,
-        call_state_ref: ActiveCallStateRef,
-        track_id: &String,
-        pending_dialog: PendingDialog,
-        hangup_headers: Option<Vec<rsipstack::rsip::Header>>,
-    ) -> Result<()> {
-        let state_receiver = pending_dialog.state_receiver;
-        //let pending_token_clone = pending_dialog.token;
-
-        let states = InviteDialogStates {
-            is_client: false,
-            session_id: self.session_id.clone(),
-            track_id: track_id.clone(),
-            event_sender: self.event_sender.clone(),
-            media_stream: self.media_stream.clone(),
-            call_state: self.call_state.clone(),
-            cancel_token,
-            terminated_reason: None,
-            has_early_media: false,
-        };
-
-        let initial_request = pending_dialog.dialog.initial_request();
-        let offer = String::from_utf8_lossy(&initial_request.body).to_string();
-
-        let (ssrc, option) = {
-            let call_state = call_state_ref.read().await;
-            (
-                call_state.ssrc,
-                call_state.option.clone().unwrap_or_default(),
-            )
-        };
-
-        match self.setup_answer_track(ssrc, &option, offer).await {
-            Ok((offer, track)) => {
-                self.setup_track_with_stream(&option, track).await?;
-                {
-                    let mut state = self.call_state.write().await;
-                    state.ready_to_answer = Some((offer, None, pending_dialog.dialog));
-                }
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!("error creating track: {}", e));
-            }
-        }
-
-        let mut client_dialog_handler = DialogStateReceiverGuard::new(
-            self.invitation.dialog_layer.clone(),
-            state_receiver,
-            hangup_headers,
-        );
-
-        crate::spawn(async move {
-            client_dialog_handler.process_dialog(states).await;
-        });
-        Ok(())
+}
+
+/// Cancels the token on drop, guaranteeing shutdown on every exit path of the
+/// actor loop (normal break, panic, or task abort).
+struct CancelOnExit<'a>(&'a CancellationToken);
+
+impl Drop for CancelOnExit<'_> {
+    fn drop(&mut self) {
+        self.0.cancel();
     }
 }
 
@@ -2406,137 +2493,6 @@ impl Drop for ActiveCall {
                     );
                 }
             }
-        }
-    }
-}
-
-impl ActiveCallState {
-    pub fn merge_option(&self, mut option: CallOption) -> CallOption {
-        if let Some(existing) = &self.option {
-            if option.asr.is_none() {
-                option.asr = existing.asr.clone();
-            }
-            if option.tts.is_none() {
-                option.tts = existing.tts.clone();
-            }
-            if option.vad.is_none() {
-                option.vad = existing.vad.clone();
-            }
-            if option.denoise.is_none() {
-                option.denoise = existing.denoise;
-            }
-            if option.recorder.is_none() {
-                option.recorder = existing.recorder.clone();
-            }
-            if option.eou.is_none() {
-                option.eou = existing.eou.clone();
-            }
-            if option.extra.is_none() {
-                option.extra = existing.extra.clone();
-            }
-            if option.ambiance.is_none() {
-                option.ambiance = existing.ambiance.clone();
-            }
-        }
-        option
-    }
-
-    pub fn set_hangup_reason(&mut self, reason: CallRecordHangupReason) {
-        if self.hangup_reason.is_none() {
-            self.hangup_reason = Some(reason);
-        }
-    }
-
-    pub fn build_hangup_event(
-        &self,
-        track_id: TrackId,
-        initiator: Option<String>,
-    ) -> crate::event::SessionEvent {
-        let from = self.option.as_ref().and_then(|o| o.caller.as_ref());
-        let to = self.option.as_ref().and_then(|o| o.callee.as_ref());
-        let extra = self.extras.clone();
-
-        crate::event::SessionEvent::Hangup {
-            track_id,
-            timestamp: crate::media::get_timestamp(),
-            reason: Some(format!("{:?}", self.hangup_reason)),
-            initiator,
-            start_time: self.start_time.to_rfc3339(),
-            answer_time: self.answer_time.map(|t| t.to_rfc3339()),
-            ringing_time: self.ring_time.map(|t| t.to_rfc3339()),
-            hangup_time: Utc::now().to_rfc3339(),
-            extra,
-            from: from.map(|f| f.into()),
-            to: to.map(|f| f.into()),
-            refer: Some(self.is_refer),
-        }
-    }
-
-    pub fn build_callrecord(
-        &self,
-        app_state: AppState,
-        session_id: String,
-        call_type: ActiveCallType,
-    ) -> CallRecord {
-        let option = self.option.clone().unwrap_or_default();
-        let recorder = if option.recorder.is_some() {
-            let recorder_file = app_state.get_recorder_file(&session_id);
-            if std::path::Path::new(&recorder_file).exists() {
-                let file_size = std::fs::metadata(&recorder_file)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-                vec![crate::callrecord::CallRecordMedia {
-                    track_id: session_id.clone(),
-                    path: recorder_file,
-                    size: file_size,
-                    extra: None,
-                }]
-            } else {
-                vec![]
-            }
-        } else {
-            vec![]
-        };
-
-        let dump_event_file = app_state.get_dump_events_file(&session_id);
-        let dump_event_file = if std::path::Path::new(&dump_event_file).exists() {
-            Some(dump_event_file)
-        } else {
-            None
-        };
-
-        let refer_callrecord = self.refer_callstate.as_ref().and_then(|rc| {
-            if let Ok(rc) = rc.try_read() {
-                Some(Box::new(rc.build_callrecord(
-                    app_state.clone(),
-                    rc.session_id.clone(),
-                    ActiveCallType::B2bua,
-                )))
-            } else {
-                None
-            }
-        });
-
-        let caller = option.caller.clone().unwrap_or_default();
-        let callee = option.callee.clone().unwrap_or_default();
-
-        CallRecord {
-            option: Some(option),
-            call_id: session_id,
-            call_type,
-            start_time: self.start_time,
-            ring_time: self.ring_time.clone(),
-            answer_time: self.answer_time.clone(),
-            end_time: Utc::now(),
-            caller,
-            callee,
-            hangup_reason: self.hangup_reason.clone(),
-            hangup_messages: Vec::new(),
-            status_code: self.last_status_code,
-            extras: self.extras.clone(),
-            dump_event_file,
-            recorder,
-            refer_callrecord,
         }
     }
 }
