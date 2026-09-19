@@ -22,7 +22,8 @@ not_vad = []
 [dependencies]
 libc = "0.2"
 audio-codec = "0.4.5"
-rustrtc = "0.3.135"
+# Pinned by rev: Cargo.lock is gitignored, so a branch ref would let CI drift.
+rustrtc = { git = "https://github.com/Object905/rustrtc", rev = "43049fa" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 minijinja = { version = "2.23.0", features = ["loader", "json"] }
