@@ -151,7 +151,7 @@ impl MessageInspector for PeerAddressLearner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rsipstack::rsip::{Headers, Header, HostWithPort, Uri, Version, Request, Response};
+    use rsipstack::rsip::{Header, Headers, HostWithPort, Request, Response, Uri, Version};
     use rsipstack::sip::Transport;
     use rsipstack::transport::SipAddr;
 
@@ -203,13 +203,32 @@ mod tests {
         learner.learn_from(&response_with_cseq("1 INVITE"), Some(&udp_addr("2.2.2.2")));
         // OPTIONS probes and REGISTER traffic must not teach the table.
         learner.learn_from(&options_request(), Some(&udp_addr("3.3.3.3")));
-        learner.learn_from(&response_with_cseq("1 REGISTER"), Some(&udp_addr("4.4.4.4")));
+        learner.learn_from(
+            &response_with_cseq("1 REGISTER"),
+            Some(&udp_addr("4.4.4.4")),
+        );
 
         let ttl = Duration::from_secs(60);
-        assert!(learner.shared().contains_within(&"1.1.1.1".parse().unwrap(), ttl));
-        assert!(learner.shared().contains_within(&"2.2.2.2".parse().unwrap(), ttl));
-        assert!(!learner.shared().contains_within(&"3.3.3.3".parse().unwrap(), ttl));
-        assert!(!learner.shared().contains_within(&"4.4.4.4".parse().unwrap(), ttl));
+        assert!(
+            learner
+                .shared()
+                .contains_within(&"1.1.1.1".parse().unwrap(), ttl)
+        );
+        assert!(
+            learner
+                .shared()
+                .contains_within(&"2.2.2.2".parse().unwrap(), ttl)
+        );
+        assert!(
+            !learner
+                .shared()
+                .contains_within(&"3.3.3.3".parse().unwrap(), ttl)
+        );
+        assert!(
+            !learner
+                .shared()
+                .contains_within(&"4.4.4.4".parse().unwrap(), ttl)
+        );
     }
 
     #[test]
@@ -223,17 +242,23 @@ mod tests {
 
         let ttl = Duration::from_secs(3600);
         assert_eq!(learner.shared().len(), 2);
-        assert!(!learner
-            .shared()
-            .contains_within(&"10.0.0.1".parse().unwrap(), ttl));
-        assert!(learner
-            .shared()
-            .contains_within(&"10.0.0.3".parse().unwrap(), ttl));
+        assert!(
+            !learner
+                .shared()
+                .contains_within(&"10.0.0.1".parse().unwrap(), ttl)
+        );
+        assert!(
+            learner
+                .shared()
+                .contains_within(&"10.0.0.3".parse().unwrap(), ttl)
+        );
 
         // A zero TTL expires everything even while still cached.
-        assert!(!learner
-            .shared()
-            .contains_within(&"10.0.0.3".parse().unwrap(), Duration::ZERO));
+        assert!(
+            !learner
+                .shared()
+                .contains_within(&"10.0.0.3".parse().unwrap(), Duration::ZERO)
+        );
     }
 
     #[test]

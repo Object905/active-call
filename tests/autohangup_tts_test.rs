@@ -10,9 +10,9 @@
 use active_call::callrecord::CallRecordHangupReason;
 use active_call::event::SessionEvent;
 use active_call::media::track::Track;
+use active_call::media::track::TrackConfig;
 use active_call::media::track::file::FileTrack;
 use active_call::media::track::tts::TtsTrack;
-use active_call::media::track::TrackConfig;
 use active_call::synthesis::SynthesisCommand;
 use active_call::synthesis::{SynthesisClient, SynthesisEvent, SynthesisType};
 use anyhow::Result;
@@ -60,7 +60,10 @@ impl SynthesisClient for StreamMock {
 }
 
 /// Run a TtsTrack to completion and return the auto_hangup carried by its TrackEnd.
-async fn run_tts_track<F>(track_auto_hangup: Option<bool>, commands: F) -> Result<Option<CallRecordHangupReason>>
+async fn run_tts_track<F>(
+    track_auto_hangup: Option<bool>,
+    commands: F,
+) -> Result<Option<CallRecordHangupReason>>
 where
     F: FnOnce(mpsc::UnboundedSender<SynthesisCommand>),
 {
@@ -307,8 +310,7 @@ async fn test_file_track_no_auto_hangup_by_default() -> Result<()> {
 async fn test_file_track_cancelled_voids_auto_hangup() -> Result<()> {
     let auto_hangup = run_file_track(Some(true), true).await?;
     assert_eq!(
-        auto_hangup,
-        None,
+        auto_hangup, None,
         "interrupted file playback must not carry the hangup intent"
     );
     Ok(())

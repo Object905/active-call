@@ -5,13 +5,13 @@ use crate::{
     },
     config::Config,
     locator::RewriteTargetLocator,
-        useragent::{
-            RegisterOption,
-            invitation::{
-                FnCreateInvitationHandler, PendingDialog, PendingDialogGuard,
-                default_create_invite_handler,
-            },
-            peer_learning::{PeerAddressLearner, SharedLearnedPeers},
+    useragent::{
+        RegisterOption,
+        invitation::{
+            FnCreateInvitationHandler, PendingDialog, PendingDialogGuard,
+            default_create_invite_handler,
+        },
+        peer_learning::{PeerAddressLearner, SharedLearnedPeers},
         public_address::{
             LearningMessageInspector, SharedPublicAddress, build_contact, build_public_contact_uri,
             find_local_addr_for_uri,
@@ -414,10 +414,7 @@ impl AppStateInner {
 
                     let dialog_id = dialog.id();
                     let dialog_id_str = dialog_id.to_string();
-                    // Incoming calls get a short public session id instead of
-                    // the raw dialog-id string; the guard registers the mapping
-                    // below so accept/hangup/message lookups can resolve it.
-                    let session_id = generate_short_session_id(&self.invitation);
+                    let session_id = if dialog_id_str.len() > 64 { generate_short_session_id(&self.invitation) } else { dialog_id_str.clone() };
                     let dialog_id_for_cleanup = dialog_id.clone();
                     let token = self.token.child_token();
                     let pending_dialog = PendingDialog {
@@ -446,7 +443,11 @@ impl AppStateInner {
                     let invitation_for_cleanup = self.invitation.clone();
                     let session_id_for_task = session_id.clone();
                     crate::spawn(async move {
-                        info!(session_id = session_id_for_task, id = dialog_id_str, "incoming invite task started");
+                        info!(
+                            session_id = session_id_for_task,
+                            id = dialog_id_str,
+                            "incoming invite task started"
+                        );
                         let _pending_guard = guard;
                         let token_ref = token.clone();
                         let accept_timeout_sleep = tokio::time::sleep(accept_timeout);
@@ -1086,9 +1087,8 @@ impl AppStateBuilder {
         let bind_addr = rsipstack::transport::SipConnection::resolve_bind_address(actual_addr);
         let mut learned_public_address: SharedPublicAddress =
             Arc::new(ArcSwap::from_pointee(bind_addr.into()));
-        let learned_peers = SharedLearnedPeers::new(
-            crate::useragent::peer_learning::LEARNED_PEERS_CAPACITY,
-        );
+        let learned_peers =
+            SharedLearnedPeers::new(crate::useragent::peer_learning::LEARNED_PEERS_CAPACITY);
 
         let udp_inner = rsipstack::transport::udp::UdpInner {
             conn: tokio_socket,

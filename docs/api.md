@@ -1367,6 +1367,18 @@ Events are received as JSON messages from the server. All timestamps are in mill
 #### TransferRequest Event
 **Triggered when:** An in-dialog SIP REFER (transfer) request is received.
 
+The server replies `202 Accepted` and opens the RFC 3515 implicit
+subscription: it immediately sends `NOTIFY (100 Trying / Subscription-State:
+active)` on the parent dialog, and a final `NOTIFY` with
+`Subscription-State: terminated` once the transfer attempt finishes
+(success: sipfrag `SIP/2.0 200 OK`; failure: the actual status code, e.g.
+`SIP/2.0 486 Busy Here`).
+
+When `auto_refer` is enabled (default), the call is transferred
+automatically: the server dials `referTo` and bridges the media. With
+`auto_refer = false` the subscription is closed with a `403` NOTIFY and
+handling is left to the websocket client.
+
 **Fields:**
 - `event` (string): Always "transferRequest"
 - `trackId` (string): **Unique identifier for the audio track.**

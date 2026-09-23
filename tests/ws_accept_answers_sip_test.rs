@@ -20,12 +20,8 @@ use serde::Deserialize;
 use std::time::Duration;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::Message,
-    MaybeTlsStream, WebSocketStream,
-};
-use tracing::{info, Level};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+use tracing::{Level, info};
 
 #[derive(Debug, Deserialize)]
 struct WebhookPayload {
@@ -78,7 +74,11 @@ async fn spawn_node(sip_port: u16, codecs: Vec<String>) -> TestNode {
         rtp_start_port: Some(31000 + port_key * 20),
         rtp_end_port: Some(31020 + port_key * 20),
         media_cache_path: "./target/tmp_media".to_string(),
-        codecs: if codecs.is_empty() { None } else { Some(codecs) },
+        codecs: if codecs.is_empty() {
+            None
+        } else {
+            Some(codecs)
+        },
         ..Default::default()
     };
     let app: AppState = AppStateBuilder::new()
@@ -190,6 +190,126 @@ impl SipUac {
             port.expect("answer SDP missing m=audio port"),
         )
     }
+
+    /// Extract the `tag=` parameter from a To/From header line.
+    fn header_tag(msg: &str, header: &str) -> Option<String> {
+        msg.lines()
+            .find(|l| l.starts_with(header))
+            .and_then(|l| l.split("tag=").nth(1))
+            .map(|t| t.trim().trim_end_matches(';').to_string())
+    }
+
+    /// Build an ACK for the answered INVITE (confirms the dialog so
+    /// in-dialog requests like REFER can be routed).
+    fn ack(&self, call_id: &str, from_tag: &str, to_tag: &str, branch: &str) -> String {
+        format!(
+            "ACK sip:bot@{server} SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 127.0.0.1:{media_port};branch={branch};rport\r\n\
+             From: <sip:caller@127.0.0.1>;tag={from_tag}\r\n\
+             To: <sip:bot@{server}>;tag={to_tag}\r\n\
+             Call-ID: {call_id}\r\n\
+             CSeq: 1 ACK\r\n\
+             Max-Forwards: 70\r\n\
+             Content-Length: 0\r\n\
+             \r\n",
+            server = self.server,
+            media_port = self.socket.local_addr().unwrap().port(),
+        )
+    }
+
+    /// Build an in-dialog REFER (RFC 3515) transferring the call to `refer_to`.
+    fn refer(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        to_tag: &str,
+        branch: &str,
+        refer_to: &str,
+    ) -> String {
+        format!(
+            "REFER sip:bot@{server} SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 127.0.0.1:{media_port};branch={branch};rport\r\n\
+             From: <sip:caller@127.0.0.1>;tag={from_tag}\r\n\
+             To: <sip:bot@{server}>;tag={to_tag}\r\n\
+             Call-ID: {call_id}\r\n\
+             CSeq: 2 REFER\r\n\
+             Max-Forwards: 70\r\n\
+             Refer-To: <{refer_to}>\r\n\
+             Referred-By: <sip:caller@127.0.0.1>\r\n\
+             Content-Length: 0\r\n\
+             \r\n",
+            server = self.server,
+            media_port = self.socket.local_addr().unwrap().port(),
+        )
+    }
+
+    /// Receive messages until one contains `needle`, replying 200 OK to any
+    /// in-dialog request (NOTIFY etc.) on the way. Returns (matched, matched
+    /// message, every full message seen) — assertions on arrival order or
+    /// already-consumed messages can use the message list.
+    async fn wait_and_reply(
+        &self,
+        needle: &str,
+        timeout: Duration,
+    ) -> (bool, Option<String>, Vec<String>) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut msgs = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return (false, None, msgs);
+            }
+            let (n, src) =
+                match tokio::time::timeout(remaining, self.socket.recv_from(&mut buf)).await {
+                    Ok(Ok(x)) => x,
+                    _ => return (false, None, msgs),
+                };
+            let msg = String::from_utf8_lossy(&buf[..n]).to_string();
+            let first_line = msg.lines().next().unwrap_or("").to_string();
+            info!(%first_line, "UAC received message");
+            if msg.contains(needle) {
+                msgs.push(msg.clone());
+                return (true, Some(msg), msgs);
+            }
+            msgs.push(msg.clone());
+            // Auto-answer in-dialog requests so transactions complete.
+            if first_line.starts_with("NOTIFY")
+                || first_line.starts_with("UPDATE")
+                || first_line.starts_with("INFO")
+            {
+                let mut via = String::new();
+                let mut from = String::new();
+                let mut to = String::new();
+                let mut call_id = String::new();
+                let mut cseq = String::new();
+                for line in msg.lines() {
+                    for (prefix, slot) in [
+                        ("Via:", &mut via),
+                        ("From:", &mut from),
+                        ("To:", &mut to),
+                        ("Call-ID:", &mut call_id),
+                        ("CSeq:", &mut cseq),
+                    ] {
+                        if line.starts_with(prefix) && slot.is_empty() {
+                            *slot = line.to_string();
+                        }
+                    }
+                }
+                let ok = format!(
+                    "SIP/2.0 200 OK\r\n\
+                     {via}\r\n\
+                     {from}\r\n\
+                     {to}\r\n\
+                     {call_id}\r\n\
+                     {cseq}\r\n\
+                     Content-Length: 0\r\n\
+                     \r\n"
+                );
+                self.socket.send_to(ok.as_bytes(), src).await.ok();
+            }
+        }
+    }
 }
 
 const PCMU_OFFER: &str = "v=0\r\n\
@@ -235,23 +355,28 @@ async fn attach_and_accept(node: &mut TestNode, call_id: &str) -> (WsSender, WsR
         payload.sip_call_id
     );
     let dialog_id = payload.dialog_id;
-    assert!(
-        dialog_id.starts_with("s.") && dialog_id.len() <= 16,
-        "unexpected session id {dialog_id}"
-    );
+    // The webhook carries either the short `s.<hex>` session id or the raw
+    // SIP dialog id (for dialogs short enough to be used verbatim); tests
+    // only need a stable handle to attach the websocket.
+    assert!(!dialog_id.is_empty() && dialog_id.len() <= 128,
+        "unexpected session id {dialog_id}");
     info!(%dialog_id, "got session id from webhook");
 
-    let (ws, _) =
-        connect_async(format!("ws://127.0.0.1:{}/call?id={dialog_id}", node.http_port))
-            .await
-            .expect("failed to attach websocket to the ringing call");
+    let (ws, _) = connect_async(format!(
+        "ws://127.0.0.1:{}/call?id={dialog_id}",
+        node.http_port
+    ))
+    .await
+    .expect("failed to attach websocket to the ringing call");
     let (mut sink, mut stream) = ws.split();
 
     // Send accept once the call is attached (first event confirms attach).
     let _ = stream.next().await; // trackStart or similar early event
-    sink.send(Message::text(r#"{"command":"accept","option":{}}"#.to_string()))
-        .await
-        .expect("failed to send accept");
+    sink.send(Message::text(
+        r#"{"command":"accept","option":{}}"#.to_string(),
+    ))
+    .await
+    .expect("failed to send accept");
 
     (sink, stream)
 }
@@ -267,11 +392,7 @@ async fn ws_accept_answers_pending_sip_dialog() {
         .ok();
 
     let mut node = spawn_node(35070, vec![]).await;
-    let uac = SipUac::new(
-        format!("127.0.0.1:{}", node.sip_port).parse().unwrap(),
-        0,
-    )
-    .await;
+    let uac = SipUac::new(format!("127.0.0.1:{}", node.sip_port).parse().unwrap(), 0).await;
     let call_id = "ws-accept-regression@127.0.0.1";
     uac.socket
         .send_to(
@@ -285,8 +406,9 @@ async fn ws_accept_answers_pending_sip_dialog() {
     let (_bot_sink, _bot_stream) = attach_and_accept(&mut node, call_id).await;
 
     // The SIP dialog must now be answered with 200 OK (+ SDP).
-    let (answered, ok_msg, seen) =
-        uac.wait_for_status("SIP/2.0 200", Duration::from_secs(8)).await;
+    let (answered, ok_msg, seen) = uac
+        .wait_for_status("SIP/2.0 200", Duration::from_secs(8))
+        .await;
     assert!(
         answered,
         "SIP dialog was never answered with 200 OK after websocket accept; \
@@ -329,8 +451,9 @@ async fn ws_accept_bridges_bidirectional_media() {
 
     let (mut bot_sink, mut bot_stream) = attach_and_accept(&mut node, call_id).await;
 
-    let (answered, ok_msg, seen) =
-        uac.wait_for_status("SIP/2.0 200", Duration::from_secs(8)).await;
+    let (answered, ok_msg, seen) = uac
+        .wait_for_status("SIP/2.0 200", Duration::from_secs(8))
+        .await;
     assert!(
         answered,
         "SIP dialog was never answered with 200 OK after websocket accept; \
@@ -352,7 +475,10 @@ async fn ws_accept_bridges_bidirectional_media() {
     let uplink_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let remaining = uplink_deadline.saturating_duration_since(tokio::time::Instant::now());
-        assert!(!remaining.is_zero(), "bot never received uplink audio over websocket");
+        assert!(
+            !remaining.is_zero(),
+            "bot never received uplink audio over websocket"
+        );
         match tokio::time::timeout(remaining, bot_stream.next()).await {
             Ok(Some(Ok(Message::Binary(data)))) if !data.is_empty() => {
                 uplink_bytes += data.len();
@@ -429,13 +555,17 @@ impl AgentUas {
         )
     }
 
-    /// Wait for the refer INVITE and answer it with 200 OK.
-    async fn answer_refer_invite(&self, timeout: Duration) {
+    /// Wait for the refer INVITE and answer it with 200 OK. Returns the raw
+    /// INVITE message and the peer address (for the follow-up BYE).
+    async fn answer_refer_invite(&self, timeout: Duration) -> (String, std::net::SocketAddr) {
         let deadline = tokio::time::Instant::now() + timeout;
         let mut buf = [0u8; 8192];
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            assert!(!remaining.is_zero(), "agent never received the refer INVITE");
+            assert!(
+                !remaining.is_zero(),
+                "agent never received the refer INVITE"
+            );
             let (n, src) = tokio::time::timeout(remaining, self.sip_socket.recv_from(&mut buf))
                 .await
                 .expect("recv failed")
@@ -491,8 +621,48 @@ impl AgentUas {
             );
             self.sip_socket.send_to(ok.as_bytes(), src).await.unwrap();
             info!("agent answered the refer INVITE");
-            return;
+            return (msg, src);
         }
+    }
+
+    /// Tear the refer leg down (agent hangs up first). The PBX must then
+    /// hang up the parent (customer) dialog via the auto-hangup path.
+    async fn send_bye(&self, invite: &str, dst: std::net::SocketAddr) {
+        let mut call_id = String::new();
+        let mut remote_from = String::new();
+        let mut contact = String::new();
+        for line in invite.lines() {
+            if line.starts_with("Call-ID:") {
+                call_id = line.to_string();
+            } else if line.starts_with("From:") && remote_from.is_empty() {
+                // The INVITE's From (the PBX side, with its tag) becomes the
+                // BYE's To header.
+                remote_from = format!(
+                    "To:{}",
+                    line.strip_prefix("From:").unwrap_or("").to_string()
+                );
+            } else if line.starts_with("Contact:") && contact.is_empty() {
+                contact = line
+                    .strip_prefix("Contact:")
+                    .unwrap_or("")
+                    .trim()
+                    .trim_matches(['<', '>'])
+                    .to_string();
+            }
+        }
+        let port = self.sip_socket.local_addr().unwrap().port();
+        let bye = format!(
+            "BYE {contact} SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 127.0.0.1:{port};branch=z9hG4bKagentbye1;rport\r\n\
+             From: <sip:agent@127.0.0.1>;tag=agenttag1\r\n\
+             {remote_from}\r\n\
+             {call_id}\r\n\
+             CSeq: 2 BYE\r\n\
+             Content-Length: 0\r\n\
+             \r\n"
+        );
+        self.sip_socket.send_to(bye.as_bytes(), dst).await.unwrap();
+        info!("agent sent BYE on the refer leg");
     }
 
     /// Receive RTP packets (customer audio forwarded through the refer leg);
@@ -586,13 +756,16 @@ async fn ws_refer_connects_customer_and_agent_media() {
     let payload = vec![0x55u8; 160];
     for seq in 0..40u16 {
         let pkt = rtp_packet(seq, seq as u32 * 160, 0xABCD_0001, &payload);
-        customer.socket.send_to(&pkt, customer_media_addr).await.unwrap();
+        customer
+            .socket
+            .send_to(&pkt, customer_media_addr)
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let pbx_refer_addr = agent
-        .wait_rtp(Duration::from_secs(5))
-        .await
-        .expect("agent never received customer audio after refer (production one-way-audio symptom)");
+    let pbx_refer_addr = agent.wait_rtp(Duration::from_secs(5)).await.expect(
+        "agent never received customer audio after refer (production one-way-audio symptom)",
+    );
 
     // ── Agent -> customer audio must flow as well. The PBX's refer leg
     // latches onto the agent's media endpoint (127.0.0.1:{agent.media_port}
@@ -629,5 +802,366 @@ async fn ws_refer_connects_customer_and_agent_media() {
             _ => continue,
         }
     }
-    info!(downlink, "customer received agent audio through the refer bridge");
+    info!(
+        downlink,
+        "customer received agent audio through the refer bridge"
+    );
+}
+
+/// A UAS that rejects every INVITE with 486 Busy Here — a transfer target
+/// that fails fast (no handshake timeout needed).
+struct BusyUas {
+    socket: UdpSocket,
+}
+
+impl BusyUas {
+    async fn new() -> Self {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        Self { socket }
+    }
+
+    fn uri(&self) -> String {
+        format!(
+            "sip:busy@127.0.0.1:{}",
+            self.socket.local_addr().unwrap().port()
+        )
+    }
+
+    /// Wait for an INVITE and reject it with 486.
+    async fn reject_next_invite(&self, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut buf = [0u8; 8192];
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(!remaining.is_zero(), "busy target never received an INVITE");
+            let (n, src) = tokio::time::timeout(remaining, self.socket.recv_from(&mut buf))
+                .await
+                .expect("recv failed")
+                .expect("recv error");
+            let msg = String::from_utf8_lossy(&buf[..n]).to_string();
+            if !msg.starts_with("INVITE") {
+                continue;
+            }
+            let mut via = String::new();
+            let mut from = String::new();
+            let mut call_id = String::new();
+            let mut cseq = String::new();
+            for line in msg.lines() {
+                if line.starts_with("Via:") {
+                    via = line.to_string();
+                } else if line.starts_with("From:") {
+                    from = line.to_string();
+                } else if line.starts_with("Call-ID:") {
+                    call_id = line.to_string();
+                } else if line.starts_with("CSeq:") {
+                    cseq = line.to_string();
+                }
+            }
+            let reject = format!(
+                "SIP/2.0 486 Busy Here\r\n\
+                 {via}\r\n\
+                 {from}\r\n\
+                 To: <sip:busy@127.0.0.1>;tag=busytag1\r\n\
+                 {call_id}\r\n\
+                 {cseq}\r\n\
+                 Content-Length: 0\r\n\
+                 \r\n"
+            );
+            self.socket.send_to(reject.as_bytes(), src).await.unwrap();
+            info!("busy target rejected the refer INVITE with 486");
+            return;
+        }
+    }
+}
+
+/// Read websocket events until one with the given `event` name arrives.
+async fn wait_ws_event(
+    stream: &mut WsReceiver,
+    name: &str,
+    timeout: Duration,
+) -> Option<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if v.get("event").and_then(|e| e.as_str()) == Some(name) {
+                        return Some(v);
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(e))) => panic!("websocket error while waiting for {name}: {e}"),
+            Ok(None) => return None,
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Incoming in-dialog REFER (RFC 3515): the websocket bot's call is
+/// transferred to the agent. The referrer must see 202, an implicit
+/// subscription with NOTIFY 100 Trying, a final NOTIFY 200 once the refer
+/// leg answers, and a BYE on the parent dialog once the agent hangs up.
+#[tokio::test]
+async fn incoming_refer_transfers_call_and_notifies_referrer() {
+    tracing_subscriber::fmt()
+        .with_max_level(Level::DEBUG)
+        .with_test_writer()
+        .try_init()
+        .ok();
+
+    let mut node = spawn_node(35073, vec!["pcmu".to_string()]).await;
+    let customer = SipUac::new(
+        format!("127.0.0.1:{}", node.sip_port).parse().unwrap(),
+        42010,
+    )
+    .await;
+    let call_id = "incoming-refer-success@127.0.0.1";
+    customer
+        .socket
+        .send_to(
+            customer
+                .invite(call_id, "fromtag-r1", "z9hG4bKinref1", PCMU_OFFER)
+                .as_bytes(),
+            customer.server,
+        )
+        .await
+        .unwrap();
+
+    let (mut bot_sink, mut bot_stream) = attach_and_accept(&mut node, call_id).await;
+
+    let (answered, ok_msg, seen) = customer
+        .wait_for_status("SIP/2.0 200", Duration::from_secs(8))
+        .await;
+    assert!(answered, "call not answered; seen: {seen:?}");
+    let ok_msg = ok_msg.unwrap();
+    let to_tag = SipUac::header_tag(&ok_msg, "To:").expect("200 OK missing To tag");
+    let _ = SipUac::answer_media_endpoint(&ok_msg);
+
+    // Confirm the dialog (ACK) so in-dialog requests can be routed.
+    customer
+        .socket
+        .send_to(
+            customer
+                .ack(call_id, "fromtag-r1", &to_tag, "z9hG4bKinrefack1")
+                .as_bytes(),
+            customer.server,
+        )
+        .await
+        .unwrap();
+
+    // ── Customer sends an in-dialog REFER transferring to the agent.
+    let agent = AgentUas::new(42101).await;
+    customer
+        .socket
+        .send_to(
+            customer
+                .refer(
+                    call_id,
+                    "fromtag-r1",
+                    &to_tag,
+                    "z9hG4bKinrefbye1",
+                    &agent.uri(),
+                )
+                .as_bytes(),
+            customer.server,
+        )
+        .await
+        .unwrap();
+
+    // RFC 3515 sequence: 202 first, then the implicit subscription opens
+    // with a 100 Trying / active NOTIFY. The two are read from the same
+    // socket, so the 202 is asserted from the message log.
+    let (trying, _, msgs) = customer
+        .wait_and_reply("Subscription-State: active", Duration::from_secs(8))
+        .await;
+    assert!(
+        trying,
+        "no active NOTIFY (100 Trying) for the refer subscription; messages: {msgs:?}"
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("SIP/2.0 202")),
+        "REFER was never answered with 202: {msgs:?}"
+    );
+
+    // The bot sees the transferRequest event...
+    let tr = wait_ws_event(&mut bot_stream, "transferRequest", Duration::from_secs(8))
+        .await
+        .expect("websocket bot never received transferRequest");
+    assert!(
+        tr.get("referTo")
+            .and_then(|v| v.as_str())
+            .map(|v| v.contains(&agent.uri()))
+            .unwrap_or(false),
+        "transferRequest carries unexpected referTo: {tr}"
+    );
+
+    // ...and the refer leg reaches the agent, which answers.
+    let (invite_msg, agent_peer) = agent.answer_refer_invite(Duration::from_secs(8)).await;
+
+    // Final NOTIFY: transfer succeeded (200, terminated).
+    let (final_ok, final_msg, msgs) = customer
+        .wait_and_reply("Subscription-State: terminated", Duration::from_secs(8))
+        .await;
+    assert!(
+        final_ok,
+        "no terminated NOTIFY for the refer subscription; messages: {msgs:?}"
+    );
+    let final_msg = final_msg.unwrap();
+    assert!(
+        final_msg.contains("SIP/2.0 200"),
+        "terminated NOTIFY should report success, got: {final_msg}"
+    );
+    assert!(
+        final_msg.contains("Event: refer"),
+        "NOTIFY must use the refer event package, got: {final_msg}"
+    );
+
+    // WS answer event marks the refer leg.
+    let answer = wait_ws_event(&mut bot_stream, "answer", Duration::from_secs(8))
+        .await
+        .expect("websocket bot never received refer answer event");
+    assert_eq!(
+        answer.get("refer").and_then(|v| v.as_bool()),
+        Some(true),
+        "answer event should carry refer=true: {answer}"
+    );
+
+    // ── Agent hangs up the refer leg; the parent (customer) dialog must be
+    // hung up by the auto-hangup path.
+    agent.send_bye(&invite_msg, agent_peer).await;
+    let (bye, _, seen) = customer
+        .wait_and_reply("BYE ", Duration::from_secs(8))
+        .await;
+    assert!(
+        bye,
+        "customer dialog was never hung up after the refer leg ended; seen: {seen:?}"
+    );
+
+    let hangup = wait_ws_event(&mut bot_stream, "hangup", Duration::from_secs(8)).await;
+    assert!(hangup.is_some(), "websocket bot never received hangup");
+    let _ = bot_sink
+        .send(Message::text(r#"{"command":"hangup"}"#.to_string()))
+        .await;
+}
+
+/// Incoming REFER to a target that rejects with 486: the referrer gets a
+/// failure NOTIFY and the parent dialog must stay alive.
+#[tokio::test]
+async fn incoming_refer_failure_notifies_and_keeps_call_alive() {
+    tracing_subscriber::fmt()
+        .with_max_level(Level::DEBUG)
+        .with_test_writer()
+        .try_init()
+        .ok();
+
+    let mut node = spawn_node(35074, vec!["pcmu".to_string()]).await;
+    let customer = SipUac::new(
+        format!("127.0.0.1:{}", node.sip_port).parse().unwrap(),
+        42011,
+    )
+    .await;
+    let call_id = "incoming-refer-failure@127.0.0.1";
+    customer
+        .socket
+        .send_to(
+            customer
+                .invite(call_id, "fromtag-r2", "z9hG4bKinref2", PCMU_OFFER)
+                .as_bytes(),
+            customer.server,
+        )
+        .await
+        .unwrap();
+
+    let (_bot_sink, mut bot_stream) = attach_and_accept(&mut node, call_id).await;
+
+    let (answered, ok_msg, seen) = customer
+        .wait_for_status("SIP/2.0 200", Duration::from_secs(8))
+        .await;
+    assert!(answered, "call not answered; seen: {seen:?}");
+    let to_tag = SipUac::header_tag(&ok_msg.unwrap(), "To:").expect("200 OK missing To tag");
+
+    // Confirm the dialog (ACK) so in-dialog requests can be routed.
+    customer
+        .socket
+        .send_to(
+            customer
+                .ack(call_id, "fromtag-r2", &to_tag, "z9hG4bKinrefack2")
+                .as_bytes(),
+            customer.server,
+        )
+        .await
+        .unwrap();
+
+    // Transfer to a target that rejects with 486.
+    let busy = BusyUas::new().await;
+    customer
+        .socket
+        .send_to(
+            customer
+                .refer(
+                    call_id,
+                    "fromtag-r2",
+                    &to_tag,
+                    "z9hG4bKinrefbye2",
+                    &busy.uri(),
+                )
+                .as_bytes(),
+            customer.server,
+        )
+        .await
+        .unwrap();
+
+    // 202 + active NOTIFY (order on the wire: 202 before NOTIFY; the 202 is
+    // asserted from the message log).
+    let (trying, _, msgs) = customer
+        .wait_and_reply("Subscription-State: active", Duration::from_secs(8))
+        .await;
+    assert!(
+        trying,
+        "no active NOTIFY (100 Trying) for the refer subscription; messages: {msgs:?}"
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("SIP/2.0 202")),
+        "REFER was never answered with 202: {msgs:?}"
+    );
+
+    // The refer leg INVITE fails fast with 486.
+    busy.reject_next_invite(Duration::from_secs(8)).await;
+
+    // Final NOTIFY reports the failure.
+    let (terminated, final_msg, msgs) = customer
+        .wait_and_reply("Subscription-State: terminated", Duration::from_secs(10))
+        .await;
+    assert!(
+        terminated,
+        "no terminated NOTIFY for the failed refer; messages: {msgs:?}"
+    );
+    let final_msg = final_msg.unwrap();
+    assert!(
+        final_msg.contains("486"),
+        "terminated NOTIFY should report the 486 failure, got: {final_msg}"
+    );
+
+    // transferRequest was still emitted (WS clients can take over manually).
+    let tr = wait_ws_event(&mut bot_stream, "transferRequest", Duration::from_secs(8))
+        .await
+        .expect("websocket bot never received transferRequest");
+    assert!(
+        tr.get("referTo").is_some(),
+        "transferRequest missing referTo"
+    );
+
+    // The parent dialog stays alive: no BYE within the window.
+    let (bye, _, msgs) = customer
+        .wait_and_reply("BYE ", Duration::from_secs(3))
+        .await;
+    assert!(
+        !bye,
+        "customer dialog must NOT be hung up after a failed transfer; messages: {msgs:?}"
+    );
 }
