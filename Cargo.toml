@@ -9,7 +9,20 @@ repository = "https://github.com/miuda-ai/active-call"
 readme = "README.md"
 keywords = ["sip", "voip", "telephony", "voice-agent", "webrtc"]
 categories = ["network-programming", "multimedia"]
-exclude = ["fixtures/**", "examples/**", "src/media/tests/**"]
+exclude = [
+    # large runtime assets and repo-only files that do not need to ship in
+    # the .crate (keeps the publish upload small)
+    "fixtures/**",
+    "examples/**",
+    "src/media/tests/**",
+    "tests/**",
+    "scripts/**",
+    "docs/**",
+    "config/**",
+    "features/**",
+    "static/**",
+    "dialogue.md",
+]
 
 [features]
 default = ["offline"]
