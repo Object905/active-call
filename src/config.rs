@@ -355,10 +355,7 @@ fn host_of_server(server: &str) -> Option<String> {
     }
     if let Some(rest) = server.strip_prefix('[') {
         // [ipv6]:port or [ipv6]
-        return rest
-            .split(']')
-            .next()
-            .map(|h| h.to_ascii_lowercase());
+        return rest.split(']').next().map(|h| h.to_ascii_lowercase());
     }
     // A bare ipv6 literal without brackets contains multiple colons; keep it whole.
     if server.matches(':').count() > 1 {
@@ -499,6 +496,29 @@ pub struct Config {
     pub enable_options_response: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub options_response: Option<OptionsResponseConfig>,
+
+    /// Follow incoming in-dialog REFER automatically: dial the Refer-To
+    /// target and bridge media (transfer). The `transferRequest` session
+    /// event is always emitted regardless; when disabled the RFC 3515
+    /// implicit subscription is terminated with a 403 NOTIFY instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_refer: Option<bool>,
+    /// Timeout in seconds for the INVITE handshake of an auto-refer leg.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_refer_timeout: Option<u32>,
+}
+
+impl Config {
+    /// Whether incoming in-dialog REFERs are followed automatically
+    /// (defaults to true).
+    pub fn auto_refer(&self) -> bool {
+        self.auto_refer.unwrap_or(true)
+    }
+
+    /// INVITE handshake timeout in seconds for auto-refer legs (default 30).
+    pub fn auto_refer_timeout(&self) -> u32 {
+        self.auto_refer_timeout.unwrap_or(30)
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Serialize)]
@@ -611,6 +631,8 @@ impl Default for Config {
             trunk_rules: None,
             enable_options_response: default_enable_options_response(),
             options_response: None,
+            auto_refer: None,
+            auto_refer_timeout: None,
         }
     }
 }
@@ -655,9 +677,7 @@ impl Config {
         self.options_response
             .as_ref()
             .and_then(|o| o.learn_ttl.as_deref())
-            .map(|raw| {
-                humantime::parse_duration(raw).unwrap_or(DEFAULT)
-            })
+            .map(|raw| humantime::parse_duration(raw).unwrap_or(DEFAULT))
             .unwrap_or(DEFAULT)
     }
 
@@ -665,7 +685,12 @@ impl Config {
     pub fn options_acl_entries(&self) -> Vec<OptionsAclEntry> {
         self.options_response
             .as_ref()
-            .map(|o| o.allow.iter().filter_map(|raw| OptionsAclEntry::parse(raw)).collect())
+            .map(|o| {
+                o.allow
+                    .iter()
+                    .filter_map(|raw| OptionsAclEntry::parse(raw))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -701,7 +726,11 @@ impl Config {
 
     /// Whether `source_ip`/`source_host` matches the static ACL or the
     /// registered-server hosts (the configured, non-learned allow sets).
-    pub fn options_matches_static(&self, source_ip: Option<std::net::IpAddr>, source_host: &str) -> bool {
+    pub fn options_matches_static(
+        &self,
+        source_ip: Option<std::net::IpAddr>,
+        source_host: &str,
+    ) -> bool {
         self.options_acl_entries()
             .iter()
             .any(|entry| entry.matches(source_ip, source_host))
@@ -1020,8 +1049,7 @@ allow = ["139.224.72.64", "10.0.0.0/8", "sip.ccc.aliyuncs.com"]
         assert!(config.options_matches_static(ip("10.1.2.3"), "10.1.2.3"));
         assert!(!config.options_matches_static(ip("192.168.1.1"), "192.168.1.1"));
         // Hostname, case-insensitive.
-        assert!(config
-            .options_matches_static(None, "SIP.CCC.ALIYUNCS.COM"));
+        assert!(config.options_matches_static(None, "SIP.CCC.ALIYUNCS.COM"));
         assert!(!config.options_matches_static(None, "sip.example.com"));
         // An IP source does not match the hostname entry and vice versa.
         assert!(!config.options_matches_static(None, "139.224.72.64"));
@@ -1045,16 +1073,10 @@ username = "1002"
         // Default: registered servers are allowed.
         assert_eq!(
             config.options_registered_hosts(),
-            vec![
-                "sip.example.com".to_string(),
-                "10.0.0.5".to_string()
-            ]
+            vec!["sip.example.com".to_string(), "10.0.0.5".to_string()]
         );
         assert!(config.options_matches_static(None, "SIP.EXAMPLE.COM"));
-        assert!(config.options_matches_static(
-            Some("10.0.0.5".parse().unwrap()),
-            "10.0.0.5"
-        ));
+        assert!(config.options_matches_static(Some("10.0.0.5".parse().unwrap()), "10.0.0.5"));
 
         // Opt out via allow_registered_servers = false.
         let toml_config_off = r#"

@@ -1,7 +1,9 @@
 use audio_codec::samples_to_bytes;
 
 use crate::media::{
-    AudioFrame, Samples, agc::{AGCOption, AutomaticGainControl}, processor::Processor,
+    AudioFrame, Samples,
+    agc::{AGCOption, AutomaticGainControl},
+    processor::Processor,
 };
 use std::{fs::File, io::Write};
 
@@ -77,7 +79,11 @@ fn test_silence_does_not_pump_gain() {
         let mut samples = Vec::with_capacity(frame_size);
         for n in 0..frame_size {
             // alternating ± to keep peak ~= noise_amp
-            let s = if (i + n) % 2 == 0 { noise_amp } else { -noise_amp };
+            let s = if (i + n) % 2 == 0 {
+                noise_amp
+            } else {
+                -noise_amp
+            };
             samples.push(s);
         }
         let mut frame = make_frame(samples, sample_rate);

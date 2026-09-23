@@ -245,7 +245,10 @@ async fn test_tts_track_pause_buffers_until_resume() -> Result<()> {
         }
     }
 
-    assert!(track_end, "TrackEnd should be emitted after resumed TTS drains");
+    assert!(
+        track_end,
+        "TrackEnd should be emitted after resumed TTS drains"
+    );
     Ok(())
 }
 
