@@ -107,6 +107,33 @@ Rewrite fields (any combination):
 A `host` rewrite value without a port preserves the original port; include a
 port (e.g. `"172.25.225.2:15060"`) to change it as well.
 
+### Incoming Call Transfer (auto_refer)
+
+When an in-dialog SIP `REFER` (RFC 3515) is received on an active call, the
+agent can follow it automatically: the server dials the `Refer-To` target and
+bridges the media (same mechanics as the `refer` websocket command).
+
+```toml
+# Automatically follow incoming REFER (default: true)
+auto_refer = true
+# INVITE handshake timeout in seconds for the transfer leg (default: 30)
+auto_refer_timeout = 30
+```
+
+Behavior details:
+
+- The REFER is always answered with `202 Accepted` and a `transferRequest`
+  event is emitted to websocket clients, regardless of `auto_refer`.
+- The RFC 3515 implicit subscription is honored: `NOTIFY (100 Trying)` right
+  after the `202`, then a final `NOTIFY` with `Subscription-State:
+  terminated` carrying the transfer result (`200 OK` on success, the actual
+  failure code otherwise, `403` when `auto_refer = false`).
+- With `auto_hangup` semantics, the original (parent) call is released only
+  after the transfer leg has been answered AND ended; a rejected/failed
+  transfer keeps the caller in the original call.
+- Only one transfer can be in flight per call; concurrent REFERs are
+  declined with `491 Request Pending` via the NOTIFY subscription.
+
 ### RTP Port Range
 
 ```toml

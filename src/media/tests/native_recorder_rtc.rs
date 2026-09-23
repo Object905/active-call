@@ -8,8 +8,8 @@
 //! WAV fell back to 16 kHz (with no audio data).
 use crate::event::create_event_sender;
 use crate::media::recorder::RecorderOption;
-use crate::media::track::rtc::{RtcTrack, RtcTrackConfig};
 use crate::media::track::TrackConfig;
+use crate::media::track::rtc::{RtcTrack, RtcTrackConfig};
 use crate::media::{stream::MediaStreamBuilder, track::Track};
 use anyhow::Result;
 use audio_codec::CodecType;
@@ -111,11 +111,15 @@ async fn test_native_samplerate_recorder_over_rtc_rtp_track() -> Result<()> {
     let answer = track.handshake(offer, Some(Duration::from_secs(5))).await?;
     let track_port: u16 = answer
         .lines()
-        .find_map(|l| l.strip_prefix("m=audio ").map(|rest| {
-            rest.split_whitespace()
-                .next()
-                .and_then(|p| p.parse::<u16>().ok())
-        }).flatten())
+        .find_map(|l| {
+            l.strip_prefix("m=audio ")
+                .map(|rest| {
+                    rest.split_whitespace()
+                        .next()
+                        .and_then(|p| p.parse::<u16>().ok())
+                })
+                .flatten()
+        })
         .ok_or_else(|| anyhow::anyhow!("no m=audio port in answer:\n{answer}"))?;
     assert!(track_port > 0, "track did not bind an RTP port");
 

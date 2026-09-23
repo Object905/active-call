@@ -113,16 +113,17 @@ impl Probe {
     }
 
     async fn send(&self, msg: String) {
-        self.socket.send_to(msg.as_bytes(), self.server).await.unwrap();
+        self.socket
+            .send_to(msg.as_bytes(), self.server)
+            .await
+            .unwrap();
     }
 
     /// Collects responses for up to `wait` and returns every message received.
     async fn collect(&self, wait: Duration) -> Vec<String> {
         let mut messages = Vec::new();
         let deadline = tokio::time::Instant::now() + wait;
-        while let Some(remaining) =
-            deadline.checked_duration_since(tokio::time::Instant::now())
-        {
+        while let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) {
             let mut buf = [0u8; 4096];
             match timeout(remaining, self.socket.recv_from(&mut buf)).await {
                 Ok(Ok((n, _))) => {

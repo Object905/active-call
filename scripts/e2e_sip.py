@@ -8,9 +8,10 @@ SIP/RTP signalling:
 
   1. options     - SIP OPTIONS ping
   2. basic_call  - INVITE -> accept over WS -> DTMF -> hold/resume -> BYE
-  3. cancel      - CANCEL before answer, call torn down cleanly
-  4. reject      - python rejects with 486, sipbot sees failure
-  5. soak        - N concurrent calls (accept + hangup), success-rate and
+  3. refer       - accept -> in-dialog REFER -> auto transfer + NOTIFY -> BYE
+  4. cancel      - CANCEL before answer, call torn down cleanly
+  5. reject      - python rejects with 486, sipbot sees failure
+  6. soak        - N concurrent calls (accept + hangup), success-rate and
                    server-RSS growth assertions (memory leak check)
 
 Usage:
@@ -18,6 +19,11 @@ Usage:
                                [--skip-soak] [-v]
 
 Requires: sipbot (cargo install sipbot), python3 + websockets.
+
+Known flaky (pre-existing, unrelated to REFER): `cancel` can fail with
+"no invite webhook received" when the CANCEL wins the race against the
+server's app-level invite pickup — the transaction is then answered 487
+and the webhook never fires. See the scenario-order note in main().
 """
 
 import argparse
@@ -54,11 +60,16 @@ def free_port() -> int:
 
 
 def free_udp_port() -> int:
-    """A UDP port that is bindable right now."""
+    """A UDP port that is bindable right now.
+
+    Kept BELOW the OS ephemeral port range (macOS: 49152+) so a killed
+    process's port is never handed to the next short-lived sipbot together
+    with a stale ICMP error that would eat its first packets.
+    """
     import socket
 
     for _ in range(20):
-        port = random.randint(20000, 60000)
+        port = random.randint(20000, 45000)
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             try:
                 s.bind(("0.0.0.0", port))
@@ -304,13 +315,131 @@ async def scenario_basic_call(ctx) -> bool:
     await call.close()
     drained = True
     try:
-        await wait_list_empty(http_port, timeout=10)
+        await wait_list_empty(http_port, timeout=15)
     except TimeoutError:
         drained = False
 
     ok = ok and dtmf and hold_on and hold_off and hangup and code == 0 and established and drained
     if not ok:
         print(f"    FAIL events={[e.get('event') for e in call.events]}")
+    return ok
+
+
+async def scenario_refer(ctx) -> bool:
+    print("[scenario] incoming REFER: accept -> REFER -> auto transfer + NOTIFY -> BYE")
+    sip_port, http_port = ctx["sip_port"], ctx["http_port"]
+
+    # Transfer target: a sipbot `wait` that auto-answers and hangs up after 4s.
+    target_port = free_udp_port()
+    target = run_sipbot(
+        [
+            "wait",
+            "--addr",
+            f"127.0.0.1:{target_port}",
+            "--answer",
+            str(REPO / "fixtures" / "sample.wav"),
+            "--hangup",
+            "4",
+            "-v",
+        ]
+    )
+    await asyncio.sleep(0.5)
+
+    # Referrer: calls the server and sends an in-dialog REFER 2s into the call.
+    proc = run_sipbot(
+        [
+            "call",
+            "--target",
+            f"sip:e2e@127.0.0.1:{sip_port}",
+            "--external",
+            "127.0.0.1",
+            "--refer-to",
+            f"sip:target@127.0.0.1:{target_port}",
+            "--refer-delay",
+            "2",
+            "--hangup",
+            "20",
+            "-v",
+        ]
+    )
+
+    invite = await next_invite(ctx["webhook"], timeout=15)
+    dialog_id = invite["dialogId"]
+    print(f"    invite received: {dialog_id}")
+
+    call = WsCall(http_port, dialog_id)
+    await call.connect()
+    await call.send({"command": "accept", "option": {}})
+
+    answer = await call.wait_event("answer", timeout=10)
+    ok = answer is not None and bool(answer.get("sdp"))
+    print(f"    answer sdp: {len(answer.get('sdp', '')) if answer else 0} bytes")
+
+    # transferRequest must reach the websocket client with the Refer-To target.
+    tr = await call.wait_event("transferRequest", timeout=10)
+    refer_ok = tr is not None and str(target_port) in str(tr.get("referTo", ""))
+    print(f"    transferRequest: {tr}")
+
+    # The refer leg answers (answer event with refer=true).
+    refer_answer = None
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        ev = await call.wait_event(
+            "answer", timeout=max(0.1, deadline - time.monotonic())
+        )
+        if ev and ev.get("refer") is True:
+            refer_answer = ev
+            break
+    print(f"    refer answer event: {bool(refer_answer)}")
+
+    # Target hangs up after 4s -> refer leg ends -> parent is hung up (ByRefer).
+    hangup = await call.wait_event("hangup", timeout=20)
+    print(f"    hangup: {bool(hangup)}")
+
+    code, output = collect(proc, timeout=30)
+    established = "Call established" in output or "200 OK" in output
+    refer_sent = "Sending REFER" in output
+    refer_accepted = "202" in output
+    notify_ok = "REFER completed with SIP/2.0 200" in output
+    print(
+        f"    sipbot rc={code} established={established} referSent={refer_sent} "
+        f"refer202={refer_accepted} notifyOk={notify_ok}"
+    )
+    for line in output.splitlines():
+        if any(k in line for k in ("NOTIFY", "REFER", "refer")):
+            print(f"    | ...{line[-140:]}")
+
+    tcode, toutput = collect(target, timeout=20)
+    target_answered = "200 OK" in toutput or "answered" in toutput.lower()
+    print(f"    target rc={tcode} answered={target_answered}")
+    if not target_answered:
+        print(f"    target output tail:\n{toutput[-800:]}")
+
+    await call.close()
+    drained = True
+    try:
+        await wait_list_empty(http_port, timeout=15)
+    except TimeoutError:
+        drained = False
+
+    ok = (
+        ok
+        and refer_ok
+        and refer_answer is not None
+        and hangup is not None
+        and code == 0
+        and established
+        and refer_sent
+        and refer_accepted
+        and notify_ok
+        and target_answered
+        and drained
+    )
+    if not ok:
+        print(f"    FAIL events={[e.get('event') for e in call.events]}")
+    # Settle after force-killing the target so stale ICMP errors on recycled
+    # sockets cannot disturb the next scenario.
+    await asyncio.sleep(1.0)
     return ok
 
 
@@ -332,7 +461,16 @@ async def scenario_cancel(ctx) -> bool:
         ]
     )
 
-    invite = await next_invite(ctx["webhook"], timeout=15)
+    invite = None
+    try:
+        invite = await next_invite(ctx["webhook"], timeout=15)
+    except (asyncio.TimeoutError, TimeoutError):
+        code0, output0 = collect(proc, timeout=5)
+        print(
+            f"    cancel: no invite received by server; sipbot rc={code0} tail:\n"
+            f"{output0[-1200:]}"
+        )
+        raise
     dialog_id = invite["dialogId"]
     print(f"    invite received: {dialog_id} (ringing, not answering)")
     # sipbot only CANCELs from Trying/Early states; send 180 Ringing so its
@@ -348,7 +486,7 @@ async def scenario_cancel(ctx) -> bool:
 
     drained = True
     try:
-        await wait_list_empty(http_port, timeout=10)
+        await wait_list_empty(http_port, timeout=15)
     except TimeoutError:
         drained = False
 
@@ -387,7 +525,7 @@ async def scenario_reject(ctx) -> bool:
     await call.close()
     drained = True
     try:
-        await wait_list_empty(http_port, timeout=10)
+        await wait_list_empty(http_port, timeout=15)
     except TimeoutError:
         drained = False
 
@@ -555,7 +693,8 @@ async def main() -> int:
     parser.add_argument("--binary", help="path to active-call binary")
     parser.add_argument("--skip-soak", action="store_true")
     parser.add_argument(
-        "--only", help="comma-separated scenario names to run (options,basic_call,cancel,reject,soak)"
+        "--only",
+        help="comma-separated scenario names to run (options,basic_call,refer,cancel,reject,soak)",
     )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
@@ -600,17 +739,29 @@ async def main() -> int:
 
         selected = set(args.only.split(",")) if args.only else None
 
-        for name, coro in [
-            ("options", scenario_options(ctx)),
-            ("basic_call", scenario_basic_call(ctx)),
-            ("cancel", scenario_cancel(ctx)),
-            ("reject", scenario_reject(ctx)),
-        ]:
+        # NOTE: `options` runs after `basic_call` on purpose — the OPTIONS
+        # ACL only answers sources learned from call traffic (or the static
+        # [options_response] ACL), so at least one call must have happened.
+        #
+        # NOTE: `cancel` runs BEFORE `refer` on purpose — a CANCEL that
+        # arrives before the app-level invite task is picked up terminates
+        # the transaction with 487 and the webhook never fires; right after
+        # the refer scenario the server is still retransmitting the BYE to
+        # the killed transfer target, which makes losing that race much
+        # more likely.
+        scenarios = [
+            ("basic_call", scenario_basic_call),
+            ("options", scenario_options),
+            ("cancel", scenario_cancel),
+            ("reject", scenario_reject),
+            ("refer", scenario_refer),
+        ]
+        for name, scenario in scenarios:
             if selected is not None and name not in selected:
                 continue
             t0 = time.monotonic()
             try:
-                ok = await coro
+                ok = await scenario(ctx)
                 err = ""
             except Exception as e:  # noqa: BLE001
                 ok, err = False, f"{type(e).__name__}: {e}"
