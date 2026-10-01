@@ -710,6 +710,26 @@ Client -> server only. The server always answers with a fully-gathered candidate
 **Notes:**
 - Only meaningful once the initial offer/answer has already been exchanged (i.e. after `invite`/`accept`).
 - Applies to whichever track on the session is WebRTC-backed; a no-op on other track types.
+
+#### Renegotiate Command
+**Purpose:** Applies a new SDP offer to an already-established WebRTC session without recreating its track - e.g. an ICE restart (`RTCPeerConnection.restartIce()` + `createOffer()`) after the caller's network changed. DTLS/SRTP state is kept, so media resumes on the new path once ICE reconnects.
+
+The new answer is delivered as an [`answer`](#answer-event) event, same as for the initial `invite`.
+
+**Fields:**
+- `command` (string): Always "renegotiate"
+- `offer` (string): SDP offer
+
+```json
+{
+  "command": "renegotiate",
+  "offer": "v=0\r\no=- 123456789 3 IN IP4 127.0.0.1\r\n..."
+}
+```
+
+**Notes:**
+- Only valid once the initial offer/answer has already been exchanged; fails otherwise.
+- An offer carrying new `ice-ufrag`/`ice-pwd` restarts ICE on the server side too, so the answer carries fresh credentials.
 - A candidate sent before the PeerConnection exists is rejected with an error.
 
 ### CallOption Object Structure

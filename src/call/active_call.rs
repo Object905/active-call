@@ -1362,6 +1362,7 @@ impl ActiveCall {
                     .add_ice_candidate(&candidate, sdp_mid.as_deref(), sdp_mline_index)
                     .await
             }
+            Command::Renegotiate { offer } => self.do_renegotiate(offer).await,
         }
     }
 
@@ -1906,6 +1907,20 @@ impl ActiveCall {
                 timestamp: crate::media::get_timestamp(),
                 sender,
                 data,
+            })
+            .map(|_| ())
+            .map_err(Into::into)
+    }
+
+    async fn do_renegotiate(&self, offer: String) -> Result<()> {
+        let answer = self.media_stream.renegotiate(offer).await?;
+        info!(session_id = self.session_id, "renegotiated, sending answer");
+        self.event_sender
+            .send(SessionEvent::Answer {
+                timestamp: crate::media::get_timestamp(),
+                track_id: self.session_id.clone(),
+                sdp: answer,
+                refer: Some(false),
             })
             .map(|_| ())
             .map_err(Into::into)

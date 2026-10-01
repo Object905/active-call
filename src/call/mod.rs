@@ -129,6 +129,12 @@ pub enum Command {
         sdp_mid: Option<String>,
         sdp_mline_index: Option<u32>,
     },
+    /// Apply a new remote offer to the already-established WebRTC track
+    /// (e.g. an ICE restart after the caller's network changed). The new
+    /// answer is delivered as an `answer` event.
+    Renegotiate {
+        offer: String,
+    },
 }
 
 /// Routing state for managing stateful load balancing
