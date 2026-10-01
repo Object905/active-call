@@ -428,6 +428,24 @@ impl MediaStream {
         }
     }
 
+    /// Apply a new remote offer to the session's own (WebRTC) track without
+    /// recreating it, e.g. for an ICE restart, and return the new answer.
+    pub async fn renegotiate(&self, offer: String) -> Result<String> {
+        // hold the lock across the handshake (instead of taking the track out
+        // of the map like `handshake` does), so a trickled candidate for the
+        // new ICE generation waits for it rather than landing in
+        // `pending_ice_candidates`, which is only replayed on `update_track`
+        let mut tracks = self.tracks.lock().await;
+        let Some((track, _)) = tracks.get_mut(self.id.as_str()) else {
+            anyhow::bail!("track not found: {}", self.id)
+        };
+        let answer = track.handshake(offer, None).await?;
+        if answer.is_empty() {
+            anyhow::bail!("track {} does not support renegotiation", self.id)
+        }
+        Ok(answer)
+    }
+
     /// Trickle ICE: feed a remote candidate into the ICE-backed (WebRTC)
     /// track, if it's up yet, or buffer it for `update_track` to replay
     /// otherwise.
