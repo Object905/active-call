@@ -94,8 +94,10 @@ fn test_fast_sigmoid_boundary_no_panic() {
 
 fn load_pcm(bytes: &[u8]) -> Vec<i16> {
     bytes
-        .chunks_exact(2)
-        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| i16::from_le_bytes(*b))
         .collect()
 }
 
@@ -263,10 +265,10 @@ impl F32Reference {
             .zip(&m.lstm_b_hh)
             .map(|(a, b)| a + b)
             .collect();
-        for j in 0..HIDDEN_SIZE {
-            for g in 0..g4 {
-                gates[g] += e3[j] * m.lstm_w_ih.exact[j * g4 + g];
-                gates[g] += self.h[j] * m.lstm_w_hh.exact[j * g4 + g];
+        for (j, (&x, &h)) in e3.iter().zip(&self.h).enumerate() {
+            for (g, gate) in gates.iter_mut().enumerate() {
+                *gate += x * m.lstm_w_ih.exact[j * g4 + g];
+                *gate += h * m.lstm_w_hh.exact[j * g4 + g];
             }
         }
         for j in 0..HIDDEN_SIZE {
@@ -292,7 +294,9 @@ fn i16_vs_f32(pcm: &[i16], dequantized: bool) -> (f32, f32, usize, usize) {
     let got = probs(pcm);
     let mut reference = F32Reference::new(dequantized);
     let want: Vec<f32> = pcm
-        .chunks_exact(CHUNK_SIZE)
+        .as_chunks::<CHUNK_SIZE>()
+        .0
+        .iter()
         .map(|c| {
             let chunk: Vec<f32> = c.iter().map(|&s| s as f32 / 32768.0).collect();
             reference.predict(&chunk)

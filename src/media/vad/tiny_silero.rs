@@ -196,8 +196,10 @@ impl SileroModel {
             let data_len = read_u32(&mut offset, buffer) as usize;
             let data_bytes = &buffer[offset..offset + data_len];
             let data_f32: Vec<f32> = data_bytes
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
                 .collect();
             offset += data_len;
 
@@ -700,13 +702,16 @@ impl TinySilero {
             &rows[..n_rows],
         );
 
-        let chunk = HIDDEN_SIZE;
+        // Gate order in the packed pre-activations: I (input), F (forget), G (cell), O (output)
+        let (i_gates, rest) = session.buf_gates.split_at(HIDDEN_SIZE);
+        let (f_gates, rest) = rest.split_at(HIDDEN_SIZE);
+        let (g_gates, o_gates) = rest.split_at(HIDDEN_SIZE);
 
         for j in 0..HIDDEN_SIZE {
-            let i_gate = fast_sigmoid(session.buf_gates[0 * chunk + j]); // Position 0: I (Input)
-            let f_gate = fast_sigmoid(session.buf_gates[1 * chunk + j]); // Position 1: F (Forget)
-            let g_gate = fast_tanh(session.buf_gates[2 * chunk + j]); // Position 2: G (Cell/Gate)
-            let o_gate = fast_sigmoid(session.buf_gates[3 * chunk + j]); // Position 3: O (Output)
+            let i_gate = fast_sigmoid(i_gates[j]);
+            let f_gate = fast_sigmoid(f_gates[j]);
+            let g_gate = fast_tanh(g_gates[j]);
+            let o_gate = fast_sigmoid(o_gates[j]);
 
             let c_new = f_gate * session.c[0][j] + i_gate * g_gate;
             let h_val = o_gate * fast_tanh(c_new);

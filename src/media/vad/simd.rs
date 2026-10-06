@@ -60,7 +60,7 @@ pub fn fma_rows_multi<S: Simd, const T: usize, const U: usize>(
     for jj in j..oc {
         for t in 0..T {
             let mut acc = 0.0f32;
-            for (&r, xr) in rows.iter().zip(xs.chunks_exact(T)) {
+            for (&r, xr) in rows.iter().zip(xs.as_chunks::<T>().0) {
                 acc += w[r * oc + jj] as f32 * xr[t];
             }
             out[t * oc + jj] += acc * scales[jj];
@@ -83,7 +83,7 @@ fn fma_block<S: Simd, const T: usize, const U: usize>(
     let zero = S::f32s::splat(simd, 0.0);
     let mut acc = [[zero; U]; T];
 
-    for (&r, xr) in rows.iter().zip(xs.chunks_exact(T)) {
+    for (&r, xr) in rows.iter().zip(xs.as_chunks::<T>().0) {
         let start = r * oc + j;
         let wr = &w[start..start + U * n];
         let w_v = load_i16::<S, U>(simd, wr);
@@ -97,10 +97,10 @@ fn fma_block<S: Simd, const T: usize, const U: usize>(
 
     for u in 0..U {
         let scale_v = S::f32s::from_slice(simd, &scales[j + u * n..j + (u + 1) * n]);
-        for t in 0..T {
+        for (t, acc_t) in acc.iter().enumerate() {
             let start = t * oc + j + u * n;
             let out_v = S::f32s::from_slice(simd, &out[start..start + n]);
-            acc[t][u]
+            acc_t[u]
                 .mul_add(scale_v, out_v)
                 .store_slice(&mut out[start..start + n]);
         }
@@ -135,11 +135,11 @@ pub fn fma_rows<S: Simd>(
                 acc[u] = w_v[u].mul_add(x_vec, acc[u]);
             }
         }
-        for u in 0..UNROLL {
+        for (u, acc_u) in acc.iter().enumerate() {
             let range = j + u * n..j + (u + 1) * n;
             let scale_v = S::f32s::from_slice(simd, &scales[range.clone()]);
             let out_v = S::f32s::from_slice(simd, &out[range.clone()]);
-            acc[u].mul_add(scale_v, out_v).store_slice(&mut out[range]);
+            acc_u.mul_add(scale_v, out_v).store_slice(&mut out[range]);
         }
         j += UNROLL * n;
     }
