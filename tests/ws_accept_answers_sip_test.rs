@@ -1201,7 +1201,7 @@ async fn ws_cancel_before_first_command_tears_down_attached_call() {
         .try_init()
         .ok();
 
-    let mut node = spawn_node(35073, vec![]).await;
+    let mut node = spawn_node(35075, vec![]).await;
     let uac = SipUac::new(
         format!("127.0.0.1:{}", node.sip_port).parse().unwrap(),
         0,
