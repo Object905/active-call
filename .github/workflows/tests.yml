@@ -22,7 +22,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run tests
-        run: cargo test --workspace
+        # --no-fail-fast: run every test target so one red run reveals all
+        # failures instead of stopping at the first failing binary
+        run: cargo test --workspace --no-fail-fast
 
   test-aarch64:
     # covers the fearless_simd codegen paths on ARM (e.g. TinySilero VAD)
@@ -39,4 +41,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run tests
-        run: cargo test --workspace
+        # --no-fail-fast: run every test target so one red run reveals all
+        # failures instead of stopping at the first failing binary
+        run: cargo test --workspace --no-fail-fast
