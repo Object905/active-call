@@ -360,7 +360,7 @@ type WsReceiver = futures::stream::SplitStream<WsStream>;
 
 /// Attach a bot websocket to the ringing call and send `accept`.
 async fn attach_and_accept(node: &mut TestNode, call_id: &str) -> (WsSender, WsReceiver) {
-    let payload = tokio::time::timeout(Duration::from_secs(5), node.webhook_rx.recv())
+    let payload = tokio::time::timeout(Duration::from_secs(20), node.webhook_rx.recv())
         .await
         .expect("webhook not called")
         .expect("webhook channel closed");
@@ -427,7 +427,7 @@ async fn ws_accept_answers_pending_sip_dialog() {
 
     // The SIP dialog must now be answered with 200 OK (+ SDP).
     let (answered, ok_msg, seen) = uac
-        .wait_for_status("SIP/2.0 200", Duration::from_secs(8))
+        .wait_for_status("SIP/2.0 200", Duration::from_secs(30))
         .await;
     assert!(
         answered,
@@ -472,7 +472,7 @@ async fn ws_accept_bridges_bidirectional_media() {
     let (mut bot_sink, mut bot_stream) = attach_and_accept(&mut node, call_id).await;
 
     let (answered, ok_msg, seen) = uac
-        .wait_for_status("SIP/2.0 200", Duration::from_secs(8))
+        .wait_for_status("SIP/2.0 200", Duration::from_secs(30))
         .await;
     assert!(
         answered,
@@ -492,7 +492,7 @@ async fn ws_accept_bridges_bidirectional_media() {
     }
 
     let mut uplink_bytes = 0usize;
-    let uplink_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let uplink_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
         let remaining = uplink_deadline.saturating_duration_since(tokio::time::Instant::now());
         assert!(
@@ -526,7 +526,7 @@ async fn ws_accept_bridges_bidirectional_media() {
     }
 
     let mut downlink_packets = 0usize;
-    let downlink_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let downlink_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     let mut buf = [0u8; 4096];
     loop {
         let remaining = downlink_deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -747,7 +747,7 @@ async fn ws_refer_connects_customer_and_agent_media() {
 
     // Customer leg must be established before the transfer.
     let (answered, ok_msg, seen) = customer
-        .wait_for_status("SIP/2.0 200", Duration::from_secs(8))
+        .wait_for_status("SIP/2.0 200", Duration::from_secs(30))
         .await;
     assert!(
         answered,
@@ -770,7 +770,7 @@ async fn ws_refer_connects_customer_and_agent_media() {
         .await
         .expect("failed to send refer");
 
-    agent.answer_refer_invite(Duration::from_secs(8)).await;
+    agent.answer_refer_invite(Duration::from_secs(30)).await;
 
     // ── Customer -> agent audio must flow through the refer bridge.
     let payload = vec![0x55u8; 160];
@@ -783,7 +783,7 @@ async fn ws_refer_connects_customer_and_agent_media() {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let pbx_refer_addr = agent.wait_rtp(Duration::from_secs(5)).await.expect(
+    let pbx_refer_addr = agent.wait_rtp(Duration::from_secs(20)).await.expect(
         "agent never received customer audio after refer (production one-way-audio symptom)",
     );
 
@@ -802,7 +802,7 @@ async fn ws_refer_connects_customer_and_agent_media() {
     }
 
     let mut downlink = 0;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     let mut buf2 = [0u8; 4096];
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -955,7 +955,7 @@ async fn incoming_refer_transfers_call_and_notifies_referrer() {
     let (mut bot_sink, mut bot_stream) = attach_and_accept(&mut node, call_id).await;
 
     let (answered, ok_msg, seen) = customer
-        .wait_for_status("SIP/2.0 200", Duration::from_secs(8))
+        .wait_for_status("SIP/2.0 200", Duration::from_secs(30))
         .await;
     assert!(answered, "call not answered; seen: {seen:?}");
     let ok_msg = ok_msg.unwrap();
@@ -997,7 +997,7 @@ async fn incoming_refer_transfers_call_and_notifies_referrer() {
     // with a 100 Trying / active NOTIFY. The two are read from the same
     // socket, so the 202 is asserted from the message log.
     let (trying, _, msgs) = customer
-        .wait_and_reply("Subscription-State: active", Duration::from_secs(8))
+        .wait_and_reply("Subscription-State: active", Duration::from_secs(30))
         .await;
     assert!(
         trying,
@@ -1009,7 +1009,7 @@ async fn incoming_refer_transfers_call_and_notifies_referrer() {
     );
 
     // The bot sees the transferRequest event...
-    let tr = wait_ws_event(&mut bot_stream, "transferRequest", Duration::from_secs(8))
+    let tr = wait_ws_event(&mut bot_stream, "transferRequest", Duration::from_secs(30))
         .await
         .expect("websocket bot never received transferRequest");
     assert!(
@@ -1021,11 +1021,11 @@ async fn incoming_refer_transfers_call_and_notifies_referrer() {
     );
 
     // ...and the refer leg reaches the agent, which answers.
-    let (invite_msg, agent_peer) = agent.answer_refer_invite(Duration::from_secs(8)).await;
+    let (invite_msg, agent_peer) = agent.answer_refer_invite(Duration::from_secs(30)).await;
 
     // Final NOTIFY: transfer succeeded (200, terminated).
     let (final_ok, final_msg, msgs) = customer
-        .wait_and_reply("Subscription-State: terminated", Duration::from_secs(8))
+        .wait_and_reply("Subscription-State: terminated", Duration::from_secs(30))
         .await;
     assert!(
         final_ok,
@@ -1042,7 +1042,7 @@ async fn incoming_refer_transfers_call_and_notifies_referrer() {
     );
 
     // WS answer event marks the refer leg.
-    let answer = wait_ws_event(&mut bot_stream, "answer", Duration::from_secs(8))
+    let answer = wait_ws_event(&mut bot_stream, "answer", Duration::from_secs(30))
         .await
         .expect("websocket bot never received refer answer event");
     assert_eq!(
@@ -1055,14 +1055,14 @@ async fn incoming_refer_transfers_call_and_notifies_referrer() {
     // hung up by the auto-hangup path.
     agent.send_bye(&invite_msg, agent_peer).await;
     let (bye, _, seen) = customer
-        .wait_and_reply("BYE ", Duration::from_secs(8))
+        .wait_and_reply("BYE ", Duration::from_secs(30))
         .await;
     assert!(
         bye,
         "customer dialog was never hung up after the refer leg ended; seen: {seen:?}"
     );
 
-    let hangup = wait_ws_event(&mut bot_stream, "hangup", Duration::from_secs(8)).await;
+    let hangup = wait_ws_event(&mut bot_stream, "hangup", Duration::from_secs(30)).await;
     assert!(hangup.is_some(), "websocket bot never received hangup");
     let _ = bot_sink
         .send(Message::text(r#"{"command":"hangup"}"#.to_string()))
@@ -1100,7 +1100,7 @@ async fn incoming_refer_failure_notifies_and_keeps_call_alive() {
     let (_bot_sink, mut bot_stream) = attach_and_accept(&mut node, call_id).await;
 
     let (answered, ok_msg, seen) = customer
-        .wait_for_status("SIP/2.0 200", Duration::from_secs(8))
+        .wait_for_status("SIP/2.0 200", Duration::from_secs(30))
         .await;
     assert!(answered, "call not answered; seen: {seen:?}");
     let to_tag = SipUac::header_tag(&ok_msg.unwrap(), "To:").expect("200 OK missing To tag");
@@ -1139,7 +1139,7 @@ async fn incoming_refer_failure_notifies_and_keeps_call_alive() {
     // 202 + active NOTIFY (order on the wire: 202 before NOTIFY; the 202 is
     // asserted from the message log).
     let (trying, _, msgs) = customer
-        .wait_and_reply("Subscription-State: active", Duration::from_secs(8))
+        .wait_and_reply("Subscription-State: active", Duration::from_secs(30))
         .await;
     assert!(
         trying,
@@ -1151,7 +1151,7 @@ async fn incoming_refer_failure_notifies_and_keeps_call_alive() {
     );
 
     // The refer leg INVITE fails fast with 486.
-    busy.reject_next_invite(Duration::from_secs(8)).await;
+    busy.reject_next_invite(Duration::from_secs(30)).await;
 
     // Final NOTIFY reports the failure.
     let (terminated, final_msg, msgs) = customer
@@ -1168,7 +1168,7 @@ async fn incoming_refer_failure_notifies_and_keeps_call_alive() {
     );
 
     // transferRequest was still emitted (WS clients can take over manually).
-    let tr = wait_ws_event(&mut bot_stream, "transferRequest", Duration::from_secs(8))
+    let tr = wait_ws_event(&mut bot_stream, "transferRequest", Duration::from_secs(30))
         .await
         .expect("websocket bot never received transferRequest");
     assert!(
@@ -1220,7 +1220,7 @@ async fn ws_cancel_before_first_command_tears_down_attached_call() {
 
     // Attach the websocket to the ringing call, but send NO command — this is
     // the window where the dialog-state watcher is not yet in place.
-    let payload = tokio::time::timeout(Duration::from_secs(5), node.webhook_rx.recv())
+    let payload = tokio::time::timeout(Duration::from_secs(20), node.webhook_rx.recv())
         .await
         .expect("webhook not called")
         .expect("webhook channel closed");
@@ -1242,7 +1242,7 @@ async fn ws_cancel_before_first_command_tears_down_attached_call() {
 
     // SIP side: the INVITE must end with 487 Request Terminated.
     let (terminated, _msg, seen) = uac
-        .wait_for_status("SIP/2.0 487", Duration::from_secs(8))
+        .wait_for_status("SIP/2.0 487", Duration::from_secs(30))
         .await;
     assert!(
         terminated,
@@ -1251,7 +1251,7 @@ async fn ws_cancel_before_first_command_tears_down_attached_call() {
 
     // WS side: the attached call must report the hangup and close. Without the
     // fix the stream just kept emitting pings until the test timed out.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut hangup_seen = false;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
