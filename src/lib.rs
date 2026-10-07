@@ -147,6 +147,7 @@ impl CallOption {
         if let Some(sip) = &self.sip {
             invite_option.credential = Some(Credential {
                 username: sip.username.clone().unwrap_or_default(),
+                auth_username: None,
                 password: sip.password.clone().unwrap_or_default(),
                 realm: sip.realm.clone(),
             });

@@ -1091,7 +1091,7 @@ impl AppStateBuilder {
             SharedLearnedPeers::new(crate::useragent::peer_learning::LEARNED_PEERS_CAPACITY);
 
         let udp_inner = rsipstack::transport::udp::UdpInner {
-            conn: tokio_socket,
+            conn: std::sync::Arc::new(tokio_socket),
             addr: rsipstack::transport::SipAddr {
                 r#type: Some(rsipstack::rsip::transport::Transport::Udp),
                 addr: bind_addr.into(),
