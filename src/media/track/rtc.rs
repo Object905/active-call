@@ -1033,6 +1033,84 @@ a=sendrecv\r\n";
         }
     }
 
+    fn webrtc_offer(ufrag: &str, pwd: &str) -> String {
+        format!(
+            "v=0\r\n\
+o=- 123456 2 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=group:BUNDLE 0\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 0\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:{ufrag}\r\n\
+a=ice-pwd:{pwd}\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n\
+a=setup:actpass\r\n\
+a=mid:0\r\n\
+a=sendrecv\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:0 PCMU/8000\r\n"
+        )
+    }
+
+    fn sdp_attr(sdp: &str, name: &str) -> String {
+        let prefix = format!("a={name}:");
+        sdp.lines()
+            .find_map(|l| l.strip_prefix(&prefix))
+            .unwrap_or_else(|| panic!("no {name} in sdp: {sdp}"))
+            .trim()
+            .to_string()
+    }
+
+    /// A second offer with new ICE credentials (browser `restartIce()`) must be
+    /// answered on the same PeerConnection, with the answer carrying fresh
+    /// local ICE credentials while DTLS identity stays the same.
+    #[tokio::test]
+    async fn test_webrtc_reoffer_restarts_ice_on_same_peer_connection() {
+        let mut rtc_config = RtcTrackConfig::default();
+        rtc_config.mode = rustrtc::TransportMode::WebRtc;
+        rtc_config.enable_ice_lite = Some(true);
+        rtc_config.codecs = vec![CodecType::PCMU];
+
+        let mut track = RtcTrack::new(
+            CancellationToken::new(),
+            "test-track-webrtc".to_string(),
+            TrackConfig::default(),
+            rtc_config,
+        );
+
+        let answer_1 = track
+            .handshake(webrtc_offer("ufr1", "pwd1pwd1pwd1pwd1pwd1pwd1"), None)
+            .await
+            .expect("initial handshake");
+        let pc_1 = track.peer_connection.clone().expect("peer connection");
+
+        let answer_2 = track
+            .handshake(webrtc_offer("ufr2", "pwd2pwd2pwd2pwd2pwd2pwd2"), None)
+            .await
+            .expect("re-offer handshake");
+        let pc_2 = track.peer_connection.clone().expect("peer connection");
+
+        assert!(Arc::ptr_eq(&pc_1, &pc_2), "re-offer must reuse the pc");
+        assert_eq!(pc_2.get_transceivers().len(), 1);
+        assert_ne!(
+            sdp_attr(&answer_1, "ice-ufrag"),
+            sdp_attr(&answer_2, "ice-ufrag"),
+            "ICE restart must roll local credentials"
+        );
+        assert_ne!(
+            sdp_attr(&answer_1, "ice-pwd"),
+            sdp_attr(&answer_2, "ice-pwd")
+        );
+        assert_eq!(
+            sdp_attr(&answer_1, "fingerprint"),
+            sdp_attr(&answer_2, "fingerprint"),
+            "DTLS identity must survive an ICE restart"
+        );
+    }
+
     /// Build an RTP-mode RtcTrack that has already generated its local offer,
     /// returning the track together with its peer connection.
     async fn rtp_track_with_local_offer(id: &str) -> RtcTrack {
