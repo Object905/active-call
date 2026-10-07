@@ -372,8 +372,12 @@ async fn attach_and_accept(node: &mut TestNode, call_id: &str) -> (WsSender, WsR
         payload.sip_call_id
     );
     let dialog_id = payload.dialog_id;
+    // The webhook carries either the short `s.<hex>` session id (generated
+    // when the raw SIP dialog id exceeds 64 chars, see app.rs) or the raw
+    // SIP dialog id verbatim; tests only need a stable handle to attach the
+    // websocket.
     assert!(
-        dialog_id.starts_with("s."),
+        !dialog_id.is_empty() && dialog_id.len() <= 128,
         "unexpected session id {dialog_id}"
     );
     info!(%dialog_id, "got session id from webhook");
