@@ -131,7 +131,13 @@ impl ProcessorChain {
                 payload,
                 sequence_number,
             } => {
-                if TrackCodec::is_audio(*payload_type) {
+                // Decode only payload types negotiated as an audio codec;
+                // telephone-event (on any payload type) stays RTP.
+                if self
+                    .codec
+                    .get_codec_for_pt(*payload_type)
+                    .is_some_and(|codec| codec.is_audio())
+                {
                     let (decoded_sample_rate, channels, samples) =
                         self.codec.decode(*payload_type, &payload);
                     let src_packet = SourcePacket {

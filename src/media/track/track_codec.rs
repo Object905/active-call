@@ -93,15 +93,6 @@ impl TrackCodec {
             .or_else(|| CodecType::try_from(pt).ok())
     }
 
-    pub fn is_audio(payload_type: u8) -> bool {
-        match payload_type {
-            0 | 8 | 9 | 18 | 111 => true,
-            101 => false, // Telephone Event (DTMF) should not be decoded as audio
-            pt if pt >= 96 && pt <= 127 => true,
-            _ => false,
-        }
-    }
-
     /// Decode an RTP payload into PCM at the codec's native sample rate.
     /// Returns `(native_sample_rate, channels, samples)`; resampling to the
     /// pipeline rate is the caller's responsibility (see ProcessorChain).

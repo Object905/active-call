@@ -1651,6 +1651,33 @@ a=rtpmap:0 PCMU/8000\r\n"
         );
     }
 
+    #[test]
+    fn test_inbound_telephone_event_on_dynamic_pt_is_not_decoded() {
+        let sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 1234 RTP/AVP 111 110\r\na=rtpmap:111 opus/48000/2\r\na=rtpmap:110 telephone-event/48000\r\n";
+        let (mut track, _sink) = capture_track(sdp);
+        let mut frame = AudioFrame {
+            samples: Samples::RTP {
+                sequence_number: 1,
+                payload_type: 110,
+                payload: vec![5, 0x0a, 0x03, 0xc0],
+            },
+            sample_rate: 48000,
+            channels: 1,
+            ..Default::default()
+        };
+        track.processor_chain.process_frame(&mut frame).unwrap();
+        assert!(
+            matches!(
+                frame.samples,
+                Samples::RTP {
+                    payload_type: 110,
+                    ..
+                }
+            ),
+            "telephone-event must stay RTP so DTMF detection sees it"
+        );
+    }
+
     /// Build an RTP-mode RtcTrack that has already generated its local offer,
     /// returning the track together with its peer connection.
     async fn rtp_track_with_local_offer(id: &str) -> RtcTrack {
