@@ -458,6 +458,8 @@ Commands are sent as JSON messages through the WebSocket connection. All timesta
 
 On SIP/WebRTC legs the digit is sent as an RFC 4733 telephone-event using the payload type negotiated in SDP. If no telephone-event was negotiated, the digit is dropped. Outgoing audio (TTS, playback, bridged audio) is muted while the digit is on the wire and resumes afterwards. DTMF runs on its own track, so it does not interrupt playback and `interrupt` does not stop it. A new `dtmf` command replaces one that is still in progress, so to send several digits, wait for each digit's `trackEnd` before sending the next. To signal the other side of a bridge, send the command to that call's session.
 
+Telephone-event is negotiated automatically and does not need to be listed in `codecs`: `telephone-event/8000` is offered when any 8 kHz codec (PCMU, PCMA, G.722, G.729) is enabled, and `telephone-event/48000` when Opus is. The digit is sent with the telephone-event that shares the negotiated audio codec's clock rate; if the remote side accepted none at that rate, it is dropped.
+
 The digit's progress is reported as `trackStart` and `trackEnd` events with `trackId` `dtmf-track` and the given `playId`. `trackEnd` is sent once the final packet of the digit has been handed to the media layer.
 
 **Fields:**

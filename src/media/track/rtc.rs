@@ -110,6 +110,9 @@ struct DtmfTxState {
     last_update: Instant,
 }
 
+/// Payload type of the 48kHz telephone-event offered alongside Opus.
+const TELEPHONE_EVENT_48K_PAYLOAD_TYPE: u8 = 110;
+
 /// Retransmissions of the final (E=1) packet, per RFC 4733 §2.5.1.4.
 const DTMF_END_PACKET_COUNT: usize = 3;
 /// Volume field of generated events (-10 dBm0).
@@ -210,23 +213,56 @@ impl RtcTrack {
             .enable_latching
             .unwrap_or_else(|| self.rtc_config.mode == TransportMode::Rtp);
 
-        if !self.rtc_config.codecs.is_empty() {
-            let mut caps = MediaCapabilities::default();
-            caps.audio.clear();
-
-            for codec in &self.rtc_config.codecs {
-                let cap = match codec {
-                    CodecType::PCMU => AudioCapability::pcmu(),
-                    CodecType::PCMA => AudioCapability::pcma(),
-                    CodecType::G722 => AudioCapability::g722(),
-                    CodecType::G729 => AudioCapability::g729(),
-                    CodecType::TelephoneEvent => AudioCapability::telephone_event(),
-                    CodecType::Opus => AudioCapability::opus(),
-                };
-                caps.audio.push(cap);
+        // Audio codecs in the configured order (rustrtc's default audio set
+        // when none are configured), followed by one telephone-event per
+        // clock rate in use, in order of first appearance: DTMF must share
+        // the audio codec's clock, so it is derived rather than configured.
+        let audio = if self.rtc_config.codecs.is_empty() {
+            MediaCapabilities::default().audio
+        } else {
+            self.rtc_config
+                .codecs
+                .iter()
+                .filter_map(|codec| match codec {
+                    CodecType::PCMU => Some(AudioCapability::pcmu()),
+                    CodecType::PCMA => Some(AudioCapability::pcma()),
+                    CodecType::G722 => Some(AudioCapability::g722()),
+                    CodecType::G729 => Some(AudioCapability::g729()),
+                    CodecType::Opus => Some(AudioCapability::opus()),
+                    CodecType::TelephoneEvent => None,
+                })
+                .collect()
+        };
+        let mut caps = MediaCapabilities::default();
+        caps.audio.clear();
+        let mut event_clock_rates = Vec::new();
+        for cap in audio {
+            if cap.codec_name.eq_ignore_ascii_case("telephone-event")
+                || caps
+                    .audio
+                    .iter()
+                    .any(|c| c.payload_type == cap.payload_type)
+            {
+                continue;
             }
-            config.media_capabilities = Some(caps);
+            if !event_clock_rates.contains(&cap.clock_rate) {
+                event_clock_rates.push(cap.clock_rate);
+            }
+            caps.audio.push(cap);
         }
+        for clock_rate in event_clock_rates {
+            let payload_type = match clock_rate {
+                8000 => AudioCapability::telephone_event().payload_type,
+                48000 => TELEPHONE_EVENT_48K_PAYLOAD_TYPE,
+                _ => continue,
+            };
+            caps.audio.push(AudioCapability {
+                payload_type,
+                clock_rate,
+                ..AudioCapability::telephone_event()
+            });
+        }
+        config.media_capabilities = Some(caps);
 
         let peer_connection = Arc::new(PeerConnection::new(config));
         self.peer_connection = Some(peer_connection.clone());
@@ -1555,6 +1591,64 @@ a=rtpmap:0 PCMU/8000\r\n"
         let (_, marker) = track.next_media_timestamp(48000, Duration::from_millis(20));
         assert!(!marker);
         assert_eq!(track.anchor.clock_rate, 48000);
+    }
+
+    async fn offer_with_codecs(codecs: Vec<CodecType>) -> String {
+        let mut rtc_config = RtcTrackConfig::default();
+        rtc_config.mode = rustrtc::TransportMode::Rtp;
+        rtc_config.codecs = codecs;
+        let mut track = RtcTrack::new(
+            CancellationToken::new(),
+            "offer".to_string(),
+            TrackConfig::default(),
+            rtc_config,
+        );
+        track.create().await.expect("create peer connection");
+        track.local_description().await.expect("local offer")
+    }
+
+    /// Payload types of the offer's audio m-line, in order.
+    async fn offer_payload_types(codecs: Vec<CodecType>) -> Vec<String> {
+        let offer = offer_with_codecs(codecs).await;
+        offer
+            .lines()
+            .find_map(|l| l.strip_prefix("m=audio "))
+            .expect("audio m-line")
+            .split_whitespace()
+            .skip(2)
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_offer_derives_telephone_event_per_clock_rate() {
+        use CodecType::*;
+        let cases: Vec<(Vec<CodecType>, Vec<&str>)> = vec![
+            // 8kHz codecs get telephone-event/8000 (101), once.
+            (vec![PCMU, PCMA], vec!["0", "8", "101"]),
+            // Opus gets telephone-event/48000 (110).
+            (vec![Opus], vec!["111", "110"]),
+            // Both clocks, events in order of first appearance.
+            (vec![PCMU, Opus, G722], vec!["0", "111", "9", "101", "110"]),
+            (vec![Opus, PCMU], vec!["111", "0", "110", "101"]),
+            // A configured telephone_event entry is ignored, not duplicated.
+            (vec![TelephoneEvent, PCMU, TelephoneEvent], vec!["0", "101"]),
+            // No configured codecs: rustrtc's default audio set plus events.
+            (vec![], vec!["111", "0", "110", "101"]),
+        ];
+        for (codecs, expected) in cases {
+            let pts = offer_payload_types(codecs.clone()).await;
+            assert_eq!(pts, expected, "codecs {codecs:?}");
+        }
+        let offer = offer_with_codecs(vec![Opus, PCMU]).await;
+        assert!(
+            offer.contains("a=rtpmap:110 telephone-event/48000"),
+            "{offer}"
+        );
+        assert!(
+            offer.contains("a=rtpmap:101 telephone-event/8000"),
+            "{offer}"
+        );
     }
 
     /// Build an RTP-mode RtcTrack that has already generated its local offer,
