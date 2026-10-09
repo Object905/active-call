@@ -37,6 +37,15 @@ pub enum Samples {
         payload_type: u8,
         payload: PayloadBuf,
     },
+    /// Transport-agnostic DTMF event update (RFC 4733 semantics). Emitted once
+    /// per ptime while a digit is held; `duration_ms` is cumulative since the
+    /// event started, `end` marks the final update. RTP tracks map it to the
+    /// negotiated telephone-event payload type and clock.
+    Dtmf {
+        event: u8,
+        duration_ms: u32,
+        end: bool,
+    },
     Empty,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]

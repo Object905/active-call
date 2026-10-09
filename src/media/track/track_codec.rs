@@ -8,10 +8,16 @@ use audio_codec::{
 };
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tracing::warn;
 
 use audio_codec::g729::{G729Decoder, G729Encoder};
 use audio_codec::opus::{OpusDecoder, OpusEncoder};
+
+/// Convert an audio duration to RTP clock ticks.
+pub fn duration_to_rtp_ticks(duration: Duration, clock_rate: u32) -> u32 {
+    (duration.as_nanos() * clock_rate as u128 / 1_000_000_000) as u32
+}
 
 pub struct TrackCodec {
     pcmu_encoder: PcmuEncoder,
@@ -263,5 +269,20 @@ mod tests {
         assert_eq!(codec.resample(samples.clone(), 0, 16000), samples);
         assert_eq!(codec.resample(samples.clone(), 16000, 0), samples);
         assert_eq!(codec.resample(samples.clone(), 0, 0), samples);
+    }
+}
+
+#[cfg(test)]
+mod duration_tests {
+    use super::*;
+
+    #[test]
+    fn test_duration_to_rtp_ticks() {
+        assert_eq!(duration_to_rtp_ticks(Duration::from_millis(20), 8000), 160);
+        assert_eq!(duration_to_rtp_ticks(Duration::from_millis(20), 48000), 960);
+        assert_eq!(
+            duration_to_rtp_ticks(Duration::from_micros(2_500), 48000),
+            120
+        );
     }
 }

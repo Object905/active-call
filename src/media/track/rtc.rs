@@ -1,4 +1,4 @@
-use super::track_codec::TrackCodec;
+use super::track_codec::{TrackCodec, duration_to_rtp_ticks};
 use crate::{
     event::{EventSender, SessionEvent},
     media::AudioFrame,
@@ -79,10 +79,45 @@ pub struct RtcTrack {
     pub peer_connection: Option<Arc<PeerConnection>>,
     next_rtp_timestamp: u32,
     next_rtp_sequence_number: u16,
-    last_packet_time: Option<Instant>,
+    /// Wall-clock anchor of the media clock, created with the track.
+    anchor: MediaAnchor,
     last_remote_sdp: Option<String>,
-    need_marker: bool,
+    /// Negotiated telephone-event payload types as `(pt, clock_rate)`.
+    telephone_events: Vec<(u8, u32)>,
+    /// Outbound telephone-event in progress, if any.
+    dtmf_tx: Option<DtmfTxState>,
 }
+
+/// Fixed point tying the RTP media clock to the wall clock: at `instant`
+/// the clock was at `rtp_timestamp`, ticking at `clock_rate` (0 until the
+/// first packet).
+struct MediaAnchor {
+    instant: Instant,
+    rtp_timestamp: u32,
+    clock_rate: u32,
+}
+
+/// RFC 4733 send state for the event currently on the wire.
+struct DtmfTxState {
+    event: u8,
+    payload_type: u8,
+    /// RTP timestamp of the event start; constant for all its packets.
+    rtp_timestamp: u32,
+    /// RTP clock of the audio codec, also used for the duration field.
+    clock_rate: u32,
+    duration_ms: u32,
+    ended: bool,
+    last_update: Instant,
+}
+
+/// Retransmissions of the final (E=1) packet, per RFC 4733 §2.5.1.4.
+const DTMF_END_PACKET_COUNT: usize = 3;
+/// Volume field of generated events (-10 dBm0).
+const DTMF_VOLUME: u8 = 10;
+/// An event with no update for this long is treated as ended.
+const DTMF_STALE_TIMEOUT: Duration = Duration::from_millis(1000);
+/// Re-anchor the media clock once wall clock runs this far ahead of it.
+const MEDIA_GAP_THRESHOLD: Duration = Duration::from_millis(30);
 
 impl RtcTrack {
     pub fn new(
@@ -92,6 +127,8 @@ impl RtcTrack {
         rtc_config: RtcTrackConfig,
     ) -> Self {
         let processor_chain = ProcessorChain::new(track_config.samplerate);
+        // RFC 3550 §5.1: the initial timestamp should be random.
+        let initial_rtp_timestamp = rand::random();
         Self {
             track_id: id,
             track_config,
@@ -106,11 +143,16 @@ impl RtcTrack {
             ssrc: 0,
             payload_type: None,
             peer_connection: None,
-            next_rtp_timestamp: 0,
+            next_rtp_timestamp: initial_rtp_timestamp,
             next_rtp_sequence_number: 0,
-            last_packet_time: None,
+            anchor: MediaAnchor {
+                instant: Instant::now(),
+                rtp_timestamp: initial_rtp_timestamp,
+                clock_rate: 0,
+            },
             last_remote_sdp: None,
-            need_marker: false,
+            telephone_events: Vec::new(),
+            dtmf_tx: None,
         }
     }
 
@@ -497,16 +539,22 @@ impl RtcTrack {
             .iter()
             .find(|m| m.kind == MediaKind::Audio)
         {
+            let mut telephone_events = Vec::new();
             for attr in &media.attributes {
                 if attr.key == "rtpmap" {
                     if let Some(value) = &attr.value {
-                        if let Ok((pt, codec, _, _)) = parse_rtpmap(value) {
+                        if let Ok((pt, codec, clock_rate, _)) = parse_rtpmap(value) {
+                            if codec == CodecType::TelephoneEvent {
+                                telephone_events.push((pt, clock_rate));
+                            }
                             self.encoder.set_payload_type(pt, codec.clone());
                             self.processor_chain.codec.set_payload_type(pt, codec);
                         }
                     }
                 }
             }
+
+            self.telephone_events = telephone_events;
 
             // Negotiate primary audio codec
             let mut negotiated = None;
@@ -777,103 +825,43 @@ impl Track for RtcTrack {
     }
 
     async fn send_packet(&mut self, packet: &AudioFrame) -> Result<()> {
-        let packet = packet.clone();
+        let Some(source) = self.local_source.clone() else {
+            return Ok(());
+        };
 
-        if let Some(source) = &self.local_source {
-            match &packet.samples {
-                crate::media::Samples::PCM { samples } => {
-                    let payload_type = self.get_payload_type();
-                    let (_, encoded) = self.encoder.encode(payload_type, packet.clone());
-                    let target_codec = self
-                        .encoder
-                        .get_codec_for_pt(payload_type)
-                        .ok_or_else(|| anyhow::anyhow!("Invalid codec type: {}", payload_type))?;
-                    if !encoded.is_empty() {
-                        let clock_rate = target_codec.clock_rate();
-
-                        let now = Instant::now();
-                        if let Some(last_time) = self.last_packet_time {
-                            let elapsed = now.duration_since(last_time);
-                            if elapsed.as_millis() > 50 {
-                                let gap_increment =
-                                    (elapsed.as_millis() as u32 * clock_rate) / 1000;
-                                self.next_rtp_timestamp += gap_increment;
-                                self.need_marker = true;
-                            }
-                        }
-
-                        self.last_packet_time = Some(now);
-
-                        let timestamp_increment = (samples.len() as u64 * clock_rate as u64
-                            / packet.sample_rate as u64
-                            / self.track_config.channels as u64)
-                            as u32;
-                        let rtp_timestamp = self.next_rtp_timestamp;
-                        self.next_rtp_timestamp += timestamp_increment;
-                        let sequence_number = self.next_rtp_sequence_number;
-                        self.next_rtp_sequence_number += 1;
-
-                        let mut marker = false;
-                        if self.need_marker {
-                            marker = true;
-                            self.need_marker = false;
-                        }
-
-                        let frame = RtcAudioFrame {
-                            data: Bytes::from(encoded),
-                            clock_rate,
-                            payload_type: Some(payload_type),
-                            sequence_number: Some(sequence_number),
-                            rtp_timestamp,
-                            marker,
-                            ..Default::default()
-                        };
-                        source.try_send_audio(frame).ok();
-                    }
-                }
-                crate::media::Samples::RTP {
-                    payload,
-                    payload_type,
-                    sequence_number,
-                } => {
-                    let target_codec = self
-                        .encoder
-                        .get_codec_for_pt(*payload_type)
-                        .ok_or_else(|| anyhow::anyhow!("Invalid codec type: {}", payload_type))?;
+        match &packet.samples {
+            crate::media::Samples::Dtmf {
+                event,
+                duration_ms,
+                end,
+            } => {
+                self.send_dtmf_update(&source, *event, *duration_ms, *end);
+            }
+            _ if self.dtmf_event_active() => {
+                // Audio is muted while a telephone-event is in progress.
+            }
+            crate::media::Samples::PCM { samples } => {
+                let payload_type = self.get_payload_type();
+                let (_, encoded) = self.encoder.encode(payload_type, packet.clone());
+                let target_codec = self
+                    .encoder
+                    .get_codec_for_pt(payload_type)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid codec type: {}", payload_type))?;
+                if !encoded.is_empty() {
                     let clock_rate = target_codec.clock_rate();
-
-                    let now = Instant::now();
-                    if let Some(last_time) = self.last_packet_time {
-                        let elapsed = now.duration_since(last_time);
-                        if elapsed.as_millis() > 50 {
-                            let gap_increment = (elapsed.as_millis() as u32 * clock_rate) / 1000;
-                            self.next_rtp_timestamp += gap_increment;
-                            self.need_marker = true;
-                        }
-                    }
-                    self.last_packet_time = Some(now);
-
-                    let increment = match *payload_type {
-                        0 | 8 | 18 => payload.len() as u32,
-                        9 => payload.len() as u32,
-                        111 => (clock_rate / 50) as u32,
-                        _ => (clock_rate / 50) as u32,
+                    let frames = samples.len() as u64 / packet.channels.max(1) as u64;
+                    let duration = if packet.sample_rate > 0 {
+                        Duration::from_nanos(frames * 1_000_000_000 / packet.sample_rate as u64)
+                    } else {
+                        self.track_config.ptime
                     };
-
-                    let rtp_timestamp = self.next_rtp_timestamp;
-                    self.next_rtp_timestamp += increment;
-                    let sequence_number = *sequence_number;
-
-                    let mut marker = false;
-                    if self.need_marker {
-                        marker = true;
-                        self.need_marker = false;
-                    }
+                    let (rtp_timestamp, marker) = self.next_media_timestamp(clock_rate, duration);
+                    let sequence_number = self.next_sequence_number();
 
                     let frame = RtcAudioFrame {
-                        data: Bytes::from(payload.clone()),
+                        data: Bytes::from(encoded),
                         clock_rate,
-                        payload_type: Some(*payload_type),
+                        payload_type: Some(payload_type),
                         sequence_number: Some(sequence_number),
                         rtp_timestamp,
                         marker,
@@ -881,8 +869,33 @@ impl Track for RtcTrack {
                     };
                     source.try_send_audio(frame).ok();
                 }
-                _ => {}
             }
+            crate::media::Samples::RTP {
+                payload,
+                payload_type,
+                ..
+            } => {
+                let target_codec = self
+                    .encoder
+                    .get_codec_for_pt(*payload_type)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid codec type: {}", payload_type))?;
+                let clock_rate = target_codec.clock_rate();
+                let (rtp_timestamp, marker) =
+                    self.next_media_timestamp(clock_rate, self.track_config.ptime);
+                let sequence_number = self.next_sequence_number();
+
+                let frame = RtcAudioFrame {
+                    data: Bytes::from(payload.clone()),
+                    clock_rate,
+                    payload_type: Some(*payload_type),
+                    sequence_number: Some(sequence_number),
+                    rtp_timestamp,
+                    marker,
+                    ..Default::default()
+                };
+                source.try_send_audio(frame).ok();
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -903,6 +916,168 @@ impl Track for RtcTrack {
 }
 
 impl RtcTrack {
+    fn next_sequence_number(&mut self) -> u16 {
+        let seq = self.next_rtp_sequence_number;
+        self.next_rtp_sequence_number = seq.wrapping_add(1);
+        seq
+    }
+
+    /// Timestamp and marker for an outgoing media packet carrying
+    /// `duration` of audio. The clock advances by exactly that duration in
+    /// `clock_rate` ticks, after syncing to the wall clock; the marker is set
+    /// on the packet where the clock jumped.
+    fn next_media_timestamp(&mut self, clock_rate: u32, duration: Duration) -> (u32, bool) {
+        let marker = self.sync_media_clock(clock_rate);
+        let rtp_timestamp = self.next_rtp_timestamp;
+        self.next_rtp_timestamp =
+            rtp_timestamp.wrapping_add(duration_to_rtp_ticks(duration, clock_rate));
+        (rtp_timestamp, marker)
+    }
+
+    /// Sync the media clock to the wall clock. The wall-clock position is
+    /// the anchor timestamp plus the time elapsed since the anchor instant;
+    /// when it is ahead of the media clock by more than
+    /// `MEDIA_GAP_THRESHOLD` (a gap in the outgoing audio, or accumulated
+    /// drift), jump to it. Returns whether it jumped. The clock never moves
+    /// backwards.
+    fn sync_media_clock(&mut self, clock_rate: u32) -> bool {
+        let elapsed = duration_to_rtp_ticks(self.anchor.instant.elapsed(), clock_rate);
+        if self.anchor.clock_rate != clock_rate {
+            // First packet or codec change: keep the instant and re-express
+            // the anchor in this clock so the media clock continues from here.
+            self.anchor.rtp_timestamp = self.next_rtp_timestamp.wrapping_sub(elapsed);
+            self.anchor.clock_rate = clock_rate;
+            return false;
+        }
+        let wall_timestamp = self.anchor.rtp_timestamp.wrapping_add(elapsed);
+        let ahead = wall_timestamp.wrapping_sub(self.next_rtp_timestamp) as i32;
+        if ahead <= duration_to_rtp_ticks(MEDIA_GAP_THRESHOLD, clock_rate) as i32 {
+            return false;
+        }
+        self.next_rtp_timestamp = wall_timestamp;
+        true
+    }
+
+    /// Whether a telephone-event is on the wire, muting regular audio.
+    /// Events whose source stopped updating without an end are closed here.
+    fn dtmf_event_active(&mut self) -> bool {
+        let stale = match &self.dtmf_tx {
+            Some(state) if !state.ended => state.last_update.elapsed() > DTMF_STALE_TIMEOUT,
+            _ => return false,
+        };
+        if stale {
+            debug!(track_id=%self.track_id, "telephone-event timed out without end");
+            self.finish_dtmf_event();
+            return false;
+        }
+        true
+    }
+
+    /// The negotiated telephone-event payload type sharing the audio clock.
+    fn telephone_event_payload_type(&self, clock_rate: u32) -> Option<u8> {
+        self.telephone_events
+            .iter()
+            .find(|(_, rate)| *rate == clock_rate)
+            .map(|(pt, _)| *pt)
+    }
+
+    /// Map a transport-agnostic DTMF update onto RFC 4733 packets: a new
+    /// event takes the current media timestamp and sets the marker bit, every
+    /// update of the same event reuses that timestamp with a growing
+    /// duration, and the end update is sent `DTMF_END_PACKET_COUNT` times.
+    fn send_dtmf_update(
+        &mut self,
+        source: &SampleStreamSource,
+        event: u8,
+        duration_ms: u32,
+        end: bool,
+    ) {
+        let in_progress = matches!(
+            &self.dtmf_tx,
+            Some(state) if state.event == event && !state.ended
+        );
+
+        let marker = if in_progress {
+            false
+        } else {
+            if self.dtmf_event_active() {
+                // A different event started before the previous one ended.
+                self.finish_dtmf_event();
+            }
+            let clock_rate = self
+                .encoder
+                .get_codec_for_pt(self.get_payload_type())
+                .map(|codec| codec.clock_rate())
+                .unwrap_or(8000);
+            let Some(payload_type) = self.telephone_event_payload_type(clock_rate) else {
+                debug!(track_id=%self.track_id, event, clock_rate, "no telephone-event negotiated at the audio clock, dropping DTMF");
+                return;
+            };
+            self.sync_media_clock(clock_rate);
+            self.dtmf_tx = Some(DtmfTxState {
+                event,
+                payload_type,
+                rtp_timestamp: self.next_rtp_timestamp,
+                clock_rate,
+                duration_ms: 0,
+                ended: false,
+                last_update: Instant::now(),
+            });
+            true
+        };
+
+        let Some(state) = self.dtmf_tx.as_mut() else {
+            return;
+        };
+        state.duration_ms = duration_ms;
+        state.last_update = Instant::now();
+        let duration =
+            duration_to_rtp_ticks(Duration::from_millis(duration_ms as u64), state.clock_rate)
+                .min(u16::MAX as u32) as u16;
+        let [duration_hi, duration_lo] = duration.to_be_bytes();
+        let payload = Bytes::from(vec![
+            event,
+            if end { 0x80 } else { 0 } | DTMF_VOLUME,
+            duration_hi,
+            duration_lo,
+        ]);
+        let (payload_type, rtp_timestamp, clock_rate) =
+            (state.payload_type, state.rtp_timestamp, state.clock_rate);
+
+        let copies = if end { DTMF_END_PACKET_COUNT } else { 1 };
+        for i in 0..copies {
+            let frame = RtcAudioFrame {
+                data: payload.clone(),
+                clock_rate,
+                payload_type: Some(payload_type),
+                sequence_number: Some(self.next_sequence_number()),
+                rtp_timestamp,
+                marker: marker && i == 0,
+                ..Default::default()
+            };
+            source.try_send_audio(frame).ok();
+        }
+
+        if end {
+            self.finish_dtmf_event();
+        }
+    }
+
+    /// Close the current event and resume the media clock after it.
+    fn finish_dtmf_event(&mut self) {
+        let Some(state) = self.dtmf_tx.as_mut() else {
+            return;
+        };
+        if state.ended {
+            return;
+        }
+        state.ended = true;
+        let duration = Duration::from_millis(state.duration_ms as u64);
+        self.next_rtp_timestamp = state
+            .rtp_timestamp
+            .wrapping_add(duration_to_rtp_ticks(duration, state.clock_rate));
+    }
+
     fn get_payload_type(&self) -> u8 {
         if let Some(pt) = self.payload_type {
             return pt;
@@ -1109,6 +1284,277 @@ a=rtpmap:0 PCMU/8000\r\n"
             sdp_attr(&answer_2, "fingerprint"),
             "DTLS identity must survive an ICE restart"
         );
+    }
+
+    use crate::media::Samples;
+    use rustrtc::media::frame::MediaSample;
+
+    /// Track with a captured outbound sample queue and the given remote SDP
+    /// applied, so `send_packet` output can be inspected without a network.
+    fn capture_track(sdp: &str) -> (RtcTrack, Arc<SampleStreamTrack>) {
+        let mut track = RtcTrack::new(
+            CancellationToken::new(),
+            "capture".to_string(),
+            TrackConfig::default(),
+            RtcTrackConfig::default(),
+        );
+        track
+            .parse_sdp_payload_types(rustrtc::SdpType::Offer, sdp)
+            .expect("parse sdp");
+        let (source, sink) = RtcTrack::create_audio_track(CodecType::PCMU, None);
+        track.local_source = Some(source);
+        (track, sink)
+    }
+
+    async fn drain(sink: &SampleStreamTrack) -> Vec<RtcAudioFrame> {
+        let mut frames = Vec::new();
+        while let Ok(Ok(sample)) =
+            tokio::time::timeout(Duration::from_millis(20), sink.recv()).await
+        {
+            if let MediaSample::Audio(frame) = sample {
+                frames.push(frame);
+            }
+        }
+        frames
+    }
+
+    fn pcm_frame(sample_rate: u32) -> AudioFrame {
+        AudioFrame {
+            track_id: "tts".to_string(),
+            samples: Samples::PCM {
+                samples: vec![0; (sample_rate / 50) as usize],
+            },
+            sample_rate,
+            channels: 1,
+            ..Default::default()
+        }
+    }
+
+    fn dtmf_frame(event: u8, duration_ms: u32, end: bool) -> AudioFrame {
+        AudioFrame {
+            track_id: "dtmf-track".to_string(),
+            samples: Samples::Dtmf {
+                event,
+                duration_ms,
+                end,
+            },
+            ..Default::default()
+        }
+    }
+
+    /// (pt, ts, marker, event, end, duration)
+    fn te_fields(frame: &RtcAudioFrame) -> (u8, u32, bool, u8, bool, u16) {
+        let p = &frame.data;
+        assert_eq!(p.len(), 4, "telephone-event payload");
+        (
+            frame.payload_type.unwrap(),
+            frame.rtp_timestamp,
+            frame.marker,
+            p[0],
+            p[1] & 0x80 != 0,
+            u16::from_be_bytes([p[2], p[3]]),
+        )
+    }
+
+    const PCMU_TE_SDP: &str = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 1234 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n";
+
+    #[tokio::test]
+    async fn test_dtmf_event_maps_to_rfc4733_packets() {
+        let (mut track, sink) = capture_track(PCMU_TE_SDP);
+
+        track.send_packet(&pcm_frame(8000)).await.unwrap();
+        track.send_packet(&dtmf_frame(5, 20, false)).await.unwrap();
+        // Audio during the event is muted.
+        track.send_packet(&pcm_frame(8000)).await.unwrap();
+        track.send_packet(&dtmf_frame(5, 40, false)).await.unwrap();
+        track.send_packet(&dtmf_frame(5, 60, true)).await.unwrap();
+        track.send_packet(&pcm_frame(8000)).await.unwrap();
+
+        let frames = drain(&sink).await;
+        assert_eq!(
+            frames.len(),
+            1 + 2 + 3 + 1,
+            "audio, 2 updates, 3 ends, audio"
+        );
+
+        assert_eq!(frames[0].payload_type, Some(0));
+        let event_ts = frames[0].rtp_timestamp.wrapping_add(160);
+
+        let te: Vec<_> = frames[1..6].iter().map(te_fields).collect();
+        assert_eq!(te[0], (101, event_ts, true, 5, false, 160));
+        assert_eq!(te[1], (101, event_ts, false, 5, false, 320));
+        for end in &te[2..] {
+            assert_eq!(*end, (101, event_ts, false, 5, true, 480));
+        }
+
+        // Sequence numbers keep increasing across audio and events.
+        let seqs: Vec<u16> = frames.iter().map(|f| f.sequence_number.unwrap()).collect();
+        assert!(
+            seqs.windows(2).all(|w| w[1] == w[0].wrapping_add(1)),
+            "{seqs:?}"
+        );
+
+        // Audio resumes right after the event on the media timeline.
+        let resumed = &frames[6];
+        assert_eq!(resumed.payload_type, Some(0));
+        assert!(!resumed.marker);
+        assert_eq!(resumed.rtp_timestamp.wrapping_sub(event_ts), 480);
+    }
+
+    #[tokio::test]
+    async fn test_dtmf_new_event_gets_new_timestamp() {
+        let (mut track, sink) = capture_track(PCMU_TE_SDP);
+
+        track.send_packet(&dtmf_frame(1, 20, true)).await.unwrap();
+        track.send_packet(&dtmf_frame(1, 20, false)).await.unwrap();
+        track.send_packet(&dtmf_frame(1, 40, true)).await.unwrap();
+
+        let te: Vec<_> = drain(&sink).await.iter().map(te_fields).collect();
+        assert_eq!(te.len(), 3 + 1 + 3);
+        let (first_ts, second_ts) = (te[0].1, te[3].1);
+        assert!(te[3].2, "second press starts with marker");
+        assert_eq!(
+            second_ts.wrapping_sub(first_ts),
+            160,
+            "{first_ts} -> {second_ts}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dtmf_uses_matching_clock_and_skips_without_negotiation() {
+        let opus_sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 1234 RTP/AVP 111 101 110\r\na=rtpmap:111 opus/48000/2\r\na=rtpmap:101 telephone-event/8000\r\na=rtpmap:110 telephone-event/48000\r\n";
+        let (mut track, sink) = capture_track(opus_sdp);
+        track.send_packet(&dtmf_frame(3, 20, false)).await.unwrap();
+        let te: Vec<_> = drain(&sink).await.iter().map(te_fields).collect();
+        assert_eq!((te[0].0, te[0].5), (110, 960));
+
+        let (mut track, sink) = capture_track(PCMU_SDP_1);
+        track.send_packet(&dtmf_frame(3, 20, false)).await.unwrap();
+        assert!(drain(&sink).await.is_empty());
+        // No event was opened, so audio is not muted.
+        track.send_packet(&pcm_frame(8000)).await.unwrap();
+        assert_eq!(drain(&sink).await.len(), 1);
+    }
+
+    fn rtp_frame(payload_type: u8, payload: Vec<u8>) -> AudioFrame {
+        AudioFrame {
+            track_id: "peer".to_string(),
+            samples: Samples::RTP {
+                sequence_number: 9999,
+                payload_type,
+                payload,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn ts_deltas(frames: &[RtcAudioFrame]) -> Vec<u32> {
+        frames
+            .windows(2)
+            .map(|w| w[1].rtp_timestamp.wrapping_sub(w[0].rtp_timestamp))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_timestamp_advances_by_audio_duration() {
+        let (mut track, sink) = capture_track(PCMU_TE_SDP);
+
+        // PCM at the internal 16kHz rate: 10ms and 20ms of audio.
+        let pcm = |samples: usize| AudioFrame {
+            samples: Samples::PCM {
+                samples: vec![0; samples],
+            },
+            sample_rate: 16000,
+            channels: 1,
+            ..Default::default()
+        };
+        track.send_packet(&pcm(160)).await.unwrap();
+        track.send_packet(&pcm(320)).await.unwrap();
+        // 20ms at 8kHz.
+        track.send_packet(&pcm_frame(8000)).await.unwrap();
+        // Encoded RTP advances by the track ptime (20ms).
+        track
+            .send_packet(&rtp_frame(0, vec![0; 160]))
+            .await
+            .unwrap();
+        track.send_packet(&pcm(320)).await.unwrap();
+        track.send_packet(&pcm(320)).await.unwrap();
+
+        let frames = drain(&sink).await;
+        assert_eq!(frames.len(), 6);
+        assert_eq!(ts_deltas(&frames), vec![80, 160, 160, 160, 160]);
+
+        // Sequence numbers come from this track, not the source frame.
+        let seqs: Vec<u16> = frames.iter().map(|f| f.sequence_number.unwrap()).collect();
+        assert!(
+            seqs.windows(2).all(|w| w[1] == w[0].wrapping_add(1)),
+            "{seqs:?}"
+        );
+        assert!(!frames.iter().any(|f| f.marker));
+    }
+
+    #[tokio::test]
+    async fn test_timestamp_reanchors_to_wall_clock_after_gap() {
+        let (mut track, sink) = capture_track(PCMU_TE_SDP);
+
+        track.send_packet(&pcm_frame(8000)).await.unwrap();
+        let gap_start = Instant::now();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let gap = gap_start.elapsed();
+        track.send_packet(&pcm_frame(8000)).await.unwrap();
+
+        let frames = drain(&sink).await;
+        assert_eq!(frames.len(), 2);
+        assert!(frames[1].marker, "talkspurt after the gap is marked");
+        // The second packet sits at the wall-clock position of the gap, not
+        // gap + the first packet's 20ms.
+        let delta = ts_deltas(&frames)[0];
+        let expected = duration_to_rtp_ticks(gap, 8000);
+        assert!(
+            delta.abs_diff(expected) <= 40,
+            "delta {delta}, expected ~{expected}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_timestamp_corrects_accumulated_drift() {
+        let (mut track, _sink) = capture_track(PCMU_TE_SDP);
+        let started = Instant::now();
+        let (start, _) = track.next_media_timestamp(8000, Duration::from_millis(20));
+
+        // A producer emitting 20ms packets every ~25ms falls further behind
+        // the wall clock each packet, while no single packet is a gap.
+        let mut jumped = None;
+        for i in 1..=20 {
+            std::thread::sleep(Duration::from_millis(25));
+            let (ts, marker) = track.next_media_timestamp(8000, Duration::from_millis(20));
+            if marker {
+                jumped = Some((i, ts, started.elapsed()));
+                break;
+            }
+        }
+        let (i, ts, wall) = jumped.expect("drift beyond the threshold must be corrected");
+        assert!(i > 1, "a single late packet is not drift");
+
+        // The corrected packet sits at the wall-clock position.
+        let clock = ts.wrapping_sub(start);
+        let expected = duration_to_rtp_ticks(wall, 8000);
+        assert!(
+            clock.abs_diff(expected) <= 40,
+            "clock {clock}, wall ~{expected}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_clock_rate_change_reanchors_without_jump() {
+        let (mut track, _sink) = capture_track(PCMU_TE_SDP);
+        track.next_media_timestamp(8000, Duration::from_millis(20));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Elapsed time measured in the new clock would look like a large
+        // gap if the old anchor were reused.
+        let (_, marker) = track.next_media_timestamp(48000, Duration::from_millis(20));
+        assert!(!marker);
+        assert_eq!(track.anchor.clock_rate, 48000);
     }
 
     /// Build an RTP-mode RtcTrack that has already generated its local offer,

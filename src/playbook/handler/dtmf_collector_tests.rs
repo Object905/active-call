@@ -641,3 +641,52 @@ dtmfCollectors:
     assert_eq!(code.digits, Some(6));
     assert_eq!(code.finish_key, None); // Not specified
 }
+
+#[tokio::test]
+async fn test_dtmf_track_lifecycle_does_not_change_speaking_state() {
+    use crate::media::track::dtmf::DTMF_TRACK_ID;
+
+    let mut handler = create_test_handler(None);
+    handler.is_speaking = true;
+    handler.is_hanging_up = true;
+
+    let track_event = |track_id: &str, end: bool| {
+        if end {
+            SessionEvent::TrackEnd {
+                track_id: track_id.to_string(),
+                timestamp: 0,
+                duration: 0,
+                ssrc: 0,
+                play_id: None,
+                auto_hangup: None,
+            }
+        } else {
+            SessionEvent::TrackStart {
+                track_id: track_id.to_string(),
+                timestamp: 0,
+                play_id: None,
+            }
+        }
+    };
+
+    handler
+        .on_event(&track_event(DTMF_TRACK_ID, false))
+        .await
+        .unwrap();
+    handler
+        .on_event(&track_event(DTMF_TRACK_ID, true))
+        .await
+        .unwrap();
+    assert!(handler.is_speaking, "DTMF track end must not stop speaking");
+    assert!(
+        handler.is_hanging_up,
+        "DTMF track end must not cancel hangup"
+    );
+
+    // The server-side track still drives the speaking state.
+    handler
+        .on_event(&track_event("server-side-track", true))
+        .await
+        .unwrap();
+    assert!(!handler.is_speaking);
+}

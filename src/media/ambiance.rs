@@ -127,7 +127,7 @@ impl Processor for AmbianceProcessor {
         let is_server_side_speaking = match &frame.samples {
             Samples::PCM { samples } => !samples.is_empty(),
             Samples::RTP { .. } => true,
-            Samples::Empty => false,
+            Samples::Dtmf { .. } | Samples::Empty => false,
         };
 
         let target_level = if is_server_side_speaking {

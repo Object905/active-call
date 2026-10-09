@@ -50,6 +50,7 @@ impl TrackConfig {
     }
 }
 
+pub mod dtmf;
 pub mod file;
 pub mod forwarding;
 pub mod media_pass;

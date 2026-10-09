@@ -1,5 +1,6 @@
 use crate::call::Command;
 use crate::event::SessionEvent;
+use crate::media::track::dtmf::DTMF_TRACK_ID;
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -1973,6 +1974,13 @@ impl DialogueHandler for LlmHandler {
     }
 
     async fn on_event(&mut self, event: &SessionEvent) -> Result<Vec<Command>> {
+        // The DTMF track's lifecycle says nothing about the bot speaking.
+        if let SessionEvent::TrackStart { track_id, .. } | SessionEvent::TrackEnd { track_id, .. } =
+            event
+            && track_id == DTMF_TRACK_ID
+        {
+            return Ok(vec![]);
+        }
         // When in DTMF collection mode, only handle DTMF events and track lifecycle
         if self.collector_state.is_some() {
             match event {

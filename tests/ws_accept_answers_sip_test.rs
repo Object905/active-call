@@ -1297,3 +1297,115 @@ async fn ws_cancel_before_first_command_tears_down_attached_call() {
         "cancelled call lingered in /list: {active:?}"
     );
 }
+
+/// End to end: a `dtmf` command on an answered SIP call must put one RFC 4733
+/// telephone-event on the wire (negotiated PT, one RTP timestamp, growing
+/// duration, marker on the first packet, end packet sent three times) and
+/// report the track lifecycle over the websocket.
+#[tokio::test]
+async fn ws_dtmf_command_sends_rfc4733_event() {
+    tracing_subscriber::fmt()
+        .with_max_level(Level::DEBUG)
+        .with_test_writer()
+        .try_init()
+        .ok();
+
+    let mut node = spawn_node(35076, vec![]).await;
+    let uac = SipUac::new(
+        format!("127.0.0.1:{}", node.sip_port).parse().unwrap(),
+        41006,
+    )
+    .await;
+    let call_id = "ws-dtmf@127.0.0.1";
+    uac.socket
+        .send_to(
+            uac.invite(call_id, "fromtag-dtmf", "z9hG4bKwsdtmf1", PCMU_OFFER)
+                .as_bytes(),
+            uac.server,
+        )
+        .await
+        .unwrap();
+
+    let (mut bot_sink, mut bot_stream) = attach_and_accept(&mut node, call_id).await;
+    let (answered, ok_msg, seen) = uac
+        .wait_for_status("SIP/2.0 200", Duration::from_secs(30))
+        .await;
+    assert!(answered, "call never answered; responses seen: {seen:?}");
+    let ok_msg = ok_msg.unwrap();
+    assert!(
+        ok_msg.contains("telephone-event/8000"),
+        "answer must accept telephone-event: {ok_msg}"
+    );
+    let (host, port) = SipUac::answer_media_endpoint(&ok_msg);
+    let media_addr: std::net::SocketAddr = format!("{host}:{port}").parse().unwrap();
+
+    // Uplink RTP so the RTP track latches onto our media address.
+    for seq in 0..10u16 {
+        let pkt = rtp_packet(seq, seq as u32 * 160, 0x1234_5678, &[0xFF; 160]);
+        uac.socket.send_to(&pkt, media_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    bot_sink
+        .send(Message::text(
+            r#"{"command":"dtmf","digit":"5","playId":"d1"}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+
+    // Collect telephone-event packets: (seq, ts, ssrc, marker, payload).
+    let mut events: Vec<(u16, u32, u32, bool, Vec<u8>)> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut buf = [0u8; 2048];
+    while events.iter().filter(|e| e.4[1] & 0x80 != 0).count() < 3 {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "telephone-event end packets never arrived; got {events:?}"
+        );
+        let Ok(Ok((n, _))) = tokio::time::timeout(remaining, uac.socket.recv_from(&mut buf)).await
+        else {
+            continue;
+        };
+        let pkt = &buf[..n];
+        if !is_rtp(pkt) || pkt[1] & 0x7F != 101 {
+            continue;
+        }
+        events.push((
+            u16::from_be_bytes([pkt[2], pkt[3]]),
+            u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]),
+            u32::from_be_bytes([pkt[8], pkt[9], pkt[10], pkt[11]]),
+            pkt[1] & 0x80 != 0,
+            pkt[12..].to_vec(),
+        ));
+    }
+    info!(?events, "telephone-event packets on the wire");
+
+    // Default 100ms digit at 20ms ptime: 4 updates, then the end three times.
+    assert_eq!(events.len(), 4 + 3, "{events:?}");
+    let durations: Vec<u16> = events
+        .iter()
+        .map(|e| u16::from_be_bytes([e.4[2], e.4[3]]))
+        .collect();
+    assert_eq!(durations, vec![160, 320, 480, 640, 800, 800, 800]);
+    assert!(events.iter().all(|e| e.4[0] == 5), "event code for digit 5");
+    assert!(
+        events.iter().all(|e| e.1 == events[0].1),
+        "one RTP timestamp"
+    );
+    assert!(events.iter().all(|e| e.2 == events[0].2), "one SSRC");
+    assert!(events[0].3, "marker on the first packet");
+    assert!(events[1..].iter().all(|e| !e.3), "marker only on the first");
+    assert!(events[..4].iter().all(|e| e.4[1] & 0x80 == 0));
+    assert!(events[4..].iter().all(|e| e.4[1] & 0x80 != 0), "end bit");
+    assert!(
+        events.windows(2).all(|w| w[1].0 == w[0].0.wrapping_add(1)),
+        "consecutive sequence numbers"
+    );
+
+    let track_end = wait_ws_event(&mut bot_stream, "trackEnd", Duration::from_secs(5))
+        .await
+        .expect("dtmf trackEnd event");
+    assert_eq!(track_end["trackId"], "dtmf-track");
+    assert_eq!(track_end["playId"], "d1");
+}

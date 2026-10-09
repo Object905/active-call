@@ -68,6 +68,16 @@ pub enum Command {
         wait_input_timeout: Option<u32>,
         offset_ms: Option<u32>,
     },
+    /// Send one DTMF digit (0-9, *, #, A-D) to the remote party. RTP legs
+    /// emit an RFC 4733 telephone-event on the negotiated payload type;
+    /// outgoing audio is muted while the digit is on the wire. Runs on its
+    /// own track, so it neither interrupts playback nor is interrupted by it.
+    Dtmf {
+        digit: char,
+        /// Duration of the digit, default 100ms.
+        duration_ms: Option<u32>,
+        play_id: Option<String>,
+    },
     Interrupt {
         graceful: Option<bool>,
         fade_out_ms: Option<u32>,
@@ -194,6 +204,35 @@ mod tests {
                 ..
             } if body == "customer_id=12345" && content_type == "text/plain"
         ));
+    }
+
+    #[test]
+    fn dtmf_command_deserializes() {
+        let command: Command = serde_json::from_value(serde_json::json!({
+            "command": "dtmf",
+            "digit": "#",
+            "durationMs": 80,
+            "playId": "notify"
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            command,
+            Command::Dtmf {
+                digit: '#',
+                duration_ms: Some(80),
+                play_id: Some(play_id),
+            } if play_id == "notify"
+        ));
+
+        // Exactly one digit.
+        assert!(
+            serde_json::from_value::<Command>(serde_json::json!({
+                "command": "dtmf",
+                "digit": "12"
+            }))
+            .is_err()
+        );
     }
 
     #[test]

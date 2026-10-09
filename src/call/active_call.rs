@@ -9,8 +9,12 @@ use crate::{
         recorder::RecorderOption,
         stream::{MediaStream, MediaStreamBuilder, SERVER_SIDE_TRACK_ID},
         track::{
-            Track, TrackConfig, forwarding::ForwardingTrack, media_pass::MediaPassTrack,
-            tts::SynthesisHandle, websocket::WebsocketBytesReceiver,
+            Track, TrackConfig,
+            dtmf::{DTMF_TRACK_ID, DtmfTrack},
+            forwarding::ForwardingTrack,
+            media_pass::MediaPassTrack,
+            tts::SynthesisHandle,
+            websocket::WebsocketBytesReceiver,
         },
     },
     synthesis::SynthesisCommand,
@@ -1318,6 +1322,11 @@ impl ActiveCall {
             Command::Ringing { .. } => self.do_ringing(command).await,
             Command::Tts { .. } => self.do_tts(command).await,
             Command::Play { .. } => self.do_play(command).await,
+            Command::Dtmf {
+                digit,
+                duration_ms,
+                play_id,
+            } => self.do_dtmf(digit, duration_ms, play_id).await,
             Command::Hangup {
                 reason,
                 initiator,
@@ -1885,6 +1894,29 @@ impl ActiveCall {
         }
 
         self.update_track_wrapper(Box::new(file_track), play_id)
+            .await;
+        Ok(())
+    }
+
+    async fn do_dtmf(
+        &self,
+        digit: char,
+        duration_ms: Option<u32>,
+        play_id: Option<String>,
+    ) -> Result<()> {
+        info!(
+            session_id = self.session_id,
+            %digit, duration_ms, play_id, "send dtmf"
+        );
+        let mut track = DtmfTrack::new(DTMF_TRACK_ID.to_string(), digit)?
+            .with_ssrc(self.ssrc)
+            .with_play_id(play_id.clone())
+            .with_cancel_token(self.cancel_token.child_token());
+        if let Some(duration_ms) = duration_ms {
+            track = track.with_duration(Duration::from_millis(duration_ms as u64));
+        }
+        self.media_stream
+            .update_track(Box::new(track), play_id)
             .await;
         Ok(())
     }

@@ -46,6 +46,7 @@ impl Samples {
         match self {
             Samples::PCM { samples } => samples.is_empty(),
             Samples::RTP { payload, .. } => payload.is_empty(),
+            Samples::Dtmf { .. } => false,
             Samples::Empty => true,
         }
     }
