@@ -24,7 +24,7 @@ use rustrtc::{
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -44,6 +44,9 @@ pub struct RtcTrackConfig {
     pub payload_type: Option<u8>,
     pub enable_latching: Option<bool>,
     pub enable_ice_lite: Option<bool>,
+    /// Emit `RtpTimeout` when no audio arrives for this long once the call
+    /// is answered; None or zero disables it.
+    pub rtp_timeout: Option<Duration>,
 }
 
 impl Default for RtcTrackConfig {
@@ -59,6 +62,7 @@ impl Default for RtcTrackConfig {
             payload_type: None,
             enable_latching: None,
             enable_ice_lite: None,
+            rtp_timeout: None,
         }
     }
 }
@@ -71,6 +75,7 @@ pub struct RtcTrack {
     packet_sender: Arc<Mutex<Option<TrackPacketSender>>>,
     event_sender: Arc<Mutex<Option<EventSender>>>,
     media_ready_sent: Arc<AtomicBool>,
+    rtp_timeout: Arc<RtpTimeoutMonitor>,
     cancel_token: CancellationToken,
     local_source: Option<Arc<SampleStreamSource>>,
     encoder: TrackCodec,
@@ -86,6 +91,66 @@ pub struct RtcTrack {
     telephone_events: Vec<(u8, u32)>,
     /// Outbound telephone-event in progress, if any.
     dtmf_tx: Option<DtmfTxState>,
+}
+
+/// Incoming-audio watchdog. The event loop checks it once a second while
+/// it is armed: answered, a timeout configured and the peer sending.
+struct RtpTimeoutMonitor {
+    epoch: tokio::time::Instant,
+    /// Milliseconds since `epoch` of the last received audio sample.
+    last_rx_ms: AtomicU64,
+    state: tokio::sync::watch::Sender<RtpTimeoutState>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct RtpTimeoutState {
+    timeout: Option<Duration>,
+    answered: bool,
+    /// Remote SDP says the peer sends audio (not recvonly/inactive).
+    peer_sending: bool,
+}
+
+impl RtpTimeoutMonitor {
+    fn new(timeout: Option<Duration>) -> Self {
+        Self {
+            epoch: tokio::time::Instant::now(),
+            last_rx_ms: AtomicU64::new(0),
+            state: tokio::sync::watch::Sender::new(RtpTimeoutState {
+                timeout,
+                answered: false,
+                peer_sending: true,
+            }),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
+
+    /// `rtp_timeout`, when given, replaces the configured one.
+    fn answer(&self, rtp_timeout: Option<Duration>) {
+        self.update(|s| {
+            s.answered = true;
+            if rtp_timeout.is_some() {
+                s.timeout = rtp_timeout;
+            }
+        });
+    }
+
+    fn update(&self, f: impl FnOnce(&mut RtpTimeoutState)) {
+        self.state.send_if_modified(|state| {
+            let before = *state;
+            f(state);
+            *state != before
+        });
+    }
+}
+
+impl RtpTimeoutState {
+    fn armed(&self) -> Option<Duration> {
+        self.timeout
+            .filter(|t| !t.is_zero() && self.answered && self.peer_sending)
+    }
 }
 
 /// Fixed point tying the RTP media clock to the wall clock: at `instant`
@@ -132,6 +197,7 @@ impl RtcTrack {
         let processor_chain = ProcessorChain::new(track_config.samplerate);
         // RFC 3550 §5.1: the initial timestamp should be random.
         let initial_rtp_timestamp = rand::random();
+        let rtp_timeout = Arc::new(RtpTimeoutMonitor::new(rtc_config.rtp_timeout));
         Self {
             track_id: id,
             track_config,
@@ -140,6 +206,7 @@ impl RtcTrack {
             packet_sender: Arc::new(Mutex::new(None)),
             event_sender: Arc::new(Mutex::new(None)),
             media_ready_sent: Arc::new(AtomicBool::new(false)),
+            rtp_timeout,
             cancel_token,
             local_source: None,
             encoder: TrackCodec::new(),
@@ -313,6 +380,7 @@ impl RtcTrack {
     ) {
         let cancel_token = self.cancel_token.clone();
         let packet_sender = self.packet_sender.clone();
+        let rtp_timeout = self.rtp_timeout.clone();
         let pc_event = pc.clone();
         let pc_stats = pc.clone();
         let pc_state = pc.clone();
@@ -338,6 +406,14 @@ impl RtcTrack {
             };
 
             let mut stats_interval = tokio::time::interval(Duration::from_secs(5));
+            let mut timeout_interval = tokio::time::interval(Duration::from_secs(1));
+            timeout_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut timeout_state = rtp_timeout.state.subscribe();
+            let mut armed = timeout_state.borrow_and_update().armed();
+            // Arming (or re-arming after hold) grants a full timeout.
+            let mut armed_at_ms = rtp_timeout.now_ms();
+            // `last_rx_ms` already reported, so each gap is reported once.
+            let mut notified_rx_ms = None;
             let mut event_count = 0;
             let mut workers = FuturesUnordered::new();
 
@@ -384,6 +460,7 @@ impl RtcTrack {
                                     track_id_log.clone(),
                                     processor_chain.clone(),
                                     default_payload_type,
+                                    rtp_timeout.clone(),
                                 );
                                 workers.push(f1);
                                 workers.push(f2);
@@ -392,6 +469,37 @@ impl RtcTrack {
                     }
 
                     _ = workers.next(), if !workers.is_empty() => {}
+
+                    Ok(()) = timeout_state.changed() => {
+                        let next = timeout_state.borrow_and_update().armed();
+                        if next != armed {
+                            armed = next;
+                            armed_at_ms = rtp_timeout.now_ms();
+                            notified_rx_ms = None;
+                        }
+                    }
+
+                    _ = timeout_interval.tick(), if armed.is_some() => {
+                        let timeout = armed.unwrap_or_default();
+                        let last_rx_ms = rtp_timeout.last_rx_ms.load(Ordering::Relaxed);
+                        let idle_ms = rtp_timeout
+                            .now_ms()
+                            .saturating_sub(last_rx_ms.max(armed_at_ms));
+                        if notified_rx_ms != Some(last_rx_ms)
+                            && idle_ms >= timeout.as_millis() as u64
+                        {
+                            if let Some(sender) = event_sender.lock().await.as_ref() {
+                                let event = SessionEvent::RtpTimeout {
+                                    track_id: track_id_log.clone(),
+                                    timestamp: crate::media::get_timestamp(),
+                                    timeout: timeout.as_secs(),
+                                };
+                                if sender.send(event).is_ok() {
+                                    notified_rx_ms = Some(last_rx_ms);
+                                }
+                            }
+                        }
+                    }
 
                     _ = stats_interval.tick() => {
                         match pc_stats.get_stats().await {
@@ -445,6 +553,7 @@ impl RtcTrack {
         track_id: TrackId,
         processor_chain: ProcessorChain,
         default_payload_type: u8,
+        rtp_timeout: Arc<RtpTimeoutMonitor>,
     ) -> (
         std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
         std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
@@ -465,7 +574,7 @@ impl RtcTrack {
 
         // Receiving Worker
         let track_id_recv = track_id.clone();
-        let recv_fut = Self::run_receiving_worker(track, tx, track_id_recv);
+        let recv_fut = Self::run_receiving_worker(track, tx, track_id_recv, rtp_timeout);
 
         (proc_fut.boxed(), recv_fut.boxed())
     }
@@ -508,6 +617,7 @@ impl RtcTrack {
         track: Arc<SampleStreamTrack>,
         tx: tokio::sync::mpsc::UnboundedSender<rustrtc::media::frame::AudioFrame>,
         track_id: TrackId,
+        rtp_timeout: Arc<RtpTimeoutMonitor>,
     ) {
         let mut samples =
             futures::stream::unfold(
@@ -518,6 +628,9 @@ impl RtcTrack {
 
         while let Some(sample) = samples.next().await {
             if let rustrtc::media::frame::MediaSample::Audio(frame) = sample {
+                rtp_timeout
+                    .last_rx_ms
+                    .store(rtp_timeout.now_ms(), Ordering::Relaxed);
                 if let Err(_) = tx.send(frame) {
                     break;
                 }
@@ -663,6 +776,27 @@ impl RtcTrack {
             .join("\n")
     }
 
+    /// Track whether the remote side will send audio, from its SDP.
+    fn update_peer_sending(&self, sdp: &rustrtc::SessionDescription) {
+        let peer_sending = sdp.media_sections.iter().any(|media| {
+            media.kind == MediaKind::Audio
+                && media.port != 0
+                && matches!(
+                    media.direction,
+                    rustrtc::sdp::Direction::SendRecv | rustrtc::sdp::Direction::SendOnly
+                )
+        });
+        self.rtp_timeout.update(|s| s.peer_sending = peer_sending);
+    }
+
+    /// A final (non-provisional) remote answer means the peer accepted our
+    /// offer, e.g. the 200 OK of an outbound INVITE.
+    fn on_remote_answer(&self, sdp_type: rustrtc::SdpType) {
+        if sdp_type == rustrtc::SdpType::Answer {
+            self.rtp_timeout.update(|s| s.answered = true);
+        }
+    }
+
     async fn update_remote_description_internal(
         &mut self,
         answer: &String,
@@ -683,6 +817,7 @@ impl RtcTrack {
                 if let Some(ref last_sdp) = self.last_remote_sdp {
                     if Self::normalize_sdp(last_sdp) == Self::normalize_sdp(answer) {
                         debug!(track_id=%self.track_id, "SDP unchanged, skipping update_remote_description");
+                        self.on_remote_answer(sdp_type);
                         return Ok(());
                     }
                 }
@@ -721,7 +856,7 @@ impl RtcTrack {
                         }
 
                         pc.set_local_description(offer)?;
-                        pc.set_remote_description(sdp_obj).await?;
+                        pc.set_remote_description(sdp_obj.clone()).await?;
                         self.last_remote_sdp = Some(answer.clone());
                         info!(track_id=%self.track_id, "successfully re-synced WebRTC state for SIP update");
                     } else {
@@ -729,6 +864,9 @@ impl RtcTrack {
                     }
                 }
             }
+
+            self.update_peer_sending(&sdp_obj);
+            self.on_remote_answer(sdp_type);
 
             // Track events will be handled by the event loop after SSRC latching
 
@@ -770,6 +908,7 @@ impl Track for RtcTrack {
 
         let sdp = rustrtc::SessionDescription::parse(rustrtc::SdpType::Offer, &offer)?;
         pc.set_remote_description(sdp.clone()).await?;
+        self.update_peer_sending(&sdp);
 
         debug!(track_id=%self.track_id, "After set_remote_description: transceivers count = {}", pc.get_transceivers().len());
         for (i, t) in pc.get_transceivers().iter().enumerate() {
@@ -798,6 +937,10 @@ impl Track for RtcTrack {
             .ok_or(anyhow::anyhow!("No local description"))?;
 
         Ok(final_answer.to_sdp_string())
+    }
+
+    fn on_answered(&self, rtp_timeout: Option<Duration>) {
+        self.rtp_timeout.answer(rtp_timeout);
     }
 
     async fn update_remote_description(&mut self, answer: &String) -> Result<()> {
@@ -1716,6 +1859,154 @@ a=rtpmap:0 PCMU/8000\r\n"
         t=0 0\r\n\
         m=audio 20000 RTP/AVP 0\r\n\
         a=rtpmap:0 PCMU/8000\r\n";
+
+    fn rtp_timeout_track(id: &str, rtp_timeout: Option<Duration>) -> RtcTrack {
+        RtcTrack::new(
+            CancellationToken::new(),
+            id.to_string(),
+            TrackConfig::default(),
+            RtcTrackConfig {
+                mode: TransportMode::Rtp,
+                rtp_timeout,
+                ..Default::default()
+            },
+        )
+    }
+
+    async fn advance_secs(secs: u64) {
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(secs)).await;
+        tokio::task::yield_now().await;
+    }
+
+    /// Outbound: the peer's final answer arms the timeout; early media does not.
+    #[tokio::test(start_paused = true)]
+    async fn rtp_timeout_arms_on_final_answer() {
+        let mut track = rtp_timeout_track("timeout-track", Some(Duration::from_secs(2)));
+        track.create().await.unwrap();
+        track.local_description().await.unwrap();
+        let (events, mut receiver) = tokio::sync::broadcast::channel(16);
+        let (packets, _packet_receiver) = tokio::sync::mpsc::unbounded_channel();
+        track.start(events, packets).await.unwrap();
+
+        advance_secs(60).await;
+        assert!(receiver.try_recv().is_err(), "unarmed before answer");
+
+        track
+            .update_remote_description_provisional(&PCMU_SDP_1.to_string())
+            .await
+            .unwrap();
+        advance_secs(5).await;
+        assert!(receiver.try_recv().is_err(), "early media must not arm");
+
+        // Same SDP as the 183: still arms despite the SDP-unchanged fast path.
+        track
+            .update_remote_description(&PCMU_SDP_1.to_string())
+            .await
+            .unwrap();
+        advance_secs(1).await;
+        assert!(receiver.try_recv().is_err());
+        advance_secs(2).await;
+        let event = receiver.try_recv().expect("timeout without a first sample");
+        assert!(matches!(
+            &event,
+            SessionEvent::RtpTimeout { track_id, timeout: 2, .. } if track_id == "timeout-track"
+        ));
+        assert_eq!(serde_json::to_value(event).unwrap()["event"], "rtpTimeout");
+        assert!(
+            !track.cancel_token.is_cancelled(),
+            "must not close the call"
+        );
+        advance_secs(5).await;
+        assert!(receiver.try_recv().is_err(), "once per gap");
+
+        // Any sample, even silence, rearms.
+        let (source, sample_track, _) = sample_track(rustrtc::media::MediaKind::Audio, 8);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let worker = tokio::spawn(RtcTrack::run_receiving_worker(
+            sample_track,
+            tx,
+            track.track_id.clone(),
+            track.rtp_timeout.clone(),
+        ));
+        source
+            .send_audio(RtcAudioFrame {
+                data: Bytes::from(vec![0xff; 160]),
+                payload_type: Some(0),
+                clock_rate: 8000,
+                ..Default::default()
+            })
+            .unwrap();
+        rx.recv().await.unwrap();
+        advance_secs(1).await;
+        assert!(receiver.try_recv().is_err());
+        advance_secs(2).await;
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            SessionEvent::RtpTimeout { .. }
+        ));
+
+        // Peer recvonly/inactive suspends; resuming grants a fresh timeout.
+        for direction in ["recvonly", "inactive"] {
+            let hold = format!("{}a={}\r\n", PCMU_SDP_1, direction);
+            track.update_remote_description_force(&hold).await.unwrap();
+            advance_secs(10).await;
+            assert!(receiver.try_recv().is_err(), "suspended while {direction}");
+        }
+        track
+            .update_remote_description_force(&PCMU_SDP_1.to_string())
+            .await
+            .unwrap();
+        advance_secs(1).await;
+        assert!(receiver.try_recv().is_err());
+        advance_secs(2).await;
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            SessionEvent::RtpTimeout { .. }
+        ));
+
+        worker.abort();
+        track.stop().await.unwrap();
+        advance_secs(10).await;
+        assert!(receiver.try_recv().is_err());
+    }
+
+    /// Inbound: answering the offer is not acceptance; `on_answered` is, and
+    /// its timeout replaces the configured one.
+    #[tokio::test(start_paused = true)]
+    async fn rtp_timeout_arms_on_local_answer() {
+        let secs = |s| Some(Duration::from_secs(s));
+        // (configured, on_answered timeout, expected event timeout)
+        for (configured, accepted, expected) in [
+            (None, None, None),
+            (secs(2), None, Some(2)),
+            (None, secs(2), Some(2)),
+            (secs(5), secs(2), Some(2)),
+            (secs(2), secs(0), None),
+        ] {
+            let mut track = rtp_timeout_track("inbound", configured);
+            track.handshake(PCMU_SDP_1.to_string(), None).await.unwrap();
+            let (events, mut receiver) = tokio::sync::broadcast::channel(16);
+            let (packets, _packet_receiver) = tokio::sync::mpsc::unbounded_channel();
+            track.start(events, packets).await.unwrap();
+            advance_secs(10).await;
+            assert!(receiver.try_recv().is_err(), "handshake must not arm");
+
+            track.on_answered(accepted);
+            advance_secs(1).await;
+            assert!(receiver.try_recv().is_err());
+            advance_secs(2).await;
+            match expected {
+                Some(timeout) => assert!(matches!(
+                    receiver.try_recv().unwrap(),
+                    SessionEvent::RtpTimeout { timeout: t, .. } if t == timeout
+                )),
+                None => assert!(receiver.try_recv().is_err(), "None and zero disable it"),
+            }
+            track.stop().await.unwrap();
+            tokio::task::yield_now().await;
+        }
+    }
 
     /// SIP 183 early media must be applied as a provisional answer (Pranswer),
     /// keeping the signaling state in HaveLocalOffer, so the final 200 OK can

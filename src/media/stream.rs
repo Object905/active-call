@@ -446,6 +446,13 @@ impl MediaStream {
         Ok(answer)
     }
 
+    /// See `Track::on_answered`.
+    pub async fn on_answered(&self, track_id: &TrackId, rtp_timeout: Option<Duration>) {
+        if let Some((track, _)) = self.tracks.lock().await.get(track_id) {
+            track.on_answered(rtp_timeout);
+        }
+    }
+
     /// Trickle ICE: feed a remote candidate into the ICE-backed (WebRTC)
     /// track, if it's up yet, or buffer it for `update_track` to replay
     /// otherwise.

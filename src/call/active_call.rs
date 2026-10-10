@@ -1579,6 +1579,12 @@ impl ActiveCall {
                         p.answer = Some(answer.clone());
                         p.answer_time.get_or_insert_with(Utc::now);
                     });
+                    self.media_stream
+                        .on_answered(
+                            &self.session_id,
+                            option.rtp_timeout.map(Duration::from_secs),
+                        )
+                        .await;
                     self.finish_caller_stack(&option, pending_track).await?;
                 }
                 Err(e) => {
@@ -1616,6 +1622,9 @@ impl ActiveCall {
                         p.answer = Some(pending.answer.clone());
                         p.answer_time.get_or_insert_with(Utc::now);
                     });
+                    pending
+                        .track
+                        .on_answered(option.rtp_timeout.map(Duration::from_secs));
                     // Register the SIP leg so customer audio is bridged with
                     // the caller track (and later the refer leg).
                     self.media_stream.update_track(pending.track, None).await;

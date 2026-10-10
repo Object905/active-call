@@ -926,6 +926,7 @@ The `CallOption` object is used in `invite` and `accept` commands and contains t
 - `enableIpv6` (boolean, optional): Enable IPv6 support for networking
 - `enableIceLite` (boolean, optional): Enable ICE lite mode for WebRTC media
 - `inactivityTimeout` (number, optional): Timeout for audio inactivity in seconds
+- `rtpTimeout` (number, optional): Incoming RTC audio sample timeout in seconds, shared by Invite and Accept. Omitted, `null`, or `0` disables it (default). Starts once the call is answered (by us or by the peer), emits an informational `rtpTimeout` event, and does not hang up.
 - `ambiance` (AmbianceOption, optional): Background audio mixing configuration
   - `path` (string): Path to background audio file
   - `duckLevel` (number, optional): Volume reduction when AI speaks (default: 0.1)
@@ -1497,6 +1498,24 @@ handling is left to the websocket client.
   "onHold": true
 }
 ```
+
+#### RtpTimeout Event
+**Triggered when:** An established RTC track receives no incoming audio samples for `rtpTimeout` seconds. Silent audio samples count as activity. The monitor checks once per second, including when no first sample has arrived. It starts when the call is answered (Accept, or the peer's final answer to our Invite; early media does not count) and is suspended while the remote SDP disables audio or indicates `recvonly`/`inactive`. An `rtpTimeout` given on Accept replaces the one from an earlier Ringing.
+
+Emitted once per inactivity period. Receiving another sample rearms the monitor. The client decides whether to send a Hangup command; this event itself never closes the call. INVITE signaling/handshake timeouts are separate.
+
+```json
+{
+  "event": "rtpTimeout",
+  "trackId": "track-abc123",
+  "timestamp": 1640995200000,
+  "timeout": 30
+}
+```
+
+`timeout` is the configured threshold in seconds. `timestamp` is milliseconds since Unix epoch.
+
+For client-controlled hangup, set `"rtpTimeout": 30` and `"inactivityTimeout": 0` in the Invite or Accept `option`. The existing `inactivityTimeout` remains independent and can otherwise hang up automatically.
 
 #### Inactivity Event
 **Triggered when:** Audio inactivity timeout expires (no audio activity detected for `inactivityTimeout` seconds).

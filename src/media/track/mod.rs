@@ -115,4 +115,9 @@ pub trait Track: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
+    /// The call was answered locally: Accept sent the 200 OK, or a WebRTC
+    /// track answered the browser's offer. `rtp_timeout`, when given,
+    /// replaces the configured RTP timeout. Default no-op for track types
+    /// without RTP timeout monitoring.
+    fn on_answered(&self, _rtp_timeout: Option<Duration>) {}
 }

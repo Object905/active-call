@@ -64,6 +64,8 @@ pub struct CallOption {
     pub handshake_timeout: Option<u64>,
     pub enable_ipv6: Option<bool>,
     pub inactivity_timeout: Option<u64>, // inactivity timeout in seconds
+    /// Incoming RTC sample timeout in seconds; None or zero disables notifications.
+    pub rtp_timeout: Option<u64>,
     pub sip: Option<SipOption>,
     pub extra: Option<HashMap<String, String>>,
     pub codec: Option<String>, // pcmu, pcma, g722, pcm, only for websocket call
@@ -90,6 +92,7 @@ impl Default for CallOption {
             media_pass: None,
             handshake_timeout: None,
             inactivity_timeout: Some(50), // default 50 seconds
+            rtp_timeout: None,
             enable_ipv6: None,
             sip: None,
             extra: None,
@@ -284,5 +287,41 @@ where
         spawner(Box::pin(future))
     } else {
         tokio::spawn(future)
+    }
+}
+
+#[cfg(test)]
+mod rtp_timeout_tests {
+    use super::CallOption;
+    use crate::call::Command;
+
+    #[test]
+    fn rtp_timeout_is_optional_and_shared_by_invite_and_accept() {
+        assert_eq!(CallOption::default().rtp_timeout, None);
+        assert!(
+            serde_json::to_value(CallOption::default())
+                .unwrap()
+                .get("rtpTimeout")
+                .is_none()
+        );
+        for command in ["invite", "accept"] {
+            for (option, expected) in [
+                (serde_json::json!({}), None),
+                (serde_json::json!({"rtpTimeout": null}), None),
+                (serde_json::json!({"rtpTimeout": 0}), Some(0)),
+                (serde_json::json!({"rtpTimeout": 30}), Some(30)),
+            ] {
+                let parsed: Command = serde_json::from_value(serde_json::json!({
+                    "command": command, "option": option,
+                }))
+                .unwrap();
+                match parsed {
+                    Command::Invite { option } | Command::Accept { option } => {
+                        assert_eq!(option.rtp_timeout, expected);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
     }
 }

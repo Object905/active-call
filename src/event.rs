@@ -119,6 +119,13 @@ pub enum SessionEvent {
         text: Option<String>,
         refer: Option<bool>,
     },
+    /// Incoming RTC media stopped; informational only, never hangs up the call.
+    RtpTimeout {
+        track_id: String,
+        timestamp: u64,
+        /// Configured timeout in seconds.
+        timeout: u64,
+    },
     ///Inactivity timeout
     Inactivity {
         track_id: String,

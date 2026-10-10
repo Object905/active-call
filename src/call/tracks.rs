@@ -217,6 +217,7 @@ impl ActiveCall {
         let ssrc = rand::random::<u32>();
 
         let mut rtc_config = RtcTrackConfig::default();
+        rtc_config.rtp_timeout = option.rtp_timeout.map(Duration::from_secs);
         let use_srtp = option
             .sip
             .as_ref()
@@ -312,9 +313,11 @@ impl ActiveCall {
         track_id: TrackId,
         ssrc: u32,
         enable_srtp: Option<bool>,
+        rtp_timeout: Option<u64>,
         offer: Option<&str>,
     ) -> Result<RtcTrack> {
         let mut rtc_config = RtcTrackConfig::default();
+        rtc_config.rtp_timeout = rtp_timeout.map(Duration::from_secs);
         // Per-call flag takes precedence over global config.
         let use_srtp = enable_srtp
             .or(self.app_state.config.enable_srtp)
@@ -681,6 +684,7 @@ impl ActiveCall {
         let ssrc = self.ssrc;
 
         let mut rtc_config = RtcTrackConfig::default();
+        rtc_config.rtp_timeout = option.rtp_timeout.map(Duration::from_secs);
         rtc_config.mode = rustrtc::TransportMode::WebRtc; // WebRTC
         rtc_config.ice_servers = self.app_state.config.ice_servers.clone();
 
@@ -715,6 +719,8 @@ impl ActiveCall {
                 return Err(anyhow::anyhow!("Failed to setup track: {}", e));
             }
         }
+        // Answering the browser's offer is the acceptance for WebRTC calls.
+        webrtc_track.on_answered(None);
 
         self.leg().update_progress(|p| {
             p.answer = answer.clone();
@@ -738,7 +744,13 @@ impl ActiveCall {
         let ssrc = out.leg.ssrc;
         let per_call_srtp = out.call_option.sip.as_ref().and_then(|s| s.enable_srtp);
         let rtp_track = self
-            .create_rtp_track(track_id.clone(), ssrc, per_call_srtp, None)
+            .create_rtp_track(
+                track_id.clone(),
+                ssrc,
+                per_call_srtp,
+                out.call_option.rtp_timeout,
+                None,
+            )
             .await
             .map_err(|e| rsipstack::Error::Error(e.to_string()))?;
 
@@ -965,6 +977,7 @@ impl ActiveCall {
 
         let mut media_track = if Self::is_webrtc_sdp(&offer) {
             let mut rtc_config = RtcTrackConfig::default();
+            rtc_config.rtp_timeout = option.rtp_timeout.map(Duration::from_secs);
             rtc_config.mode = rustrtc::TransportMode::WebRtc;
             rtc_config.ice_servers = self.app_state.config.ice_servers.clone();
             self.rtc_apply_network(&mut rtc_config);
@@ -987,6 +1000,7 @@ impl ActiveCall {
                     self.session_id.clone(),
                     self.ssrc,
                     per_call_srtp,
+                    option.rtp_timeout,
                     Some(&offer),
                 )
                 .await?;
