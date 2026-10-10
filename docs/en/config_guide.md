@@ -68,6 +68,72 @@ If the server is behind NAT, configure the public IP:
 external_ip = "1.2.3.4"
 ```
 
+### Trunk Rules (Match & Rewrite Outgoing INVITE/REFER)
+
+`trunk_rules` rewrite the outgoing SIP INVITE (and REFER legs) before they are
+sent. This is useful to pick the SIP `Contact` address (e.g. `external_ip` vs an
+internal IP) based on the target, or to rewrite the caller/callee URIs per trunk.
+
+Rules are evaluated in **declaration order** and the **first** rule whose match
+conditions all hold (AND) is applied (first-match-wins). A rule with no match
+conditions always matches and acts as a **catch-all default**.
+
+```toml
+[[trunk_rules]]
+rule.match.to.host = "^172\\.25\\."            # target on the internal network
+rule.rewrite.contact.host = "172.25.225.2"     # advertise the internal IP as Contact
+
+[[trunk_rules]]
+rule.rewrite.contact.host = "1.2.3.4"          # catch-all: external targets use external_ip
+```
+
+Match fields (regex, any combination — all must match):
+
+| Field | Matches |
+|---|---|
+| `rule.match.from.user` | caller username (before `@`) |
+| `rule.match.from.host` | caller host (after `@`) |
+| `rule.match.to.user` | callee username (To header / Request-URI user) |
+| `rule.match.to.host` | callee host (To header / Request-URI host) |
+
+Rewrite fields (any combination):
+
+| Field | Rewrites |
+|---|---|
+| `rule.rewrite.from.user` / `rule.rewrite.from.host` | caller URI |
+| `rule.rewrite.to.user` / `rule.rewrite.to.host` | callee URI |
+| `rule.rewrite.contact.user` / `rule.rewrite.contact.host` | Contact URI |
+
+A `host` rewrite value without a port preserves the original port; include a
+port (e.g. `"172.25.225.2:15060"`) to change it as well.
+
+### Incoming Call Transfer (auto_refer)
+
+When an in-dialog SIP `REFER` (RFC 3515) is received on an active call, the
+agent can follow it automatically: the server dials the `Refer-To` target and
+bridges the media (same mechanics as the `refer` websocket command).
+
+```toml
+# Automatically follow incoming REFER (default: true)
+auto_refer = true
+# INVITE handshake timeout in seconds for the transfer leg (default: 30)
+auto_refer_timeout = 30
+```
+
+Behavior details:
+
+- The REFER is always answered with `202 Accepted` and a `transferRequest`
+  event is emitted to websocket clients, regardless of `auto_refer`.
+- The RFC 3515 implicit subscription is honored: `NOTIFY (100 Trying)` right
+  after the `202`, then a final `NOTIFY` with `Subscription-State:
+  terminated` carrying the transfer result (`200 OK` on success, the actual
+  failure code otherwise, `403` when `auto_refer = false`).
+- With `auto_hangup` semantics, the original (parent) call is released only
+  after the transfer leg has been answered AND ended; a rejected/failed
+  transfer keeps the caller in the original call.
+- Only one transfer can be in flight per call; concurrent REFERs are
+  declined with `491 Request Pending` via the NOTIFY subscription.
+
 ### RTP Port Range
 
 ```toml

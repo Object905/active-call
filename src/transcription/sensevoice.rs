@@ -7,7 +7,7 @@ use crate::offline::get_offline_models;
 use crate::offline::sensevoice::{FeaturePipeline, FrontendConfig, language_id_from_code};
 use crate::transcription::{TranscriptionClient, TranscriptionOption};
 use anyhow::{Result, anyhow};
-use audio_codec::Resampler;
+use audio_codec::BoxedResampler;
 use std::{future::Future, pin::Pin, sync::Arc};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -96,6 +96,7 @@ impl SensevoiceAsrClientBuilder {
                 event_sender,
                 input_rate,
                 vad_option,
+                option.refer,
             ));
 
             let inner = SensevoiceAsrClientInner {
@@ -117,6 +118,7 @@ async fn process_stream(
     event_sender: EventSender,
     input_rate: u32,
     vad_option: VADOption,
+    refer: Option<bool>,
 ) {
     // Buffer for accumulating audio samples (target rate 16000)
     let mut buffer: Vec<i16> = Vec::with_capacity(16000 * 10);
@@ -131,7 +133,7 @@ async fn process_stream(
 
     // Resampler setup
     let mut resampler = if input_rate != sample_rate as u32 {
-        Some(Resampler::new(input_rate as usize, sample_rate))
+        BoxedResampler::new(input_rate as usize, sample_rate).ok()
     } else {
         None
     };
@@ -250,6 +252,7 @@ async fn process_stream(
                             is_filler: None,
                             confidence: Some(1.0),
                             task_id: None,
+                            refer,
                         };
 
                         if let Err(e) = event_sender.send(event) {

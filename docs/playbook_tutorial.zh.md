@@ -40,6 +40,7 @@ llm:
 ```yaml
 greeting: "您好，我是您的 AI 助手，请问有什么可以帮您？"
 denoise: true # 启用语音降噪
+agc: {} # 启用 WebRTC AGC2 自动增益控制（默认 5 dB 余量，15 dB 初始增益），需要同时配置 `vad`
 interruption:
   strategy: "both" # 打断策略: "none", "vad", "asr", "both"
   minSpeechMs: 500 # 用户说话超过 500ms 才触发打断
@@ -89,6 +90,7 @@ Playbook 支持两种方式触发系统动作：
 
 -   **挂断**: `<hangup/>`
 -   **转接**: `<refer to="sip:1001@127.0.0.1"/>`
+-   **发送 SIP 元信息正文**: `<message body="customer_id=12345"/>`
 -   **音效播放**: `<play file="config/media/ding.wav"/>`
 -   **场景跳转**: `<goto scene="support"/>`
 

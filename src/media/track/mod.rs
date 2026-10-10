@@ -25,9 +25,6 @@ pub struct TrackConfig {
 impl Default for TrackConfig {
     fn default() -> Self {
         Self {
-            #[cfg(feature = "opus")]
-            codec: CodecType::Opus,
-            #[cfg(not(feature = "opus"))]
             codec: CodecType::G722,
             samplerate: 16000,
             channels: 1,
@@ -53,7 +50,9 @@ impl TrackConfig {
     }
 }
 
+pub mod dtmf;
 pub mod file;
+pub mod forwarding;
 pub mod media_pass;
 pub mod rtc;
 pub mod track_codec;
@@ -64,6 +63,12 @@ pub trait Track: Send + Sync {
     fn ssrc(&self) -> u32;
     fn id(&self) -> &TrackId;
     fn config(&self) -> &TrackConfig;
+    fn set_paused(&self, _paused: bool) -> bool {
+        false
+    }
+    fn is_paused(&self) -> bool {
+        false
+    }
     fn processor_chain(&mut self) -> &mut ProcessorChain;
     fn insert_processor(&mut self, processor: Box<dyn Processor>) {
         self.processor_chain().insert_processor(processor);
@@ -71,10 +76,23 @@ pub trait Track: Send + Sync {
     fn append_processor(&mut self, processor: Box<dyn Processor>) {
         self.processor_chain().append_processor(processor);
     }
+    /// Attach a raw-tap receiver that mirrors inbound frames at their native
+    /// (pre-resample) sample rate, used by the native-samplerate recorder.
+    /// Setting `None` detaches an existing tap.
+    fn set_raw_tap(&mut self, tap: Option<mpsc::UnboundedSender<AudioFrame>>) {
+        self.processor_chain().set_raw_tap(tap);
+    }
     async fn handshake(&mut self, offer: String, timeout: Option<Duration>) -> Result<String>;
     async fn update_remote_description(&mut self, answer: &String) -> Result<()>;
     async fn update_remote_description_force(&mut self, answer: &String) -> Result<()> {
         // Default implementation: force update is same as regular update for most tracks
+        self.update_remote_description(answer).await
+    }
+    /// Apply a provisional remote description (SIP 183 early media). Unlike
+    /// `update_remote_description`, this must not finalize SDP negotiation —
+    /// the real answer (200 OK) is still to come. Default: same as a regular
+    /// update, for track types that don't have a signaling state machine.
+    async fn update_remote_description_provisional(&mut self, answer: &String) -> Result<()> {
         self.update_remote_description(answer).await
     }
     async fn start(
@@ -87,4 +105,19 @@ pub trait Track: Send + Sync {
         self.stop().await
     }
     async fn send_packet(&mut self, packet: &AudioFrame) -> Result<()>;
+    /// Feed a remotely-gathered ICE candidate into this track's PeerConnection.
+    /// Default no-op for track types that aren't backed by ICE (file/tts/websocket tracks).
+    fn add_ice_candidate(
+        &self,
+        _candidate: &str,
+        _sdp_mid: Option<&str>,
+        _sdp_mline_index: Option<u32>,
+    ) -> Result<()> {
+        Ok(())
+    }
+    /// The call was answered locally: Accept sent the 200 OK, or a WebRTC
+    /// track answered the browser's offer. `rtp_timeout`, when given,
+    /// replaces the configured RTP timeout. Default no-op for track types
+    /// without RTP timeout monitoring.
+    fn on_answered(&self, _rtp_timeout: Option<Duration>) {}
 }

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+pub mod agc;
 pub mod ambiance;
 pub mod asr_processor;
 pub mod cache;
@@ -12,6 +13,8 @@ pub mod negotiate;
 pub mod processor;
 pub mod realtime_processor;
 pub mod recorder;
+#[cfg(feature = "ringback-detection")]
+pub mod ringback_detection;
 pub mod stream;
 #[cfg(test)]
 mod tests;
@@ -34,6 +37,15 @@ pub enum Samples {
         payload_type: u8,
         payload: PayloadBuf,
     },
+    /// Transport-agnostic DTMF event update (RFC 4733 semantics). Emitted once
+    /// per ptime while a digit is held; `duration_ms` is cumulative since the
+    /// event started, `end` marks the final update. RTP tracks map it to the
+    /// negotiated telephone-event payload type and clock.
+    Dtmf {
+        event: u8,
+        duration_ms: u32,
+        end: bool,
+    },
     Empty,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +63,8 @@ pub struct AudioFrame {
     pub timestamp: u64,
     pub sample_rate: u32,
     pub channels: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speech_probability: Option<f32>,
 }
 
 impl Samples {
