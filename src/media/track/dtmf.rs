@@ -14,14 +14,7 @@ pub const DEFAULT_DTMF_DURATION_MS: u32 = 100;
 
 /// Map a DTMF character to its RFC 4733 event code.
 pub fn dtmf_event_code(c: char) -> Option<u8> {
-    match c {
-        '0'..='9' => Some(c as u8 - b'0'),
-        '*' => Some(10),
-        '#' => Some(11),
-        'A'..='D' => Some(c as u8 - b'A' + 12),
-        'a'..='d' => Some(c as u8 - b'a' + 12),
-        _ => None,
-    }
+    audio_codec::telephone_event::digit_to_event(c)
 }
 
 /// Producer track that plays one DTMF digit as `Samples::Dtmf` event

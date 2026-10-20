@@ -10,7 +10,6 @@ use std::{
         atomic::{AtomicU32, AtomicUsize, Ordering},
     },
     time::Duration,
-    u32,
 };
 use tokio::{
     fs::File,

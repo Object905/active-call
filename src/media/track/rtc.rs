@@ -10,6 +10,7 @@ use crate::{
 use anyhow::Result;
 use async_trait::async_trait;
 use audio_codec::CodecType;
+use audio_codec::telephone_event::encode_event_payload;
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use rustrtc::{
@@ -1213,13 +1214,7 @@ impl RtcTrack {
         let duration =
             duration_to_rtp_ticks(Duration::from_millis(duration_ms as u64), state.clock_rate)
                 .min(u16::MAX as u32) as u16;
-        let [duration_hi, duration_lo] = duration.to_be_bytes();
-        let payload = Bytes::from(vec![
-            event,
-            if end { 0x80 } else { 0 } | DTMF_VOLUME,
-            duration_hi,
-            duration_lo,
-        ]);
+        let payload = Bytes::from(encode_event_payload(event, end, DTMF_VOLUME, duration).to_vec());
         let (payload_type, rtp_timestamp, clock_rate) =
             (state.payload_type, state.rtp_timestamp, state.clock_rate);
 
