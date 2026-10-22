@@ -2290,20 +2290,9 @@ impl ActiveCall {
             self.session_id.clone(),
         ));
 
-        // Blindly forward the REFER's custom headers (User-to-User,
-        // X-ACC-Bizdata, ...) onto the transfer INVITE. X-Referred-* were
-        // already excluded at collection time, so no duplicates here.
-        if let Some(extra) = refer_option
-            .as_ref()
-            .and_then(|o| o.extra_headers.as_ref())
-        {
-            for (name, value) in extra {
-                headers.push(rsipstack::rsip::Header::Other(
-                    name.clone(),
-                    value.clone(),
-                ));
-            }
-        }
+        // The REFER-carried custom headers (User-to-User, X-ACC-Bizdata, ...)
+        // are appended inside the background task below, after running them
+        // through the optional ReferHeaderResolver.
 
         let ssrc = rand::random::<u32>();
         let refer_leg = LegShared::new(
@@ -2349,6 +2338,8 @@ impl ActiveCall {
         let refer_cancel_token = self.cancel_token.child_token();
         self.set_refer_call_token(refer_cancel_token.clone());
 
+        let refer_header_resolver = self.app_state.refer_header_resolver.clone();
+
         // Run the INVITE handshake in the background so the actor keeps
         // serving events (MOH looping, auto-hangup...) while it is in flight.
         let me = runtime
@@ -2360,6 +2351,45 @@ impl ActiveCall {
         let log_session_id = session_id.clone();
         let reject_track_id = track_id.clone();
         crate::spawn(async move {
+            // Resolve the REFER-carried extra headers through the optional
+            // ReferHeaderResolver (default: forward unchanged). This runs in
+            // the background task, *before* the INVITE timeout window opens,
+            // so a slow resolver neither stalls the call actor nor eats into
+            // the INVITE budget. On resolver failure fall back to the original
+            // REFER headers — the transfer still proceeds.
+            let mut extra_headers = refer_option
+                .as_ref()
+                .and_then(|o| o.extra_headers.clone())
+                .unwrap_or_default();
+            if let Some(resolver) = refer_header_resolver.as_ref() {
+                let context = crate::call::ReferHeaderContext {
+                    session_id: log_session_id.clone(),
+                    refer_target: callee.clone(),
+                    headers: extra_headers.clone(),
+                };
+                match resolver.resolve(&context).await {
+                    Ok(resolved) => extra_headers = resolved,
+                    Err(e) => {
+                        warn!(
+                            session_id = log_session_id,
+                            error = %e,
+                            "refer header resolver failed, forwarding REFER headers unchanged"
+                        );
+                    }
+                }
+            }
+            {
+                let headers = invite_option.headers.get_or_insert_with(Vec::new);
+                // Forward the (possibly rewritten) REFER custom headers onto
+                // the transfer INVITE. X-Referred-* were already excluded at
+                // collection time, so no duplicates here.
+                for (name, value) in &extra_headers {
+                    headers.push(rsipstack::rsip::Header::Other(
+                        name.clone(),
+                        value.clone(),
+                    ));
+                }
+            }
             let out = crate::call::tracks::OutgoingLeg {
                 cancel_token: refer_cancel_token,
                 leg: refer_leg,

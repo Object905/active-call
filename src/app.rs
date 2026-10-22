@@ -1,5 +1,5 @@
 use crate::{
-    call::{ActiveCallRef, sip::Invitation},
+    call::{ActiveCallRef, refer_headers::ReferHeaderResolver, sip::Invitation},
     callrecord::{
         CallRecordFormatter, CallRecordManagerBuilder, CallRecordSender, DefaultCallRecordFormatter,
     },
@@ -105,6 +105,9 @@ pub struct AppStateInner {
     /// Peer source addresses learned from call traffic, used by the OPTIONS
     /// ACL (`[options_response]`).
     pub learned_peers: crate::useragent::peer_learning::SharedLearnedPeers,
+    /// Optional hook that rewrites the custom headers an incoming REFER
+    /// carries onto the transfer INVITE; `None` forwards them unchanged.
+    pub refer_header_resolver: Option<std::sync::Arc<dyn ReferHeaderResolver>>,
 
     pub active_calls: Arc<std::sync::Mutex<HashMap<String, ActiveCallRef>>>,
     pub total_calls: AtomicU64,
@@ -127,6 +130,7 @@ pub struct AppStateBuilder {
     pub message_inspector: Option<Box<dyn MessageInspector>>,
     pub target_locator: Option<Box<dyn TargetLocator>>,
     pub transport_inspector: Option<Box<dyn TransportEventInspector>>,
+    pub refer_header_resolver: Option<std::sync::Arc<dyn ReferHeaderResolver>>,
 }
 
 impl AppStateInner {
@@ -1016,6 +1020,7 @@ impl AppStateBuilder {
             message_inspector: None,
             target_locator: None,
             transport_inspector: None,
+            refer_header_resolver: None,
         }
     }
 
@@ -1058,6 +1063,17 @@ impl AppStateBuilder {
         inspector: Box<dyn TransportEventInspector>,
     ) -> &mut Self {
         self.transport_inspector = Some(inspector);
+        self
+    }
+
+    /// Install a hook that rewrites the custom headers an incoming REFER
+    /// carries onto the transfer INVITE. Without one the REFER headers are
+    /// forwarded unchanged.
+    pub fn with_refer_header_resolver(
+        mut self,
+        resolver: std::sync::Arc<dyn ReferHeaderResolver>,
+    ) -> Self {
+        self.refer_header_resolver = Some(resolver);
         self
     }
 
@@ -1291,6 +1307,7 @@ impl AppStateBuilder {
             pending_playbooks: Arc::new(Mutex::new(HashMap::new())),
             learned_public_address,
             learned_peers,
+            refer_header_resolver: self.refer_header_resolver,
             active_calls: Arc::new(std::sync::Mutex::new(HashMap::new())),
             total_calls: AtomicU64::new(0),
             total_failed_calls: AtomicU64::new(0),
