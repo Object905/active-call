@@ -372,14 +372,19 @@ async fn run_bridge_bot(mut sock: SipSock, agent_port: u16, events: mpsc::Unboun
     })
     .await;
 
-    // Send the in-dialog REFER with Refer-To = agent.
+    // Send the in-dialog REFER with Refer-To = agent, plus carrier routing
+    // headers that must survive onto the transfer INVITE.
     tokio::time::sleep(Duration::from_millis(700)).await;
     sock.send_in_dialog(
         &invite,
         "REFER",
-        &[&format!(
-            "Refer-To: <sip:952299@127.0.0.1:{agent_port}>"
-        )],
+        &[
+            &format!(
+                "Refer-To: <sip:952299@127.0.0.1:{agent_port}>"
+            ),
+            "User-to-User: dGVzdC11MnUtcGF5bG9hZA==;encoding=base64;purpose=user",
+            "X-ACC-Bizdata: X-TransferChannel=123456;X-queue=100",
+        ],
         2,
     );
     let _ = events.send("refer_sent".into());
@@ -424,6 +429,13 @@ async fn run_agent_bot(mut sock: SipSock, events: mpsc::UnboundedSender<String>)
     sock.reply(&invite, "SIP/2.0 100 Trying", None);
     sock.answer_ok(&invite);
     let _ = events.send("agent_answered".into());
+    // Report whether the REFER's custom headers made it onto the transfer
+    // INVITE (blind header forwarding).
+    let _ = events.send(format!(
+        "agent_invite_headers user_to_user={:?} x_acc_bizdata={:?}",
+        sock.hdr(&invite, "User-to-User"),
+        sock.hdr(&invite, "X-ACC-Bizdata"),
+    ));
 
     // Wait for ACK.
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
@@ -600,6 +612,20 @@ async fn auto_refer_follows_bridge_leg_refer() {
     wait_event(&mut agent_rx, "agent_answered", Duration::from_secs(15))
         .await
         .expect("transfer INVITE never reached the agent — auto_refer did not follow the bridge-leg REFER");
+
+    // 3b) The REFER's custom headers must be blindly forwarded onto the
+    // transfer INVITE.
+    let headers_ev = wait_event(&mut agent_rx, "agent_invite_headers", Duration::from_secs(5))
+        .await
+        .expect("missing agent_invite_headers event");
+    assert!(
+        headers_ev.contains("user_to_user=Some"),
+        "User-to-User was not forwarded onto the transfer INVITE: {headers_ev}"
+    );
+    assert!(
+        headers_ev.contains("x_acc_bizdata=Some"),
+        "X-ACC-Bizdata was not forwarded onto the transfer INVITE: {headers_ev}"
+    );
 
     // 4) The WS app observes the refer answer (skip the accept's answer event).
     let mut answer = None;

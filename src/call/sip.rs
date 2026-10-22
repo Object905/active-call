@@ -546,6 +546,41 @@ impl DialogStateReceiverGuard {
                         }
                         None
                     });
+                    // Blindly forward the REFER's custom headers onto the
+                    // transfer INVITE: INVITE-mode carriers (e.g. Aliyun CC)
+                    // attach routing data to the REFER (User-to-User,
+                    // X-ACC-Bizdata, X-AliyunIVR-*) and expect it to survive
+                    // the transfer hop. Protocol headers are typed (never
+                    // `Header::Other`), so collecting Other headers only is
+                    // inherently safe; User-to-User is added explicitly since
+                    // rsipstack types it; X-Referred-* are skipped because
+                    // do_refer regenerates them for the new hop.
+                    let mut extra_headers: HashMap<String, String> = req
+                        .headers
+                        .iter()
+                        .filter_map(|h| {
+                            if let rsipstack::rsip::Header::Other(name, value) = h {
+                                let name = name.to_string();
+                                if name.eq_ignore_ascii_case("X-Referred-To")
+                                    || name.eq_ignore_ascii_case("X-Referred-From")
+                                    || name.eq_ignore_ascii_case("X-Referred-Id")
+                                {
+                                    return None;
+                                }
+                                return Some((name, value.to_string()));
+                            }
+                            None
+                        })
+                        .collect();
+                    if let Some(user_to_user) = req.headers.iter().find_map(|h| {
+                        if let rsipstack::rsip::Header::UserToUser(h) = h {
+                            return Some(h.value().to_string());
+                        }
+                        None
+                    }) {
+                        extra_headers.insert("User-to-User".to_string(), user_to_user);
+                    }
+                    let extra_headers = (!extra_headers.is_empty()).then_some(extra_headers);
                     info!(session_id = states.session_id, %dialog_id, %refer_to, "received REFER");
                     tx_handle
                         .reply(rsipstack::rsip::StatusCode::Other(202, "Accepted".into()))
@@ -569,6 +604,7 @@ impl DialogStateReceiverGuard {
                             timestamp: crate::media::get_timestamp(),
                             refer_to,
                             referred_by,
+                            extra_headers,
                             refer: Some(states.leg.is_refer),
                             leg_session_id: Some(
                                 states.leg.progress.load_full().session_id.clone()

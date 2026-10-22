@@ -187,6 +187,9 @@ pub struct ReferOption {
     pub pause_parent_asr: Option<bool>,
     /// If false, DTMF RTP packets are not forwarded between the main call and the refer call
     pub forward_dtmf: Option<bool>,
+    /// Custom headers blindly forwarded onto the transfer INVITE (e.g.
+    /// `User-to-User`, `X-ACC-Bizdata` received on an incoming REFER).
+    pub extra_headers: Option<HashMap<String, String>>,
 }
 
 #[skip_serializing_none]

@@ -1202,6 +1202,7 @@ impl ActiveCall {
             SessionEvent::TransferRequest {
                 refer_to,
                 referred_by,
+                extra_headers,
                 refer,
                 leg_session_id,
                 notify,
@@ -1284,6 +1285,9 @@ impl ActiveCall {
                     sip: None,
                     call_id: None,
                     pause_parent_asr: None,
+                    // Carriers put routing data on the REFER (User-to-User,
+                    // X-ACC-Bizdata, ...); forward it onto the transfer INVITE.
+                    extra_headers,
                 };
                 info!(
                     session_id = self.session_id,
@@ -2286,6 +2290,21 @@ impl ActiveCall {
             self.session_id.clone(),
         ));
 
+        // Blindly forward the REFER's custom headers (User-to-User,
+        // X-ACC-Bizdata, ...) onto the transfer INVITE. X-Referred-* were
+        // already excluded at collection time, so no duplicates here.
+        if let Some(extra) = refer_option
+            .as_ref()
+            .and_then(|o| o.extra_headers.as_ref())
+        {
+            for (name, value) in extra {
+                headers.push(rsipstack::rsip::Header::Other(
+                    name.clone(),
+                    value.clone(),
+                ));
+            }
+        }
+
         let ssrc = rand::random::<u32>();
         let refer_leg = LegShared::new(
             ssrc,
@@ -2836,6 +2855,7 @@ mod auto_refer_tests {
             timestamp: 0,
             refer_to: "sip:952299@example.com".to_string(),
             referred_by: None,
+            extra_headers: None,
             refer: Some(true),
             leg_session_id,
             notify,

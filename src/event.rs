@@ -149,6 +149,12 @@ pub enum SessionEvent {
         refer_to: String,
         referred_by: Option<String>,
         refer: Option<bool>,
+        /// Custom (`Header::Other`) headers received on the REFER, blindly
+        /// forwarded onto the transfer INVITE (e.g. `User-to-User`,
+        /// `X-ACC-Bizdata`, `X-AliyunIVR-*`). Protocol headers (Via, Route,
+        /// Call-ID, ...) are typed and never included.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extra_headers: Option<HashMap<String, String>>,
         /// Session id of the leg that received the REFER (the ref call id
         /// for refer bridge legs). Lets the actor tell the current
         /// INVITE-mode bridge leg apart from other refer legs.
