@@ -5,6 +5,7 @@ use crate::{
     },
     config::Config,
     locator::RewriteTargetLocator,
+    sipflow::{SipFlow, SipFlowUploadHook},
     useragent::{
         RegisterOption,
         invitation::{
@@ -101,6 +102,9 @@ pub struct AppStateInner {
     pub invitation: Invitation,
     pub routing_state: Arc<crate::call::RoutingState>,
     pub pending_playbooks: Arc<Mutex<HashMap<String, (String, Instant)>>>,
+    /// In-process SIP signaling capture ([`crate::sipflow`]); `None` when
+    /// the `[sipflow]` section is absent/disabled.
+    pub sip_flow: Option<Arc<SipFlow>>,
     pub learned_public_address: SharedPublicAddress,
     /// Peer source addresses learned from call traffic, used by the OPTIONS
     /// ACL (`[options_response]`).
@@ -131,6 +135,10 @@ pub struct AppStateBuilder {
     pub target_locator: Option<Box<dyn TargetLocator>>,
     pub transport_inspector: Option<Box<dyn TransportEventInspector>>,
     pub refer_header_resolver: Option<std::sync::Arc<dyn ReferHeaderResolver>>,
+    /// Externally created signaling recorder; when set it takes precedence
+    /// over `[sipflow]` config (used by embedders that need the same
+    /// `SipFlow` handle in their own callrecord manager).
+    pub sip_flow: Option<Arc<SipFlow>>,
 }
 
 impl AppStateInner {
@@ -419,6 +427,11 @@ impl AppStateInner {
                     let dialog_id = dialog.id();
                     let dialog_id_str = dialog_id.to_string();
                     let session_id = if dialog_id_str.len() > 64 { generate_short_session_id(&self.invitation) } else { dialog_id_str.clone() };
+                    // Register the dialog's SIP Call-ID under this session so
+                    // sipflow can merge its signaling at hangup.
+                    if let Some(flow) = self.sip_flow.as_ref() {
+                        flow.associate(&session_id, &dialog_id.call_id);
+                    }
                     let dialog_id_for_cleanup = dialog_id.clone();
                     let token = self.token.child_token();
                     let pending_dialog = PendingDialog {
@@ -1021,6 +1034,7 @@ impl AppStateBuilder {
             target_locator: None,
             transport_inspector: None,
             refer_header_resolver: None,
+            sip_flow: None,
         }
     }
 
@@ -1074,6 +1088,13 @@ impl AppStateBuilder {
         resolver: std::sync::Arc<dyn ReferHeaderResolver>,
     ) -> Self {
         self.refer_header_resolver = Some(resolver);
+        self
+    }
+
+    /// Inject an externally created signaling recorder (see
+    /// [`crate::sipflow`]). Takes precedence over `[sipflow]` config.
+    pub fn with_sipflow(mut self, sip_flow: Arc<SipFlow>) -> Self {
+        self.sip_flow = Some(sip_flow);
         self
     }
 
@@ -1243,6 +1264,35 @@ impl AppStateBuilder {
             learned_public_address = inspector.shared_public_address();
             next_inspector = Some(Box::new(inspector));
         }
+
+        // [sipflow] in-process signaling capture — outermost inspector so
+        // every message (both directions, REFER transfer dialogs included)
+        // is recorded before any other inspector sees it. An injected
+        // recorder takes precedence over the config section.
+        let sip_flow = match self.sip_flow.take() {
+            Some(flow) => Some(flow),
+            None => match config.sipflow.as_ref().filter(|c| c.enabled()) {
+                Some(sipflow_config) => {
+                    info!(
+                        max_calls = sipflow_config.max_calls(),
+                        max_items_per_call = sipflow_config.max_items_per_call(),
+                        upload = sipflow_config.upload.is_some(),
+                        "sipflow signaling capture enabled"
+                    );
+                    Some(Arc::new(SipFlow::new(
+                        sipflow_config.clone(),
+                        bind_addr.to_string(),
+                        None,
+                    )))
+                }
+                None => None,
+            },
+        };
+        if let Some(flow) = sip_flow.as_ref() {
+            flow.set_next(next_inspector.take());
+            next_inspector = Some(Box::new(SipFlow::clone(flow)));
+        }
+
         if let Some(inspector) = next_inspector {
             endpoint_builder = endpoint_builder.with_inspector(inspector);
         }
@@ -1281,6 +1331,17 @@ impl AppStateBuilder {
                 .with_config(callrecord.clone())
                 .with_max_concurrent(32)
                 .with_formatter(callrecord_formatter.clone());
+            // Attach the sipflow upload/eviction hook when capture is on.
+            let builder = match sip_flow.as_ref() {
+                Some(flow) => builder.with_hook(Arc::new(SipFlowUploadHook {
+                    flow: flow.clone(),
+                    upload: config
+                        .sipflow
+                        .as_ref()
+                        .and_then(|c| c.upload.clone()),
+                })),
+                None => builder,
+            };
 
             let mut callrecord_manager = builder.build();
             let sender = callrecord_manager.sender.clone();
@@ -1305,6 +1366,7 @@ impl AppStateBuilder {
             invitation: Invitation::new(dialog_layer),
             routing_state: Arc::new(crate::call::RoutingState::new()),
             pending_playbooks: Arc::new(Mutex::new(HashMap::new())),
+            sip_flow,
             learned_public_address,
             learned_peers,
             refer_header_resolver: self.refer_header_resolver,

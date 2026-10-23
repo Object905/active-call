@@ -109,6 +109,39 @@ auto_start = true
 type = "local"
 root = "./config/cdr"
 
+# ---------------------------------------------------------------------------
+# Sipflow: in-process SIP signaling capture (rustpbx-style).
+#
+# When enabled, every SIP message in both directions — including the dialogs
+# created for REFER transfers — is recorded into a bounded in-memory buffer.
+# When a call ends, all of the session's dialogs are merged into one
+# time-sorted JSONL and uploaded ({YYYYMMDD}/{session_id}.jsonl). Without
+# [sipflow.upload] the flows are captured and discarded at hangup.
+#
+# [sipflow]
+# max_calls = 4096                # LRU bound on tracked Call-IDs
+# max_items_per_call = 8192       # per-dialog message cap (overflow drops)
+#
+# Upload to S3-compatible storage:
+# [sipflow.upload]
+# type = "s3"
+# vendor = "aliyun"
+# bucket = "my-bucket"
+# region = "oss-cn-hangzhou"
+# access_key = "..."
+# secret_key = "..."
+# endpoint = "https://oss-cn-hangzhou.aliyuncs.com"
+# root = "sipflow"                # object key prefix
+#
+# ...or POST as a multipart file part (field "signaling"):
+# [sipflow.upload]
+# type = "http"
+# url = "https://collector.example.com/sipflow"
+# # headers = { Authorization = "Bearer ..." }
+# # file_field = "signaling"
+# # file_name = "{session_id}.jsonl"
+# ---------------------------------------------------------------------------
+
 # [[register_users]]
 # server = "127.0.0.1:5060" # Your Asterisk server
 # username = "1002"        # SIP extension

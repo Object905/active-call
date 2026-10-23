@@ -134,6 +134,38 @@ Behavior details:
 - Only one transfer can be in flight per call; concurrent REFERs are
   declined with `491 Request Pending` via the NOTIFY subscription.
 
+### SIP Signaling Capture (sipflow)
+
+In-process capture of every SIP message in both directions — including the
+dialogs created for REFER transfers — kept in a bounded in-memory buffer. When
+a call ends, all dialogs of the session (primary leg, bridge legs, transfer
+legs) are merged into one time-sorted JSONL document and uploaded; the
+per-line format matches rustpbx's sipflow export (plus a `call_id` field).
+
+```toml
+[sipflow]
+max_calls = 4096                # LRU bound on tracked Call-IDs
+max_items_per_call = 8192       # per-dialog message cap (overflow drops)
+
+# Optional upload of {YYYYMMDD}/{session_id}.jsonl to S3-compatible storage:
+[sipflow.upload]
+type = "s3"
+vendor = "aliyun"
+bucket = "my-bucket"
+region = "oss-cn-hangzhou"
+access_key = "..."
+secret_key = "..."
+endpoint = "https://oss-cn-hangzhou.aliyuncs.com"
+root = "sipflow"
+
+# ...or POST as a multipart file part (field "signaling"):
+# [sipflow.upload]
+# type = "http"
+# url = "https://collector.example.com/sipflow"
+```
+
+Without `[sipflow.upload]` the flows are captured and discarded at hangup.
+
 ### RTP Port Range
 
 ```toml

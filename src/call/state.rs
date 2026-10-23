@@ -268,6 +268,15 @@ pub fn build_callrecord(
     let refer_callrecord =
         refer_leg.map(|leg| Box::new(leg.build_callrecord(app_state, ActiveCallType::B2bua)));
 
+    // SIP Call-IDs of every dialog seen for this session (primary leg,
+    // bridge legs, REFER transfer legs) — resolved by the sipflow capture
+    // when enabled, empty otherwise.
+    let sip_call_ids = app_state
+        .sip_flow
+        .as_ref()
+        .map(|flow| flow.get_session_call_ids(&session_id))
+        .unwrap_or_default();
+
     let caller = option.caller.clone().unwrap_or_default();
     let callee = option.callee.clone().unwrap_or_default();
 
@@ -288,6 +297,7 @@ pub fn build_callrecord(
         dump_event_file,
         recorder,
         refer_callrecord,
+        sip_call_ids,
     }
 }
 

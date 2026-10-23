@@ -506,6 +506,10 @@ pub struct Config {
     /// Timeout in seconds for the INVITE handshake of an auto-refer leg.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_refer_timeout: Option<u32>,
+    /// In-process SIP signaling capture and post-call JSONL upload
+    /// (rustpbx-style "sipflow", lightweight in-memory flavour).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sipflow: Option<crate::sipflow::SipFlowConfig>,
 }
 
 impl Config {
@@ -633,6 +637,7 @@ impl Default for Config {
             options_response: None,
             auto_refer: None,
             auto_refer_timeout: None,
+            sipflow: None,
         }
     }
 }

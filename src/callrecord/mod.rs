@@ -98,6 +98,11 @@ pub struct CallRecord {
     pub extras: Option<HashMap<String, serde_json::Value>>,
     pub dump_event_file: Option<String>,
     pub refer_callrecord: Option<Box<CallRecord>>,
+    /// SIP Call-IDs of every dialog belonging to this session (primary leg,
+    /// bridge legs, REFER transfer legs), resolved by the sipflow capture
+    /// ([`crate::sipflow`]) so post-call hooks can merge all legs' signaling.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sip_call_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,6 +205,23 @@ pub trait CallRecordFormatter: Send + Sync {
     fn format_file_name(&self, record: &CallRecord) -> String;
     fn format_dump_events_path(&self, record: &CallRecord) -> String;
     fn format_media_path(&self, record: &CallRecord, media: &CallRecordMedia) -> String;
+}
+
+/// Post-processing hooks run by the [`CallRecordManager`] around the saver
+/// (single-record counterpart of rustpbx's `CallRecordHook`). Implement
+/// either method; both default to no-ops. Heavy work should be spawned.
+#[async_trait::async_trait]
+pub trait CallRecordHook: Send + Sync {
+    /// Runs before the record is handed to the saver; may mutate the record
+    /// (e.g. enrich fields that must appear in the persisted document).
+    async fn on_record_enrich(&self, _record: &mut CallRecord) -> Result<()> {
+        Ok(())
+    }
+
+    /// Runs after the saver finished (successfully or not).
+    async fn on_record_completed(&self, _record: &mut CallRecord) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub struct DefaultCallRecordFormatter {
@@ -330,6 +352,7 @@ pub struct CallRecordManager {
     receiver: CallRecordReceiver,
     saver_fn: FnSaveCallRecord,
     formatter: Arc<dyn CallRecordFormatter>,
+    hooks: Vec<Arc<dyn CallRecordHook>>,
 }
 
 pub struct CallRecordManagerBuilder {
@@ -338,6 +361,7 @@ pub struct CallRecordManagerBuilder {
     pub max_concurrent: Option<usize>,
     saver_fn: Option<FnSaveCallRecord>,
     formatter: Option<Arc<dyn CallRecordFormatter>>,
+    hooks: Vec<Arc<dyn CallRecordHook>>,
 }
 
 impl CallRecordManagerBuilder {
@@ -348,6 +372,7 @@ impl CallRecordManagerBuilder {
             max_concurrent: None,
             saver_fn: None,
             formatter: None,
+            hooks: Vec::new(),
         }
     }
 
@@ -373,6 +398,12 @@ impl CallRecordManagerBuilder {
 
     pub fn with_max_concurrent(mut self, max_concurrent: usize) -> Self {
         self.max_concurrent = Some(max_concurrent);
+        self
+    }
+
+    /// Appends a post-processing hook (see [`CallRecordHook`]).
+    pub fn with_hook(mut self, hook: Arc<dyn CallRecordHook>) -> Self {
+        self.hooks.push(hook);
         self
     }
 
@@ -412,6 +443,7 @@ impl CallRecordManagerBuilder {
             config,
             saver_fn,
             formatter,
+            hooks: self.hooks,
         }
     }
 }
@@ -739,16 +771,36 @@ impl CallRecordManager {
                 break;
             }
 
-            for record in buffer {
+            for mut record in buffer {
                 let cancel_token_ref = self.cancel_token.clone();
                 let save_fn_ref = self.saver_fn.clone();
                 let config_ref = self.config.clone();
                 let formatter_ref = self.formatter.clone();
+                let hooks = self.hooks.clone();
 
                 futures.push(async move {
-                    if let Err(e) =
-                        save_fn_ref(cancel_token_ref, formatter_ref, config_ref, record).await
-                    {
+                    for hook in &hooks {
+                        if let Err(e) = hook.on_record_enrich(&mut record).await {
+                            warn!(
+                                call_id = record.call_id,
+                                "callrecord on_record_enrich hook failed: {}", e
+                            );
+                        }
+                    }
+                    // The saver consumes the record; keep a copy for the
+                    // post-save hooks (records are small).
+                    let result =
+                        save_fn_ref(cancel_token_ref, formatter_ref, config_ref, record.clone())
+                            .await;
+                    for hook in &hooks {
+                        if let Err(e) = hook.on_record_completed(&mut record).await {
+                            warn!(
+                                call_id = record.call_id,
+                                "callrecord on_record_completed hook failed: {}", e
+                            );
+                        }
+                    }
+                    if let Err(e) = result {
                         warn!("Failed to save call record: {}", e);
                     }
                 });
@@ -756,5 +808,109 @@ impl CallRecordManager {
             while let Some(_) = futures.next().await {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Records the order hook/saver invocations happen in.
+    struct OrderingHook {
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        name: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl CallRecordHook for OrderingHook {
+        async fn on_record_enrich(&self, record: &mut CallRecord) -> Result<()> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("{}:enrich", self.name));
+            // Enrich must be able to mutate the persisted record.
+            record.sip_call_ids.push(format!("from-{}", self.name));
+            Ok(())
+        }
+
+        async fn on_record_completed(&self, _record: &mut CallRecord) -> Result<()> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("{}:completed", self.name));
+            Ok(())
+        }
+    }
+
+    fn sample_record() -> CallRecord {
+        CallRecord {
+            call_type: crate::call::ActiveCallType::Sip,
+            option: None,
+            call_id: "s.test".into(),
+            start_time: Utc::now(),
+            ring_time: None,
+            answer_time: None,
+            end_time: Utc::now(),
+            caller: "a".into(),
+            callee: "b".into(),
+            status_code: 200,
+            hangup_reason: None,
+            hangup_messages: Vec::new(),
+            recorder: Vec::new(),
+            extras: None,
+            dump_event_file: None,
+            refer_callrecord: None,
+            sip_call_ids: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn hooks_run_around_the_saver() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let saved: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let saver_saved = saved.clone();
+        let saver: FnSaveCallRecord = Arc::new(Box::new(
+            move |_token, _formatter, _config, record| {
+                let saver_saved = saver_saved.clone();
+                Box::pin(async move {
+                    saver_saved.lock().unwrap().push(record.call_id.clone());
+                    Ok(())
+                })
+            },
+        ));
+
+        // Build the manager field-by-field so the test can close the
+        // channel after sending (swap out the manager's own sender clone).
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut manager = CallRecordManager {
+            max_concurrent: 4,
+            sender,
+            config: Arc::new(CallRecordConfig::default()),
+            cancel_token: CancellationToken::new(),
+            receiver,
+            saver_fn: saver,
+            formatter: Arc::new(DefaultCallRecordFormatter::default()),
+            hooks: vec![Arc::new(OrderingHook {
+                events: events.clone(),
+                name: "h1",
+            })],
+        };
+
+        manager.sender.send(sample_record()).unwrap();
+        let real_sender = std::mem::replace(
+            &mut manager.sender,
+            tokio::sync::mpsc::unbounded_channel().0,
+        );
+        drop(real_sender);
+        manager.recv_loop().await.unwrap();
+
+        let timeline = events.lock().unwrap().clone();
+        assert_eq!(
+            timeline,
+            vec!["h1:enrich".to_string(), "h1:completed".to_string()]
+        );
+        // The saver saw the enriched record.
+        assert_eq!(saved.lock().unwrap().len(), 1);
     }
 }

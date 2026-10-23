@@ -29,6 +29,7 @@ pub mod offline;
 
 pub mod playbook;
 pub mod sip_util;
+pub mod sipflow;
 pub mod synthesis;
 pub mod transcription;
 pub mod useragent;

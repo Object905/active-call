@@ -881,6 +881,17 @@ impl ActiveCall {
             .invite(out.invite_option, dlg_state_sender)
             .await?;
 
+        // Register the new dialog's SIP Call-ID under the session (and the
+        // leg's own session id for REFER transfer legs) so sipflow merges
+        // all legs' signaling into the session's JSONL.
+        if let Some(flow) = self.app_state.sip_flow.as_ref() {
+            flow.associate(&self.session_id, &dialog_id.call_id);
+            let leg_session_id = out.leg.progress.load_full().session_id.clone();
+            if leg_session_id != self.session_id {
+                flow.associate(&leg_session_id, &dialog_id.call_id);
+            }
+        }
+
         if out.cancel_token.is_cancelled() {
             // CANCEL and the far end's 2xx crossed in flight (RFC 3261 S9.1
             // glare) - e.g. a slow PSTN gateway had already committed to
