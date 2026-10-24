@@ -1,5 +1,5 @@
 use crate::CallOption;
-use crate::call::{ActiveCallRef, Command};
+use crate::call::{ActiveCallRef, ActiveCallType, Command};
 use crate::event::EventReceiver;
 use anyhow::{Result, anyhow};
 use serde_json::json;
@@ -32,15 +32,14 @@ impl PlaybookRunner {
 
     pub fn new(playbook: Playbook, call: ActiveCallRef) -> Result<Self> {
         let event_receiver = call.event_sender.subscribe();
-        if let Ok(mut state) = call.call_state.try_write() {
+        // Runs before `serve` starts, so this plain rcu cannot race the actor.
+        call.progress.rcu(|p| {
+            let mut p = crate::call::state::CallProgress::clone(p);
             // Ensure option exists before applying config
-            if state.option.is_none() {
-                state.option = Some(CallOption::default());
-            }
-            if let Some(option) = state.option.as_mut() {
-                apply_playbook_config(option, &playbook.config);
-            }
-        }
+            let option = p.option.get_or_insert_with(CallOption::default);
+            apply_playbook_config(option, &playbook.config);
+            p
+        });
 
         let handler: Box<dyn DialogueHandler> = if let Some(llm_config) = &playbook.config.llm {
             let mut llm_config = llm_config.clone();
@@ -85,29 +84,41 @@ impl PlaybookRunner {
             self.call.session_id
         );
 
-        let mut answered = {
-            let state = self.call.call_state.read().await;
-            state.answer_time.is_some()
-        };
+        let mut answered = self.call.progress.load_full().answer_time.is_some();
+        let wait_for_media_ready = matches!(
+            self.call.call_type,
+            ActiveCallType::Sip | ActiveCallType::B2bua
+        );
+        let mut media_ready = !wait_for_media_ready;
 
         if let Ok(commands) = self.handler.on_start().await {
             for cmd in commands {
                 let is_media = matches!(cmd, Command::Tts { .. } | Command::Play { .. });
 
-                if is_media && !answered {
-                    info!("Waiting for call establishment before executing media command...");
+                if is_media && (!answered || !media_ready) {
+                    info!(
+                        wait_for_media_ready,
+                        "Waiting for call media readiness before executing media command..."
+                    );
                     while let Ok(event) = self.event_receiver.recv().await {
                         match &event {
                             crate::event::SessionEvent::Answer { .. } => {
-                                info!("Call established, proceeding to execute media command");
+                                info!("Call established");
                                 answered = true;
-                                break;
+                            }
+                            crate::event::SessionEvent::MediaReady { .. } => {
+                                info!("Call media ready");
+                                media_ready = true;
                             }
                             crate::event::SessionEvent::Hangup { .. } => {
-                                info!("Call hung up before established, stopping");
+                                info!("Call hung up before media command, stopping");
                                 return;
                             }
                             _ => {}
+                        }
+                        if answered && media_ready {
+                            info!("Proceeding to execute media command");
+                            break;
                         }
                     }
                 }
@@ -161,9 +172,7 @@ impl PlaybookRunner {
             crate::spawn(async move {
                 info!("Executing posthook for session {}", session_id);
 
-                let posthook_timeout = Duration::from_secs(
-                    posthook.timeout.unwrap_or(30) as u64
-                );
+                let posthook_timeout = Duration::from_secs(posthook.timeout.unwrap_or(30) as u64);
 
                 let posthook_task = async {
                     let summary = if let Some(summary_type) = &posthook.summary {
@@ -221,7 +230,10 @@ impl PlaybookRunner {
                     }
                 };
 
-                if tokio::time::timeout(posthook_timeout, posthook_task).await.is_err() {
+                if tokio::time::timeout(posthook_timeout, posthook_task)
+                    .await
+                    .is_err()
+                {
                     error!("Posthook timed out for session {}", session_id);
                 }
             });
@@ -250,6 +262,9 @@ pub fn apply_playbook_config(option: &mut CallOption, config: &PlaybookConfig) {
     if let Some(denoise) = config.denoise {
         option.denoise = Some(denoise);
     }
+    if let Some(agc) = config.agc.clone() {
+        option.agc = Some(agc);
+    }
     if let Some(ambiance) = config.ambiance.clone() {
         option.ambiance = Some(ambiance);
     }
@@ -273,6 +288,9 @@ pub fn apply_playbook_config(option: &mut CallOption, config: &PlaybookConfig) {
     }
     if let Some(sip) = config.sip.clone() {
         option.sip = Some(sip);
+    }
+    if let Some(ringback) = config.ringback_detection.clone() {
+        option.ringback_detection = Some(ringback);
     }
 }
 

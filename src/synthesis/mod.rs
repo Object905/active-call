@@ -32,6 +32,7 @@ pub struct SynthesisCommand {
     pub option: SynthesisOption,
     pub base64: bool,
     pub cache_key: Option<String>,
+    pub auto_hangup: Option<bool>,
 }
 pub type SynthesisCommandSender = mpsc::UnboundedSender<SynthesisCommand>;
 pub type SynthesisCommandReceiver = mpsc::UnboundedReceiver<SynthesisCommand>;
@@ -92,11 +93,13 @@ pub struct SynthesisOption {
     pub speed: Option<f32>,
     pub app_id: Option<String>,
     pub secret_id: Option<String>,
+    #[serde(alias = "apiKey")]
     pub secret_key: Option<String>,
     pub volume: Option<i32>,
     pub speaker: Option<String>,
     pub codec: Option<String>,
     pub subtitle: Option<bool>,
+    #[serde(alias = "voice")]
     pub model: Option<String>,
     pub language: Option<String>,
     /// emotion: neutral、sad、happy、angry、fear、news、story、radio、poetry、

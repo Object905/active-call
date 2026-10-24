@@ -4,6 +4,7 @@ Cargo.lock
 /config/cdr
 /config/recorders
 /config/playbook
+__pycache__
 .env
 *.decoded
 *.encoded
@@ -15,3 +16,5 @@ bank-demo/
 models/
 .venv*/
 .claude/
+*.bin
+static/webrtc-demo.html

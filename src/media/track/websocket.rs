@@ -160,6 +160,7 @@ impl Track for WebsocketTrack {
                     duration: crate::media::get_timestamp() - start_time,
                     ssrc,
                     play_id: None,
+                    auto_hangup: None,
                 })
                 .ok();
         });

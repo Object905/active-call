@@ -208,7 +208,7 @@ pub fn sample_noisy_latent(
     let bsz = duration.len();
 
     // Find absolute max length in time domain
-    let max_duration = duration.iter().cloned().fold(0. / 0., f32::max);
+    let max_duration = duration.iter().cloned().fold(f32::NAN, f32::max);
     let wav_len_max = (max_duration * sample_rate as f32) as usize;
 
     let wav_lengths: Vec<usize> = duration
