@@ -68,9 +68,9 @@ pub struct CallOption {
     /// Incoming RTC sample timeout in seconds; None or zero disables notifications.
     pub rtp_timeout: Option<u64>,
     /// Jitter buffer and loss concealment on this leg's inbound audio (see
-    /// `media::jitter`). None: on for WebRTC (`webrtc_jitter_buffer` in the
-    /// config), off for SIP. Worth turning on for SIP endpoints on the open
-    /// internet, such as softphones, rather than carrier trunks.
+    /// `media::jitter`). None: `[jitter_buffer]` in the config, by default
+    /// on for WebRTC, off for SIP. Worth turning on for SIP endpoints on the
+    /// open internet, such as softphones, rather than carrier trunks.
     pub jitter_buffer: Option<bool>,
     pub sip: Option<SipOption>,
     pub extra: Option<HashMap<String, String>>,
