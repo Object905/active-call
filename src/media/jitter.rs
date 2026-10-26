@@ -177,6 +177,14 @@ impl<T> PlayoutBuffer<T> {
         }
     }
 
+    /// After a [`Playout::Lost`], the frame right after the lost one, if
+    /// it's buffered: what in-band FEC rebuilds the lost one from.
+    pub fn following(&self) -> Option<&T> {
+        // `next` moved past a lost frame only when later ones are here; on
+        // an underrun it stays on the missing one, and nothing is buffered
+        self.frames.get(&self.next?)
+    }
+
     pub fn tick(&mut self) -> Playout<T> {
         let next = match self.next {
             Some(next) => next,
@@ -274,6 +282,24 @@ mod tests {
         }
         assert_eq!(drain(&mut buf, 4), vec![Frame(1), Frame(2), Lost, Frame(4)]);
         assert_eq!(buf.stats().lost, 1);
+    }
+
+    #[test]
+    fn following_is_the_frame_after_the_lost_one() {
+        let mut buf = buffer();
+        for seq in [1, 2, 4, 6] {
+            buf.push(seq, seq);
+        }
+        assert_eq!(drain(&mut buf, 3), vec![Frame(1), Frame(2), Lost]);
+        assert_eq!(buf.following(), Some(&4));
+        assert_eq!(buf.tick(), Frame(4));
+        // 5 lost, 6 right after it
+        assert_eq!(buf.tick(), Lost);
+        assert_eq!(buf.following(), Some(&6));
+        assert_eq!(buf.tick(), Frame(6));
+        // an underrun: nothing after it yet
+        assert_eq!(buf.tick(), Lost);
+        assert_eq!(buf.following(), None);
     }
 
     #[test]

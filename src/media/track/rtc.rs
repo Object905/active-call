@@ -195,6 +195,32 @@ const DTMF_STALE_TIMEOUT: Duration = Duration::from_millis(1000);
 /// Re-anchor the media clock once wall clock runs this far ahead of it.
 const MEDIA_GAP_THRESHOLD: Duration = Duration::from_millis(30);
 
+/// Inbound audio passed from the receiving worker, through the playout
+/// worker when there is one, to the processing worker.
+enum Inbound {
+    Frame(RtcAudioFrame),
+    /// A frame of `ptime` was due but lost. `next` is the frame right after
+    /// it, when already buffered, to rebuild it from (Opus in-band FEC).
+    Lost {
+        ptime: Duration,
+        next: Option<(Option<u8>, Bytes)>,
+    },
+}
+
+/// How the processing worker filled in lost frames.
+#[derive(Default)]
+struct LossStats {
+    /// Opus with the next packet at hand: rebuilt from its in-band FEC,
+    /// where the sender coded any.
+    recovered: u64,
+    /// Concealed by the codec's decoder.
+    codec_concealed: u64,
+    /// Concealed from the decoded audio (`media::plc`).
+    concealed: u64,
+    /// Left as gaps: nothing decoded to conceal from.
+    unconcealed: u64,
+}
+
 impl RtcTrack {
     pub fn new(
         cancel_token: CancellationToken,
@@ -579,11 +605,15 @@ impl RtcTrack {
         std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
         std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
     ) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Playout<RtcAudioFrame>>();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Inbound>();
 
         let recv_fut = Self::run_receiving_worker(track, tx, track_id.clone(), rtp_timeout);
         let proc_fut = match playout_ptime {
             Some(ptime) => {
+                // the playout worker reports losses: have the decoders
+                // conceal them
+                let mut processor_chain = processor_chain;
+                processor_chain.codec.enable_concealment();
                 let (playout_tx, playout_rx) = tokio::sync::mpsc::unbounded_channel();
                 let playout = Self::run_playout_worker(rx, playout_tx, track_id.clone(), ptime);
                 let processing = Self::run_processing_worker(
@@ -614,8 +644,8 @@ impl RtcTrack {
     /// Releases received frames one per packet time, in sequence order,
     /// reporting the missing ones as `Playout::Lost` (see `media::jitter`).
     async fn run_playout_worker(
-        mut rx: tokio::sync::mpsc::UnboundedReceiver<Playout<RtcAudioFrame>>,
-        tx: tokio::sync::mpsc::UnboundedSender<Playout<RtcAudioFrame>>,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<Inbound>,
+        tx: tokio::sync::mpsc::UnboundedSender<Inbound>,
         track_id: TrackId,
         mut ptime: Duration,
     ) {
@@ -628,10 +658,10 @@ impl RtcTrack {
         loop {
             tokio::select! {
                 item = rx.recv() => {
-                    let Some(Playout::Frame(frame)) = item else { break };
+                    let Some(Inbound::Frame(frame)) = item else { break };
                     let Some(seq) = frame.sequence_number else {
                         // nothing to order it by
-                        if tx.send(Playout::Frame(frame)).is_err() {
+                        if tx.send(Inbound::Frame(frame)).is_err() {
                             break;
                         }
                         continue;
@@ -670,7 +700,13 @@ impl RtcTrack {
                 _ = ticker.tick() => {
                     let out = match buffer.tick() {
                         Playout::Idle => continue,
-                        out => out,
+                        Playout::Frame(frame) => Inbound::Frame(frame),
+                        Playout::Lost => Inbound::Lost {
+                            ptime,
+                            next: buffer
+                                .following()
+                                .map(|f| (f.payload_type, f.data.clone())),
+                        },
                     };
                     if tx.send(out).is_err() {
                         break;
@@ -694,7 +730,7 @@ impl RtcTrack {
     }
 
     async fn run_processing_worker(
-        mut rx: tokio::sync::mpsc::UnboundedReceiver<Playout<RtcAudioFrame>>,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<Inbound>,
         track_id: TrackId,
         packet_sender: Arc<Mutex<Option<TrackPacketSender>>>,
         mut processor_chain: ProcessorChain,
@@ -702,14 +738,24 @@ impl RtcTrack {
     ) {
         info!(track_id=%track_id, "RtcTrack processing worker started");
         let mut concealer = Concealer::new();
+        let mut losses = LossStats::default();
         while let Some(item) = rx.recv().await {
             let frame = match item {
-                Playout::Frame(frame) => frame,
-                Playout::Lost => {
-                    Self::conceal_frame(&mut concealer, &track_id, &packet_sender).await;
+                Inbound::Frame(frame) => frame,
+                Inbound::Lost { ptime, next } => {
+                    let next = next.map(|(pt, data)| (pt.unwrap_or(default_payload_type), data));
+                    Self::conceal_frame(
+                        &mut concealer,
+                        &mut processor_chain,
+                        &track_id,
+                        &packet_sender,
+                        ptime,
+                        next,
+                        &mut losses,
+                    )
+                    .await;
                     continue;
                 }
-                Playout::Idle => continue,
             };
             let res = std::panic::AssertUnwindSafe(Self::process_audio_frame(
                 frame,
@@ -734,38 +780,84 @@ impl RtcTrack {
                 break;
             }
         }
-        info!(track_id=%track_id, "RtcTrack processing worker stopped");
+        info!(
+            track_id=%track_id,
+            recovered = losses.recovered,
+            codec_concealed = losses.codec_concealed,
+            concealed = losses.concealed,
+            unconcealed = losses.unconcealed,
+            "RtcTrack processing worker stopped"
+        );
     }
 
-    /// Plays a concealment frame in place of a lost one. Only possible once
-    /// the chain decodes this track to PCM; undecoded RTP passes through
-    /// with the gap.
+    /// Plays a frame in place of a lost one: rebuilt from the next packet's
+    /// in-band FEC, or concealed by the codec's decoder, run through the
+    /// chain like a decoded packet; else concealed from the decoded audio.
+    /// Only possible once the chain decodes this track to PCM; undecoded
+    /// RTP passes through with the gap.
     async fn conceal_frame(
         concealer: &mut Concealer,
+        processor_chain: &mut ProcessorChain,
         track_id: &TrackId,
         packet_sender: &Arc<Mutex<Option<TrackPacketSender>>>,
+        ptime: Duration,
+        next: Option<(u8, Bytes)>,
+        losses: &mut LossStats,
     ) {
-        let Some((samples, sample_rate)) = concealer.conceal() else {
-            return;
-        };
-        let packet_sender = packet_sender.lock().await;
-        if let Some(sender) = packet_sender.as_ref() {
-            sender
-                .send(AudioFrame {
+        let frame = match processor_chain
+            .codec
+            .conceal(ptime, next.as_ref().map(|(pt, data)| (*pt, &data[..])))
+        {
+            Some((sample_rate, channels, samples, used_next)) => {
+                if used_next {
+                    losses.recovered += 1;
+                } else {
+                    losses.codec_concealed += 1;
+                }
+                let mut af = AudioFrame {
+                    track_id: track_id.clone(),
+                    samples: crate::media::Samples::PCM { samples },
+                    timestamp: crate::media::get_timestamp(),
+                    sample_rate,
+                    channels,
+                    ..Default::default()
+                };
+                if let Err(e) = processor_chain.process_frame(&mut af) {
+                    debug!(track_id=%track_id, "processor_chain process_frame error: {:?}", e);
+                }
+                if let crate::media::Samples::PCM { samples } = &mut af.samples
+                    && af.channels == 1
+                {
+                    // keeps the fallback's history continuous
+                    concealer.on_frame(samples, af.sample_rate);
+                }
+                af
+            }
+            None => {
+                let Some((samples, sample_rate)) = concealer.conceal() else {
+                    losses.unconcealed += 1;
+                    return;
+                };
+                losses.concealed += 1;
+                AudioFrame {
                     track_id: track_id.clone(),
                     samples: crate::media::Samples::PCM { samples },
                     timestamp: crate::media::get_timestamp(),
                     sample_rate,
                     channels: 1,
                     ..Default::default()
-                })
-                .ok();
+                }
+            }
+        };
+        let packet_sender = packet_sender.lock().await;
+        if let Some(sender) = packet_sender.as_ref() {
+            sender.send(frame).ok();
         }
     }
 
     async fn run_receiving_worker(
         track: Arc<SampleStreamTrack>,
-        tx: tokio::sync::mpsc::UnboundedSender<Playout<RtcAudioFrame>>,
+        tx: tokio::sync::mpsc::UnboundedSender<Inbound>,
         track_id: TrackId,
         rtp_timeout: Arc<RtpTimeoutMonitor>,
     ) {
@@ -781,7 +873,7 @@ impl RtcTrack {
                 rtp_timeout
                     .last_rx_ms
                     .store(rtp_timeout.now_ms(), Ordering::Relaxed);
-                if let Err(_) = tx.send(Playout::Frame(frame)) {
+                if let Err(_) = tx.send(Inbound::Frame(frame)) {
                     break;
                 }
             } else {
