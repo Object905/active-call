@@ -1,7 +1,11 @@
 //! Packet loss concealment for decoded PCM, after ITU-T G.711 Appendix I.
 //!
 //! A lost frame is filled by repeating the last pitch period of the audio
-//! before it, overlap-added onto that audio so there's no step at the seam.
+//! before it, continuing the waveform where it stopped. The period's last
+//! quarter is overlap-added with the quarter before it, so each repetition
+//! runs into the next without a step. (Appendix I also smooths the seam
+//! with the last audio played, by holding output back 3.75 ms; this plays
+//! without delay, so that seam is only as smooth as the pitch estimate.)
 //! Long losses fade out: the first 10 ms play at full level, then the level
 //! drops by 20% per 10 ms and reaches silence 60 ms in. When real frames
 //! resume, the first one is crossfaded with the continued synthesis.
@@ -92,21 +96,10 @@ impl Concealer {
         if self.frame_len == 0 || self.history.len() < self.history_len() {
             return None;
         }
-        let first = self.concealed == 0;
-        if first {
+        if self.concealed == 0 {
             self.start_period();
         }
         let mut out = self.synthesize(self.frame_len);
-        if first {
-            // overlap-add the start onto the audio the loss interrupted, a
-            // quarter period long, so the waveform continues without a step
-            let ola = (self.period.len() / 4).min(out.len());
-            let prev = &self.history[self.history.len() - ola..];
-            for i in 0..ola {
-                let w = (i + 1) as f32 / (ola + 1) as f32;
-                out[i] = (prev[i] as f32 * (1.0 - w) + out[i] as f32 * w) as i16;
-            }
-        }
         let full = self.ms(FULL_LEVEL_MS);
         let per_10ms = self.ms(10).max(1);
         for (i, s) in out.iter_mut().enumerate() {
@@ -144,7 +137,18 @@ impl Concealer {
                 best = (lag, score);
             }
         }
-        self.period = h[end - best.0..].to_vec();
+        let p = best.0;
+        let mut period = h[end - p..].to_vec();
+        // the period wraps from its end, the last sample played, back to
+        // its start: fade its last quarter into the quarter before its
+        // start, the audio that led into the start
+        let ola = p / 4;
+        let before = &h[end - p - ola..end - p];
+        for (i, (t, b)) in period[p - ola..].iter_mut().zip(before).enumerate() {
+            let w = (i + 1) as f32 / (ola + 1) as f32;
+            *t = (*t as f32 * (1.0 - w) + *b as f32 * w) as i16;
+        }
+        self.period = period;
         self.pos = 0;
     }
 
@@ -223,6 +227,34 @@ mod tests {
         let mut seam = vec![last];
         seam.extend_from_slice(&out);
         assert!(max_step(&seam) < 1000, "step {}", max_step(&seam));
+    }
+
+    #[test]
+    fn concealment_continues_from_any_phase() {
+        // the loss may cut the waveform anywhere in its cycle: the
+        // concealment must carry on from that point, across its own
+        // repetitions too
+        for offset in (0..FRAME).step_by(13) {
+            let shifted = |frame: usize| -> Vec<i16> {
+                (0..FRAME)
+                    .map(|i| {
+                        let t = (frame * FRAME + i + offset) as f32 / SR as f32;
+                        (8000.0 * (2.0 * std::f32::consts::PI * 150.0 * t).sin()) as i16
+                    })
+                    .collect()
+            };
+            let mut c = Concealer::new();
+            for f in 0..5 {
+                c.on_frame(&mut shifted(f), SR);
+            }
+            let mut seam = vec![*shifted(4).last().unwrap()];
+            seam.extend_from_slice(&c.conceal().unwrap().0);
+            assert!(
+                max_step(&seam) < 1000,
+                "offset {offset}: step {}",
+                max_step(&seam)
+            );
+        }
     }
 
     #[test]
