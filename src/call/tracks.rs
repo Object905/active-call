@@ -218,6 +218,7 @@ impl ActiveCall {
 
         let mut rtc_config = RtcTrackConfig::default();
         rtc_config.rtp_timeout = option.rtp_timeout.map(Duration::from_secs);
+        rtc_config.jitter_buffer = option.jitter_buffer;
         let use_srtp = option
             .sip
             .as_ref()
@@ -314,10 +315,12 @@ impl ActiveCall {
         ssrc: u32,
         enable_srtp: Option<bool>,
         rtp_timeout: Option<u64>,
+        jitter_buffer: Option<bool>,
         offer: Option<&str>,
     ) -> Result<RtcTrack> {
         let mut rtc_config = RtcTrackConfig::default();
         rtc_config.rtp_timeout = rtp_timeout.map(Duration::from_secs);
+        rtc_config.jitter_buffer = jitter_buffer;
         // Per-call flag takes precedence over global config.
         let use_srtp = enable_srtp
             .or(self.app_state.config.enable_srtp)
@@ -687,7 +690,9 @@ impl ActiveCall {
         rtc_config.rtp_timeout = option.rtp_timeout.map(Duration::from_secs);
         rtc_config.mode = rustrtc::TransportMode::WebRtc; // WebRTC
         rtc_config.ice_servers = self.app_state.config.ice_servers.clone();
-        rtc_config.jitter_buffer = self.app_state.config.webrtc_jitter_buffer;
+        rtc_config.jitter_buffer = option
+            .jitter_buffer
+            .or(self.app_state.config.webrtc_jitter_buffer);
 
         self.rtc_apply_codecs(&mut rtc_config);
         self.rtc_apply_network(&mut rtc_config);
@@ -750,6 +755,7 @@ impl ActiveCall {
                 ssrc,
                 per_call_srtp,
                 out.call_option.rtp_timeout,
+                out.call_option.jitter_buffer,
                 None,
             )
             .await
@@ -992,7 +998,9 @@ impl ActiveCall {
             rtc_config.rtp_timeout = option.rtp_timeout.map(Duration::from_secs);
             rtc_config.mode = rustrtc::TransportMode::WebRtc;
             rtc_config.ice_servers = self.app_state.config.ice_servers.clone();
-            rtc_config.jitter_buffer = self.app_state.config.webrtc_jitter_buffer;
+            rtc_config.jitter_buffer = option
+                .jitter_buffer
+                .or(self.app_state.config.webrtc_jitter_buffer);
             self.rtc_apply_network(&mut rtc_config);
             self.rtc_apply_latching(&mut rtc_config);
             restrict_codecs_to_offer(&mut rtc_config, &offer);
@@ -1014,6 +1022,7 @@ impl ActiveCall {
                     self.ssrc,
                     per_call_srtp,
                     option.rtp_timeout,
+                    option.jitter_buffer,
                     Some(&offer),
                 )
                 .await?;
