@@ -487,6 +487,9 @@ pub struct Config {
     pub media_cache_path: String,
     pub ambiance: Option<AmbianceOption>,
     pub ice_servers: Option<Vec<IceServer>>,
+    /// Jitter buffer and loss concealment on WebRTC legs' inbound audio
+    /// (default on); see `media::jitter`.
+    pub webrtc_jitter_buffer: Option<bool>,
     #[serde(default)]
     pub recording: Option<RecordingPolicy>,
     pub rewrites: Option<Vec<RewriteRule>>,
@@ -619,6 +622,7 @@ impl Default for Config {
             ambiance: None,
             callrecord: None,
             ice_servers: None,
+            webrtc_jitter_buffer: None,
             codecs: None,
             external_ip: None,
             rtp_start_port: default_config_rtp_start_port(),

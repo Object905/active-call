@@ -687,6 +687,7 @@ impl ActiveCall {
         rtc_config.rtp_timeout = option.rtp_timeout.map(Duration::from_secs);
         rtc_config.mode = rustrtc::TransportMode::WebRtc; // WebRTC
         rtc_config.ice_servers = self.app_state.config.ice_servers.clone();
+        rtc_config.jitter_buffer = self.app_state.config.webrtc_jitter_buffer;
 
         self.rtc_apply_codecs(&mut rtc_config);
         self.rtc_apply_network(&mut rtc_config);
@@ -991,6 +992,7 @@ impl ActiveCall {
             rtc_config.rtp_timeout = option.rtp_timeout.map(Duration::from_secs);
             rtc_config.mode = rustrtc::TransportMode::WebRtc;
             rtc_config.ice_servers = self.app_state.config.ice_servers.clone();
+            rtc_config.jitter_buffer = self.app_state.config.webrtc_jitter_buffer;
             self.rtc_apply_network(&mut rtc_config);
             self.rtc_apply_latching(&mut rtc_config);
             restrict_codecs_to_offer(&mut rtc_config, &offer);
