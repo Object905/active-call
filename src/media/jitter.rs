@@ -78,6 +78,8 @@ pub struct PlayoutBuffer<T> {
     next: Option<u64>,
     /// Extended form of the last sequence number seen, to unwrap the next.
     last_seq: Option<u64>,
+    /// The sender's SSRC, when known.
+    source: Option<u32>,
     concealed_run: usize,
     above_target_ticks: usize,
     stats: PlayoutStats,
@@ -90,6 +92,7 @@ impl<T> PlayoutBuffer<T> {
             frames: BTreeMap::new(),
             next: None,
             last_seq: None,
+            source: None,
             concealed_run: 0,
             above_target_ticks: 0,
             stats: PlayoutStats::default(),
@@ -126,6 +129,17 @@ impl<T> PlayoutBuffer<T> {
         self.concealed_run = 0;
         self.above_target_ticks = 0;
         self.stats.resets += 1;
+    }
+
+    /// Note the SSRC of the frames about to be pushed. A new SSRC is a new
+    /// stream with its own random sequence numbers: one landing just behind
+    /// the old stream's would otherwise be dropped as late until it caught
+    /// up, which `RESET_GAP` doesn't cover.
+    pub fn set_source(&mut self, ssrc: u32) {
+        if self.source.is_some_and(|source| source != ssrc) {
+            self.reset();
+        }
+        self.source = Some(ssrc);
     }
 
     pub fn push(&mut self, seq: u16, frame: T) {
@@ -349,6 +363,25 @@ mod tests {
         assert_eq!(buf.tick(), Idle);
         buf.push(5001, 5001);
         assert_eq!(drain(&mut buf, 2), vec![Frame(5000), Frame(5001)]);
+    }
+
+    #[test]
+    fn new_ssrc_restarts_the_stream() {
+        let mut buf = buffer();
+        buf.set_source(1);
+        buf.push(100, 100);
+        buf.push(101, 101);
+        assert_eq!(buf.tick(), Frame(100));
+        // the new stream's numbers land just behind the old ones
+        buf.set_source(2);
+        buf.push(90, 90);
+        buf.push(91, 91);
+        assert_eq!(buf.stats().resets, 1);
+        assert_eq!(buf.stats().late, 0);
+        assert_eq!(drain(&mut buf, 2), vec![Frame(90), Frame(91)]);
+        // the same source again changes nothing
+        buf.set_source(2);
+        assert_eq!(buf.stats().resets, 1);
     }
 
     #[test]

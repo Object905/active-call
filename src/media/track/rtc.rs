@@ -662,6 +662,9 @@ impl RtcTrack {
                         }
                     }
                     last = Some((seq, frame.rtp_timestamp));
+                    if let Some(packet) = &frame.raw_packet {
+                        buffer.set_source(packet.header.ssrc);
+                    }
                     buffer.push(seq, frame);
                 }
                 _ = ticker.tick() => {
