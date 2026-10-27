@@ -6,8 +6,8 @@ use std::collections::HashMap;
 
 use crate::{
     media::{
-        agc::AGCOption, ambiance::AmbianceOption, recorder::RecorderOption,
-        track::media_pass::MediaPassOption, vad::VADOption,
+        agc::AGCOption, ambiance::AmbianceOption, monitor::MonitorOption,
+        recorder::RecorderOption, track::media_pass::MediaPassOption, vad::VADOption,
     },
     synthesis::SynthesisOption,
     transcription::TranscriptionOption,
@@ -74,6 +74,9 @@ pub struct CallOption {
     pub eou: Option<EouOption>,
     pub realtime: Option<RealtimeOption>,
     pub subscribe: Option<bool>,
+    /// Side-path audio distribution: dial out to a websocket and mirror both
+    /// legs' audio (one-way tap, the media path is untouched).
+    pub monitor: Option<MonitorOption>,
     pub enable_ice_lite: Option<bool>,
     pub ringback_detection: Option<RingbackDetectionOption>,
 }
@@ -102,6 +105,7 @@ impl Default for CallOption {
             eou: None,
             realtime: None,
             subscribe: None,
+            monitor: None,
             enable_ice_lite: None,
             ringback_detection: None,
         }

@@ -9,6 +9,7 @@ pub mod dtmf;
 pub mod engine;
 pub mod inactivity;
 pub mod loader;
+pub mod monitor;
 pub mod negotiate;
 pub mod processor;
 pub mod realtime_processor;

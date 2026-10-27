@@ -1,4 +1,5 @@
 use crate::media::agc::AGCOption;
+use crate::media::monitor::MonitorOption;
 use crate::media::recorder::RecorderOption;
 use crate::media::vad::VADOption;
 use crate::synthesis::SynthesisOption;
@@ -62,6 +63,8 @@ pub struct PlaybookConfig {
     pub dtmf_collectors: Option<HashMap<String, DtmfCollectorConfig>>,
     pub realtime: Option<RealtimeOption>,
     pub ringback_detection: Option<RingbackDetectionOption>,
+    /// Side-path audio distribution (see `media::monitor`).
+    pub monitor: Option<MonitorOption>,
     pub posthook: Option<PostHookConfig>,
     pub follow_up: Option<FollowUpConfig>,
     pub sip: Option<SipOption>,

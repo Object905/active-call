@@ -6,6 +6,7 @@ use crate::{
     media::{
         TrackId,
         engine::StreamEngine,
+        monitor::MonitorOption,
         recorder::RecorderOption,
         stream::{MediaStream, MediaStreamBuilder, SERVER_SIDE_TRACK_ID},
         track::{
@@ -1545,6 +1546,13 @@ impl ActiveCall {
         }
         self.ensure_call_ambiance(&option).await;
 
+        // Side-path audio distribution: create the monitor hub before any
+        // track is added so every track (media-pass, caller, TTS, …) gets
+        // tapped as it is registered.
+        if option.monitor.is_some() {
+            self.media_stream.enable_monitor().await;
+        }
+
         if let Some(opt) = &option.media_pass {
             let track_id = self.server_side_track_id.clone();
             let cancel_token = self.cancel_token.child_token();
@@ -1569,7 +1577,13 @@ impl ActiveCall {
         );
 
         match self.setup_caller_track(&option).await {
-            Ok(_) => return Ok(option),
+            Ok(_) => {
+                // Both legs exist by now; dial out the side-path monitor.
+                if let Some(monitor) = option.monitor.clone() {
+                    self.start_monitor_forwarder(monitor).await;
+                }
+                return Ok(option);
+            }
             Err(e) => {
                 self.app_state
                     .total_failed_calls
@@ -1587,6 +1601,33 @@ impl ActiveCall {
                 return Err(e);
             }
         }
+    }
+
+    /// Dial out the side-path audio monitor (see `media::monitor`) for this
+    /// call. Single attempt per the option's semantics: a failure only
+    /// disables monitoring for the rest of the call, media keeps flowing.
+    async fn start_monitor_forwarder(&self, option: MonitorOption) {
+        let Some(hub) = self.media_stream.monitor_hub().await else {
+            return;
+        };
+        let metadata = crate::media::monitor::monitor_start_metadata(
+            &self.session_id,
+            serde_json::json!(self.call_type.clone()),
+            self.start_time.to_rfc3339(),
+            serde_json::json!(self.extras.load_full().as_ref()),
+        );
+        info!(
+            session_id = self.session_id,
+            url = %option.url(),
+            "starting monitor forwarder"
+        );
+        crate::spawn(crate::media::monitor::run_monitor_forwarder(
+            self.session_id.clone(),
+            option,
+            metadata,
+            self.cancel_token.child_token(),
+            hub.subscribe(),
+        ));
     }
 
     async fn do_invite(&self, runtime: &mut CallRuntime, option: CallOption) -> Result<()> {

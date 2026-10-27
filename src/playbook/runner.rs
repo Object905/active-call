@@ -292,6 +292,9 @@ pub fn apply_playbook_config(option: &mut CallOption, config: &PlaybookConfig) {
     if let Some(ringback) = config.ringback_detection.clone() {
         option.ringback_detection = Some(ringback);
     }
+    if let Some(monitor) = config.monitor.clone() {
+        option.monitor = Some(monitor);
+    }
 }
 
 #[cfg(test)]

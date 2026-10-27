@@ -92,6 +92,9 @@ impl CallProgress {
             if option.ringback_detection.is_none() {
                 option.ringback_detection = existing.ringback_detection.clone();
             }
+            if option.monitor.is_none() {
+                option.monitor = existing.monitor.clone();
+            }
         }
         option
     }
