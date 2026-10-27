@@ -207,9 +207,10 @@ enum Inbound {
     },
 }
 
-/// How the processing worker filled in lost frames.
-#[derive(Default)]
+/// How the processing worker filled in lost frames. Logged when dropped:
+/// the worker is dropped with its track rather than run to its end.
 struct LossStats {
+    track_id: TrackId,
     /// Opus with the next packet at hand: rebuilt from its in-band FEC,
     /// where the sender coded any.
     recovered: u64,
@@ -219,6 +220,69 @@ struct LossStats {
     concealed: u64,
     /// Left as gaps: nothing decoded to conceal from.
     unconcealed: u64,
+}
+
+impl LossStats {
+    fn new(track_id: TrackId) -> Self {
+        Self {
+            track_id,
+            recovered: 0,
+            codec_concealed: 0,
+            concealed: 0,
+            unconcealed: 0,
+        }
+    }
+}
+
+impl Drop for LossStats {
+    fn drop(&mut self) {
+        info!(
+            track_id=%self.track_id,
+            recovered = self.recovered,
+            codec_concealed = self.codec_concealed,
+            concealed = self.concealed,
+            unconcealed = self.unconcealed,
+            "RtcTrack processing worker stopped"
+        );
+    }
+}
+
+/// The playout worker's buffer, its stats logged when dropped (see
+/// [`LossStats`]).
+struct LoggedPlayout {
+    track_id: TrackId,
+    buffer: PlayoutBuffer<RtcAudioFrame>,
+}
+
+impl std::ops::Deref for LoggedPlayout {
+    type Target = PlayoutBuffer<RtcAudioFrame>;
+    fn deref(&self) -> &Self::Target {
+        &self.buffer
+    }
+}
+
+impl std::ops::DerefMut for LoggedPlayout {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.buffer
+    }
+}
+
+impl Drop for LoggedPlayout {
+    fn drop(&mut self) {
+        let stats = self.buffer.stats();
+        info!(
+            track_id=%self.track_id,
+            received = stats.received,
+            played = stats.played,
+            lost = stats.lost,
+            underruns = stats.underruns,
+            late = stats.late,
+            duplicates = stats.duplicates,
+            dropped = stats.dropped,
+            resets = stats.resets,
+            "RtcTrack playout stopped"
+        );
+    }
 }
 
 impl RtcTrack {
@@ -649,7 +713,10 @@ impl RtcTrack {
         track_id: TrackId,
         mut ptime: Duration,
     ) {
-        let mut buffer = PlayoutBuffer::new(PlayoutConfig::default());
+        let mut buffer = LoggedPlayout {
+            track_id: track_id.clone(),
+            buffer: PlayoutBuffer::new(PlayoutConfig::default()),
+        };
         let mut ticker = tokio::time::interval(ptime);
         // the sender's last frame, to measure its packet time from
         let mut last: Option<(u16, u32)> = None;
@@ -714,19 +781,6 @@ impl RtcTrack {
                 }
             }
         }
-        let stats = buffer.stats();
-        info!(
-            track_id=%track_id,
-            received = stats.received,
-            played = stats.played,
-            lost = stats.lost,
-            underruns = stats.underruns,
-            late = stats.late,
-            duplicates = stats.duplicates,
-            dropped = stats.dropped,
-            resets = stats.resets,
-            "RtcTrack playout stopped"
-        );
     }
 
     async fn run_processing_worker(
@@ -738,7 +792,7 @@ impl RtcTrack {
     ) {
         info!(track_id=%track_id, "RtcTrack processing worker started");
         let mut concealer = Concealer::new();
-        let mut losses = LossStats::default();
+        let mut losses = LossStats::new(track_id.clone());
         while let Some(item) = rx.recv().await {
             let frame = match item {
                 Inbound::Frame(frame) => frame,
@@ -780,14 +834,6 @@ impl RtcTrack {
                 break;
             }
         }
-        info!(
-            track_id=%track_id,
-            recovered = losses.recovered,
-            codec_concealed = losses.codec_concealed,
-            concealed = losses.concealed,
-            unconcealed = losses.unconcealed,
-            "RtcTrack processing worker stopped"
-        );
     }
 
     /// Plays a frame in place of a lost one: rebuilt from the next packet's
