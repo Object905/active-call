@@ -12,6 +12,7 @@ use crate::media::ambiance::SharedAmbianceProcessor;
 use crate::media::engine::StreamEngine;
 use crate::media::negotiate::strip_ipv6_candidates;
 use crate::media::processor::SubscribeProcessor;
+use crate::media::monitor::{LEG_AGENT, LEG_CALLER, MonitorProcessor};
 use crate::media::track::Track;
 use crate::media::track::file::FileTrack;
 use crate::media::track::rtc::{RtcTrack, RtcTrackConfig};
@@ -411,7 +412,7 @@ impl ActiveCall {
         mut track: Box<dyn Track>,
         play_id: Option<String>,
     ) {
-        let (call_ambiance, subscribe) = {
+        let (call_ambiance, subscribe, monitor) = {
             let state = self.progress.load_full();
             (
                 state.option.as_ref().and_then(|o| o.ambiance.clone()),
@@ -420,6 +421,7 @@ impl ActiveCall {
                     .as_ref()
                     .and_then(|o| o.subscribe)
                     .unwrap_or_default(),
+                state.option.as_ref().and_then(|o| o.monitor.clone()),
             )
         };
         let ambiance_opt = self.merged_ambiance(call_ambiance.as_ref());
@@ -449,9 +451,34 @@ impl ActiveCall {
             } else {
                 (1, self.session_id.clone())
             };
-            let sub_processor =
-                SubscribeProcessor::new(self.event_sender.clone(), sub_track_id, track_index);
-            track.append_processor(Box::new(sub_processor));
+            let sub_processor = SubscribeProcessor::new(
+                self.event_sender.clone(),
+                sub_track_id,
+                track.id().clone(),
+                track_index,
+            );
+            // Reach into the chain directly: the media-pass track ignores
+            // `Track::append_processor`, yet its own downlink frames must
+            // still be subscribed like any other track.
+            track.processor_chain().append_processor(Box::new(sub_processor));
+        }
+
+        // Side-path audio distribution (see `media::monitor`): tap this
+        // track's own frames into the session monitor hub when enabled.
+        // Same direct-chain access as the recorder: the media-pass track
+        // ignores `Track::append_processor`.
+        if monitor.is_some() {
+            if let Some(hub) = self.media_stream.monitor_hub().await {
+                let (leg, owner) = if track.id() == &self.server_side_track_id {
+                    (LEG_AGENT, self.server_side_track_id.clone())
+                } else {
+                    (LEG_CALLER, track.id().clone())
+                };
+                let chain = track.processor_chain();
+                if !chain.has_processor::<MonitorProcessor>() {
+                    chain.append_processor(Box::new(MonitorProcessor::new(owner, leg, hub)));
+                }
+            }
         }
 
         self.set_current_play(play_id.clone());

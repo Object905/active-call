@@ -220,14 +220,21 @@ impl ProcessorChain {
 pub struct SubscribeProcessor {
     event_sender: EventSender,
     track_id: String,
+    /// Only frames tagged with this track id are mirrored. A track may relay
+    /// another leg's audio (e.g. the media-pass track forwards the caller's
+    /// audio to the websocket and runs it through its own chain); that
+    /// relayed copy is already published by its origin track and must not be
+    /// subscribed a second time.
+    owner: TrackId,
     track_index: u8, // 0 for caller, 1 for callee
 }
 
 impl SubscribeProcessor {
-    pub fn new(event_sender: EventSender, track_id: String, track_index: u8) -> Self {
+    pub fn new(event_sender: EventSender, track_id: String, owner: TrackId, track_index: u8) -> Self {
         Self {
             event_sender,
             track_id,
+            owner,
             track_index,
         }
     }
@@ -235,6 +242,9 @@ impl SubscribeProcessor {
 
 impl Processor for SubscribeProcessor {
     fn process_frame(&mut self, frame: &mut AudioFrame) -> Result<()> {
+        if frame.track_id != self.owner {
+            return Ok(());
+        }
         if let Samples::PCM { samples } = &frame.samples {
             if !samples.is_empty() {
                 let pcm_data = audio_codec::samples_to_bytes(samples);

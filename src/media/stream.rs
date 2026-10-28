@@ -1,6 +1,7 @@
 use crate::event::{EventSender, SessionEvent};
 use crate::media::ambiance::{AmbianceOption, AmbianceProcessor};
 use crate::media::dtmf::DtmfDetector;
+use crate::media::monitor::MonitorHub;
 use crate::media::volume_control::HoldProcessor;
 use crate::media::{AudioFrame, INTERNAL_SAMPLERATE, Samples, TrackId};
 use crate::media::{
@@ -48,6 +49,9 @@ pub struct MediaStream {
     ambiance_source_id: StdMutex<Option<TrackId>>,
     last_server_packet_ts: Arc<AtomicU64>,
     ambiance_idle_started: AtomicBool,
+    /// Side-path audio distribution hub (see `media::monitor`). Lazily
+    /// created by `enable_monitor` when the call option asks for it.
+    monitor_hub: Mutex<Option<MonitorHub>>,
 }
 
 const CALLEE_TRACK_ID: &str = "callee-track";
@@ -114,6 +118,7 @@ impl MediaStreamBuilder {
             ambiance_source_id: StdMutex::new(None),
             last_server_packet_ts: Arc::new(AtomicU64::new(0)),
             ambiance_idle_started: AtomicBool::new(false),
+            monitor_hub: Mutex::new(None),
         }
     }
 }
@@ -264,6 +269,24 @@ impl MediaStream {
     pub async fn update_recorder_option(&self, recorder_config: RecorderOption) {
         *self.recorder_option.lock().await = Some(recorder_config);
         self.start_recorder().await.ok();
+    }
+
+    /// Create the session's monitor hub on first use and return it. Idempotent.
+    pub async fn enable_monitor(&self) -> MonitorHub {
+        let mut slot = self.monitor_hub.lock().await;
+        if let Some(hub) = slot.as_ref() {
+            return hub.clone();
+        }
+        let hub = MonitorHub::new();
+        *slot = Some(hub.clone());
+        drop(slot);
+        info!(session_id = self.id, "monitor hub enabled");
+        hub
+    }
+
+    /// The session's monitor hub, if `enable_monitor` was called.
+    pub async fn monitor_hub(&self) -> Option<MonitorHub> {
+        self.monitor_hub.lock().await.clone()
     }
 
     pub async fn remove_track(&self, id: &TrackId, graceful: bool) {

@@ -10,6 +10,7 @@ pub mod engine;
 pub mod inactivity;
 pub mod jitter;
 pub mod loader;
+pub mod monitor;
 pub mod negotiate;
 pub mod plc;
 pub mod processor;

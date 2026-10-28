@@ -9,7 +9,14 @@ use base64::{Engine as _, engine::general_purpose};
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{
+        Message,
+        client::IntoClientRequest,
+        http::{HeaderValue, Request},
+    },
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
@@ -90,21 +97,7 @@ async fn run_realtime_loop(
         .secret_key
         .ok_or_else(|| anyhow!("API key missing"))?;
 
-    let mut request_builder = http::Request::builder().uri(&url);
-
-    match provider {
-        RealtimeType::OpenAI => {
-            request_builder = request_builder
-                .header("Authorization", format!("Bearer {}", api_key))
-                .header("OpenAI-Beta", "realtime=v1");
-        }
-        RealtimeType::Azure => {
-            request_builder = request_builder.header("api-key", api_key);
-        }
-        _ => {}
-    }
-
-    let request = request_builder.body(())?;
+    let request = build_realtime_request(&provider, &url, &api_key)?;
 
     info!(url = %url, "Connecting to Realtime API");
     let (ws_stream, _) = connect_async(request).await?;
@@ -243,4 +236,89 @@ async fn run_realtime_loop(
     }
 
     Ok(())
+}
+
+/// Build the websocket handshake request for the realtime provider.
+///
+/// Starts from the standard `&str` conversion so tungstenite generates the
+/// required handshake headers (Host / Connection / Upgrade /
+/// Sec-WebSocket-Version / Sec-WebSocket-Key), then layers the
+/// provider-specific auth headers on top. A bare
+/// `http::Request::builder().uri(..)` would pass through
+/// `IntoClientRequest` untouched (the `Request` impl is a no-op) and the
+/// upgrade would fail for lack of those headers.
+fn build_realtime_request(
+    provider: &RealtimeType,
+    url: &str,
+    api_key: &str,
+) -> Result<Request<()>> {
+    let mut request = url.into_client_request()?;
+    let headers = request.headers_mut();
+    match provider {
+        RealtimeType::OpenAI => {
+            headers.insert(
+                "Authorization",
+                HeaderValue::from_str(&format!("Bearer {}", api_key))?,
+            );
+            headers.insert("OpenAI-Beta", HeaderValue::from_static("realtime=v1"));
+        }
+        RealtimeType::Azure => {
+            headers.insert("api-key", HeaderValue::from_str(api_key)?);
+        }
+        RealtimeType::Other(_) => {}
+    }
+    Ok(request)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header<'r>(request: &'r Request<()>, name: &str) -> Option<&'r str> {
+        request
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+    }
+
+    #[test]
+    fn openai_request_carries_required_websocket_headers() {
+        let request = build_realtime_request(
+            &RealtimeType::OpenAI,
+            "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
+            "sk-test",
+        )
+        .unwrap();
+        for name in [
+            "Host",
+            "Connection",
+            "Upgrade",
+            "Sec-WebSocket-Version",
+            "Sec-WebSocket-Key",
+        ] {
+            assert!(
+                header(&request, name).is_some(),
+                "missing handshake header: {name}"
+            );
+        }
+        assert_eq!(header(&request, "Authorization"), Some("Bearer sk-test"));
+        assert_eq!(header(&request, "OpenAI-Beta"), Some("realtime=v1"));
+    }
+
+    #[test]
+    fn azure_request_carries_api_key() {
+        let request = build_realtime_request(
+            &RealtimeType::Azure,
+            "wss://endpoint/openai/realtime",
+            "az-key",
+        )
+        .unwrap();
+        for name in ["Host", "Connection", "Upgrade", "Sec-WebSocket-Key"] {
+            assert!(
+                header(&request, name).is_some(),
+                "missing handshake header: {name}"
+            );
+        }
+        assert_eq!(header(&request, "api-key"), Some("az-key"));
+    }
 }

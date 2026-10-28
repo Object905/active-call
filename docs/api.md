@@ -922,6 +922,11 @@ The `CallOption` object is used in `invite` and `accept` commands and contains t
   - `outputSampleRate` (number): Sample rate of audio sent to WebSocket server
   - `packetSize` (number, optional): Packet size sent to WebSocket server in bytes (default: 2560)
 - `subscribe` (boolean, optional): Enable real-time audio subscription for non-WebSocket calls (SIP/WebRTC). If true, audio will be pushed via the control WebSocket using binary frames with a 1-byte track header (0x00 for caller, 0x01 for callee).
+- `monitor` (MonitorOption, optional): Side-path audio distribution. Dials out to an external WebSocket and mirrors **both legs' audio** (caller uplink + agent downlink) as one-way binary frames. Works with or without `mediaPass`, and never touches the main media path. See `docs/features/monitor.zh.md`.
+  - `url` (string): WebSocket URL to dial out to (e.g. `ws://asr-server:9000/audio`). A `session_id` query parameter is appended automatically.
+  - `bufferSize` (number, optional): Target size in bytes of each pushed binary frame (PCM16, excluding the 1-byte leg prefix). Omitted/0 forwards each tapped frame as-is (~20 ms).
+  - `ptime` (number, optional): Interval in milliseconds at which partially filled buffers are flushed. Omitted/0 disables the timer.
+  - `headers` (object, optional): Extra HTTP headers for the WebSocket handshake (e.g. `Authorization`).
 - `handshakeTimeout` (number, optional): Timeout for connection handshake in seconds (e.g., 30)
 - `enableIpv6` (boolean, optional): Enable IPv6 support for networking
 - `enableIceLite` (boolean, optional): Enable ICE lite mode for WebRTC media
