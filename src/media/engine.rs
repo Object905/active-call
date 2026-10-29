@@ -1,5 +1,6 @@
 use super::{
     INTERNAL_SAMPLERATE,
+    agc::AutomaticGainControl,
     asr_processor::AsrProcessor,
     denoiser::NoiseReducer,
     processor::Processor,
@@ -18,8 +19,8 @@ use crate::{
         TencentCloudTtsBasicClient, TencentCloudTtsClient,
     },
     transcription::{
-        AliyunAsrClientBuilder, TencentCloudAsrClientBuilder, TranscriptionClient,
-        TranscriptionOption, TranscriptionType,
+        AliyunAsrClientBuilder, DeepgramAsrClientBuilder, TencentCloudAsrClientBuilder,
+        TranscriptionClient, TranscriptionOption, TranscriptionType,
     },
 };
 
@@ -31,6 +32,8 @@ use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
+#[cfg(feature = "ringback-detection")]
+use tracing::warn;
 
 pub type FnCreateVadProcessor = fn(
     token: CancellationToken,
@@ -92,6 +95,10 @@ impl Default for StreamEngine {
         engine.register_asr(
             TranscriptionType::Aliyun,
             Box::new(AliyunAsrClientBuilder::create),
+        );
+        engine.register_asr(
+            TranscriptionType::Deepgram,
+            Box::new(DeepgramAsrClientBuilder::create),
         );
 
         #[cfg(feature = "offline")]
@@ -227,7 +234,7 @@ impl StreamEngine {
 
     pub async fn create_processors(
         engine: Arc<StreamEngine>,
-        track: &dyn Track,
+        track_id: TrackId,
         cancel_token: CancellationToken,
         event_sender: EventSender,
         packet_sender: TrackPacketSender,
@@ -235,7 +242,7 @@ impl StreamEngine {
     ) -> Result<Vec<Box<dyn Processor>>> {
         (engine.clone().create_processors_hook)(
             engine,
-            track.id().clone(),
+            track_id,
             cancel_token,
             event_sender,
             packet_sender,
@@ -253,6 +260,7 @@ impl StreamEngine {
         play_id: Option<String>,
         streaming: bool,
         tts_option: &SynthesisOption,
+        auto_hangup: Option<bool>,
     ) -> Result<(SynthesisHandle, Box<dyn Track>)> {
         let (tx, rx) = mpsc::unbounded_channel();
         let new_handle = SynthesisHandle::new(tx, play_id.clone(), ssrc);
@@ -260,6 +268,7 @@ impl StreamEngine {
         let sample_rate = tts_option.samplerate.unwrap_or(16000) as u32;
         let tts_track = TtsTrack::new(track_id, session_id, streaming, play_id, rx, tts_client)
             .with_ssrc(ssrc)
+            .with_auto_hangup(auto_hangup)
             .with_sample_rate(sample_rate)
             .with_cancel_token(cancel_token);
         Ok((new_handle, Box::new(tts_track) as Box<dyn Track>))
@@ -318,6 +327,11 @@ impl StreamEngine {
                 }
                 None => {}
             }
+            if let Some(agc_option) = option.agc.clone() {
+                debug!(%track_id, "Adding AutomaticGainControl processor");
+                let agc = AutomaticGainControl::new(INTERNAL_SAMPLERATE as u32, agc_option)?;
+                processors.push(Box::new(agc) as Box<dyn Processor>);
+            }
             match option.asr {
                 Some(mut option) => {
                     debug!(%track_id, "Adding AsrProcessor processor provider={:?}", option.provider);
@@ -356,6 +370,24 @@ impl StreamEngine {
                     processors.push(Box::new(inactivity_processor) as Box<dyn Processor>);
                 }
                 _ => {}
+            }
+
+            #[cfg(feature = "ringback-detection")]
+            if let Some(ref ringback_opt) = option.ringback_detection {
+                if ringback_opt.enabled.unwrap_or(false) {
+                    debug!(%track_id, "Adding RingbackDetectionProcessor");
+                    match
+                        crate::media::ringback_detection::processor::RingbackDetectionProcessor::new(
+                            track_id.clone(),
+                            cancel_token.child_token(),
+                            event_sender.clone(),
+                            ringback_opt.clone(),
+                            None,
+                        ) {
+                        Ok(p) => processors.push(Box::new(p) as Box<dyn Processor>),
+                        Err(e) => warn!(%track_id, "Failed to create RingbackDetectionProcessor: {}", e),
+                    }
+                }
             }
 
             Ok(processors)

@@ -9,7 +9,7 @@ mod tests {
     use audio_codec::g729::{G729Decoder, G729Encoder};
     use audio_codec::opus::OpusEncoder;
     use audio_codec::pcmu::{PcmuDecoder, PcmuEncoder};
-    use audio_codec::{Decoder, Encoder, Resampler};
+    use audio_codec::{BoxedResampler, Decoder, Encoder};
     use rand::RngExt;
     use std::time::{Duration, Instant};
 
@@ -45,14 +45,14 @@ mod tests {
             .collect();
 
         // --- Common Components ---
-        let mut resampler_8k_to_16k = Resampler::new(8000, 16000);
+        let mut resampler_8k_to_16k = BoxedResampler::new(8000, 16000).unwrap();
         let mut noise_reducer = NoiseReducer::new(16000);
         let vad_config = VADOption {
             samplerate: 16000,
             ..Default::default()
         };
         let mut vad = TinySilero::new(vad_config).unwrap();
-        let mut resampler_16k_to_8k = Resampler::new(16000, 8000);
+        let mut resampler_16k_to_8k = BoxedResampler::new(16000, 8000).unwrap();
 
         // --- Scenario A/B Components ---
         let mut pcmu_decoder = PcmuDecoder::new();
