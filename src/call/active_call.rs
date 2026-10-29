@@ -298,10 +298,10 @@ mod tests {
     /// Feed the call a connection-lost TrackEnd of its caller track, with
     /// `registered` (if any) as the caller track then in the media stream;
     /// returns whether the call hung up.
-    async fn caller_track_lost(cache_dir: &str, registered: Option<bool>) -> bool {
+    async fn caller_track_lost(registered: Option<bool>) -> bool {
         let call = make_active_call_with_engine_and_option(
             Arc::new(StreamEngine::default()),
-            cache_dir,
+            "/tmp/mediacache",
             crate::CallOption::default(),
         )
         .await;
@@ -328,15 +328,15 @@ mod tests {
 
     #[tokio::test]
     async fn lost_caller_track_hangs_up() {
-        assert!(caller_track_lost("mediacache_lost_caller_track", Some(true)).await);
-        assert!(caller_track_lost("mediacache_lost_caller_track_gone", None).await);
+        assert!(caller_track_lost(Some(true)).await);
+        assert!(caller_track_lost(None).await);
     }
 
     // A caller track replaced (same id and ssrc) after its connection was
     // lost: the old track's TrackEnd must not hang up the new media.
     #[tokio::test]
     async fn lost_replaced_caller_track_keeps_the_call() {
-        assert!(!caller_track_lost("mediacache_replaced_caller_track", Some(false)).await);
+        assert!(!caller_track_lost(Some(false)).await);
     }
 
     struct MockAsrClient;
