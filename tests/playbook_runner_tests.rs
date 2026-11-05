@@ -1,4 +1,5 @@
 use active_call::app::AppStateBuilder;
+use active_call::call::active_call::CallSpec;
 use active_call::call::{ActiveCall, ActiveCallType, Command};
 use active_call::config::Config;
 use active_call::event::SessionEvent;
@@ -63,19 +64,18 @@ async fn test_playbook_run_flow() -> Result<()> {
     let session_id = "test-session".to_string();
     let track_config = TrackConfig::default();
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel_token.clone(),
-        session_id.clone(),
-        app_state.invitation.clone(),
-        app_state.clone(),
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel_token.clone(),
+        session_id: session_id.clone(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
         track_config,
-        None,  // audio_receiver
-        false, // dump_events
-        None,  // server_side_track
-        None,  // extras
-        None,
-    ));
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     // Get command receiver
     let receiver = active_call.new_receiver();
@@ -123,12 +123,24 @@ async fn test_playbook_run_flow() -> Result<()> {
         runner.run().await;
     });
 
-    // Simulate Answer event to let runner proceed to dialogue loop
+    // Simulate Answer event. SIP media commands should still wait for MediaReady.
     active_call.event_sender.send(SessionEvent::Answer {
         track_id: "track1".to_string(),
         timestamp: 0,
         sdp: "".to_string(),
         refer: None,
+    })?;
+
+    let greeting_before_media =
+        tokio::time::timeout(std::time::Duration::from_millis(200), cmd_rx.recv()).await;
+    assert!(
+        greeting_before_media.is_err(),
+        "SIP greeting should wait for MediaReady"
+    );
+
+    active_call.event_sender.send(SessionEvent::MediaReady {
+        track_id: "track1".to_string(),
+        timestamp: 1,
     })?;
 
     // 6. Assert Greeting (on_start)
@@ -153,6 +165,7 @@ async fn test_playbook_run_flow() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
 
     // Send event
@@ -200,19 +213,18 @@ async fn test_playbook_hangup_flow() -> Result<()> {
         .build()
         .await?;
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        CancellationToken::new(),
-        "test-hangup".to_string(),
-        app_state.invitation.clone(),
-        app_state.clone(),
-        TrackConfig::default(),
-        None,
-        false,
-        None,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: CancellationToken::new(),
+        session_id: "test-hangup".to_string(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     let receiver = active_call.new_receiver();
     let mut cmd_rx = receiver.cmd_receiver;
@@ -247,12 +259,16 @@ async fn test_playbook_hangup_flow() -> Result<()> {
         runner.run().await;
     });
 
-    // Simulate Answer event
+    // Simulate Answer and MediaReady events for SIP media commands.
     active_call.event_sender.send(SessionEvent::Answer {
         track_id: "test-hangup".to_string(),
         timestamp: 0,
         sdp: "".to_string(),
         refer: None,
+    })?;
+    active_call.event_sender.send(SessionEvent::MediaReady {
+        track_id: "test-hangup".to_string(),
+        timestamp: 1,
     })?;
 
     // 1. Check TTS
@@ -294,19 +310,18 @@ async fn test_playbook_accept_flow() -> Result<()> {
         .build()
         .await?;
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        CancellationToken::new(),
-        "test-accept".to_string(),
-        app_state.invitation.clone(),
-        app_state.clone(),
-        TrackConfig::default(),
-        None,
-        false,
-        None,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: CancellationToken::new(),
+        session_id: "test-accept".to_string(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     let receiver = active_call.new_receiver();
     let mut cmd_rx = receiver.cmd_receiver;
@@ -361,19 +376,18 @@ async fn test_playbook_reject_flow() -> Result<()> {
         .build()
         .await?;
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        CancellationToken::new(),
-        "test-reject".to_string(),
-        app_state.invitation.clone(),
-        app_state.clone(),
-        TrackConfig::default(),
-        None,
-        false,
-        None,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: CancellationToken::new(),
+        session_id: "test-reject".to_string(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     let receiver = active_call.new_receiver();
     let mut cmd_rx = receiver.cmd_receiver;
@@ -433,19 +447,18 @@ async fn test_playbook_media_wait_flow() -> Result<()> {
         .build()
         .await?;
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        CancellationToken::new(),
-        "test-wait".to_string(),
-        app_state.invitation.clone(),
-        app_state.clone(),
-        TrackConfig::default(),
-        None,
-        false,
-        None,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: CancellationToken::new(),
+        session_id: "test-wait".to_string(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     let receiver = active_call.new_receiver();
     let mut cmd_rx = receiver.cmd_receiver;
@@ -506,10 +519,13 @@ async fn test_playbook_media_wait_flow() -> Result<()> {
         panic!("Did not receive Accept command");
     }
 
-    // 2. We should NOT receive TTS yet (it should be waiting for Answer event)
+    // 2. We should NOT receive TTS yet (it should be waiting for Answer and MediaReady)
     let tts_received =
         tokio::time::timeout(std::time::Duration::from_millis(200), cmd_rx.recv()).await;
-    assert!(tts_received.is_err(), "TTS should have waited for Answer");
+    assert!(
+        tts_received.is_err(),
+        "TTS should have waited for Answer and MediaReady"
+    );
 
     // 3. Send Answer event
     active_call.event_sender.send(SessionEvent::Answer {
@@ -517,6 +533,18 @@ async fn test_playbook_media_wait_flow() -> Result<()> {
         timestamp: 1000,
         sdp: "".to_string(),
         refer: None,
+    })?;
+
+    let tts_after_answer =
+        tokio::time::timeout(std::time::Duration::from_millis(200), cmd_rx.recv()).await;
+    assert!(
+        tts_after_answer.is_err(),
+        "SIP TTS should still wait for MediaReady after Answer"
+    );
+
+    active_call.event_sender.send(SessionEvent::MediaReady {
+        track_id: "track1".to_string(),
+        timestamp: 1001,
     })?;
 
     // 4. NOW we should receive TTS

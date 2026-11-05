@@ -68,6 +68,7 @@ impl MockAsrClientBuilder {
                             is_filler: None,
                             confidence: None,
                             task_id: None,
+                            refer: None,
                         };
                         let _ = event_sender.send(event);
                     }
@@ -182,7 +183,7 @@ async fn test_webrtc_call_workflow() -> Result<()> {
     let (mut ws_stream, _) = connect_async(&ws_url).await?;
 
     // 4. Setup WebRTC PeerConnection
-    let mut rtc_config = RtcConfiguration::default();
+    let mut rtc_config = RtcConfiguration::webrtc();
     // Use local candidates only
     rtc_config.ice_servers = vec![];
     let pc = Arc::new(PeerConnection::new(rtc_config));
@@ -262,7 +263,7 @@ async fn test_webrtc_call_workflow() -> Result<()> {
                 clock_rate: 48000,
                 ..Default::default()
             };
-            if let Err(e) = source.send_audio(frame).await {
+            if let Err(e) = source.send_audio(frame) {
                 tracing::error!("Failed to send audio frame {}: {:?}", i, e);
             }
         }
@@ -333,6 +334,7 @@ async fn test_webrtc_call_workflow() -> Result<()> {
         reason: None,
         initiator: None,
         headers: None,
+        refer: None,
     };
     ws_stream
         .send(Message::Text(serde_json::to_string(&hangup_cmd)?.into()))
