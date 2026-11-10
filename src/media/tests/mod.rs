@@ -1,8 +1,12 @@
+mod agc;
 mod denoiser;
 mod file_track;
 mod media_pass;
+mod monitor;
+mod native_recorder_rtc;
 mod perf_analysis;
 mod perf_rtp_recorder;
+mod playout_rtc;
 mod recorder;
 mod recorder_rtp;
 mod stream;

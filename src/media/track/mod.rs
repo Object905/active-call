@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use audio_codec::CodecType;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 pub type TrackPacketSender = mpsc::UnboundedSender<AudioFrame>;
 pub type TrackPacketReceiver = mpsc::UnboundedReceiver<AudioFrame>;
@@ -25,9 +26,6 @@ pub struct TrackConfig {
 impl Default for TrackConfig {
     fn default() -> Self {
         Self {
-            #[cfg(feature = "opus")]
-            codec: CodecType::Opus,
-            #[cfg(not(feature = "opus"))]
             codec: CodecType::G722,
             samplerate: 16000,
             channels: 1,
@@ -53,7 +51,9 @@ impl TrackConfig {
     }
 }
 
+pub mod dtmf;
 pub mod file;
+pub mod forwarding;
 pub mod media_pass;
 pub mod rtc;
 pub mod track_codec;
@@ -63,18 +63,64 @@ pub mod websocket;
 pub trait Track: Send + Sync {
     fn ssrc(&self) -> u32;
     fn id(&self) -> &TrackId;
+    /// The track's lifecycle token: cancelled by `stop()`/`stop_graceful()`
+    /// (directly or through the track's own event loop teardown).
+    ///
+    /// Per-track background workers spawned on behalf of this track (e.g. the
+    /// inactivity watchdog created by `setup_track_with_stream`) MUST derive
+    /// their lifetime from this token, so that stopping or replacing the
+    /// track disarms them. Binding those workers to the session token instead
+    /// leaves "zombie" watchdogs behind: a retired leg keeps its frozen
+    /// last-frame timestamp and eventually fires `SessionEvent::Inactivity`
+    /// against a call that is alive and well (seen with INVITE-mode
+    /// auto-refer transfers, where the superseded bridge leg's watchdog
+    /// killed the session ~50s after a successful transfer).
+    fn cancel_token(&self) -> CancellationToken;
     fn config(&self) -> &TrackConfig;
+    fn set_paused(&self, _paused: bool) -> bool {
+        false
+    }
+    fn is_paused(&self) -> bool {
+        false
+    }
     fn processor_chain(&mut self) -> &mut ProcessorChain;
+    /// Cancel the track's media pipeline (per-track workers, inactivity
+    /// watchdog) WITHOUT closing the underlying transport. Used when a track
+    /// is replaced by a successor: the successor's media setup must not race
+    /// against the predecessor's transport teardown.
+    /// The full `stop()` (which closes the transport) follows afterwards.
+    fn cancel_pipeline(&self) {
+        // Default: nothing to cancel for tracks without a pipeline.
+    }
     fn insert_processor(&mut self, processor: Box<dyn Processor>) {
         self.processor_chain().insert_processor(processor);
     }
     fn append_processor(&mut self, processor: Box<dyn Processor>) {
         self.processor_chain().append_processor(processor);
     }
+    /// Attach a raw-tap receiver that mirrors inbound frames at their native
+    /// (pre-resample) sample rate, used by the native-samplerate recorder.
+    /// Setting `None` detaches an existing tap.
+    fn set_raw_tap(&mut self, tap: Option<mpsc::UnboundedSender<AudioFrame>>) {
+        // Record this track's id as the tap owner so relayed frames (e.g. the
+        // caller's audio forwarded through the media-pass track) are not
+        // mirrored a second time.
+        let owner = self.id().clone();
+        let chain = self.processor_chain();
+        chain.set_raw_tap(tap);
+        chain.set_tap_owner(Some(owner));
+    }
     async fn handshake(&mut self, offer: String, timeout: Option<Duration>) -> Result<String>;
     async fn update_remote_description(&mut self, answer: &String) -> Result<()>;
     async fn update_remote_description_force(&mut self, answer: &String) -> Result<()> {
         // Default implementation: force update is same as regular update for most tracks
+        self.update_remote_description(answer).await
+    }
+    /// Apply a provisional remote description (SIP 183 early media). Unlike
+    /// `update_remote_description`, this must not finalize SDP negotiation —
+    /// the real answer (200 OK) is still to come. Default: same as a regular
+    /// update, for track types that don't have a signaling state machine.
+    async fn update_remote_description_provisional(&mut self, answer: &String) -> Result<()> {
         self.update_remote_description(answer).await
     }
     async fn start(
@@ -87,4 +133,24 @@ pub trait Track: Send + Sync {
         self.stop().await
     }
     async fn send_packet(&mut self, packet: &AudioFrame) -> Result<()>;
+    /// Feed a remotely-gathered ICE candidate into this track's PeerConnection.
+    /// Default no-op for track types that aren't backed by ICE (file/tts/websocket tracks).
+    fn add_ice_candidate(
+        &self,
+        _candidate: &str,
+        _sdp_mid: Option<&str>,
+        _sdp_mline_index: Option<u32>,
+    ) -> Result<()> {
+        Ok(())
+    }
+    /// The call was answered locally: Accept sent the 200 OK, or a WebRTC
+    /// track answered the browser's offer. `rtp_timeout`, when given,
+    /// replaces the configured RTP timeout. Default no-op for track types
+    /// without RTP timeout monitoring.
+    fn on_answered(&self, _rtp_timeout: Option<Duration>) {}
+    /// The track is done for good (stopped, or lost its transport), though
+    /// it may stay registered until replaced. Default: never.
+    fn has_ended(&self) -> bool {
+        false
+    }
 }

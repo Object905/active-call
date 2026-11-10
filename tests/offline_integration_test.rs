@@ -1,3 +1,7 @@
+//! Integration tests requiring the `offline` feature (bundled VAD/ASR
+//! models). Skipped entirely when the crate is built without it.
+#![cfg(feature = "offline")]
+
 use active_call::offline::sensevoice::{FeaturePipeline, FrontendConfig, language_id_from_code};
 use active_call::offline::{
     OfflineModels,
@@ -74,7 +78,7 @@ async fn test_offline_integration() -> anyhow::Result<()> {
             .map(|&x| (x * 32767.0).clamp(-32768.0, 32767.0) as i16)
             .collect();
 
-        let mut resampler = audio_codec::Resampler::new(sample_rate as usize, 16000);
+        let mut resampler = audio_codec::BoxedResampler::new(sample_rate as usize, 16000).unwrap();
         let resampled_i16 = resampler.resample(&i16_samples);
 
         // Convert back to f32

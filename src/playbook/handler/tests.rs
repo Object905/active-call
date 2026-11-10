@@ -1,4 +1,5 @@
 use super::*;
+use crate::call::active_call::CallSpec;
 use crate::event::SessionEvent;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -145,6 +146,7 @@ async fn handler_applies_tool_instructions() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
 
     let commands = handler.on_event(&event).await?;
@@ -200,6 +202,7 @@ async fn handler_requeries_after_rag() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
 
     let commands = handler.on_event(&event).await?;
@@ -263,6 +266,7 @@ async fn test_full_dialogue_flow() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
     let commands = handler.on_event(&event).await?;
     // "Hello! How can I help you today?" -> split into two + EOS
@@ -284,6 +288,7 @@ async fn test_full_dialogue_flow() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
     let commands = handler.on_event(&event).await?;
     assert_eq!(commands.len(), 1);
@@ -310,6 +315,7 @@ async fn test_full_dialogue_flow() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
     let commands = handler.on_event(&event).await?;
     // Should have Tts with auto_hangup
@@ -358,6 +364,7 @@ async fn test_xml_tools_and_sentence_splitting() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
 
     let commands = handler.on_event(&event).await?;
@@ -440,6 +447,7 @@ async fn test_interruption_logic() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
     handler.on_event(&event).await?;
     assert!(handler.is_speaking);
@@ -458,6 +466,7 @@ async fn test_interruption_logic() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
     let commands = handler.on_event(&event).await?;
     assert_eq!(commands.len(), 1);
@@ -502,14 +511,12 @@ async fn test_rag_iteration_limit() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
 
     let commands = handler.on_event(&event).await?;
-    // After 3 attempts (MAX_RAG_ATTEMPTS), it should stop and return the last raw response
-    assert_eq!(commands.len(), 1);
-    if let Command::Tts { text, .. } = &commands[0] {
-        assert_eq!(text, rag_instruction);
-    }
+    // After MAX_RAG_ATTEMPTS, tool-only JSON should not be spoken back to the caller.
+    assert!(commands.is_empty());
 
     Ok(())
 }
@@ -555,6 +562,7 @@ async fn test_follow_up_logic() -> Result<()> {
         start_time: 0,
         duration: 50,
         samples: None,
+        refer: None,
     };
     let commands = handler.on_event(&event).await?;
     assert!(commands.is_empty(), "Should not trigger if < timeout");
@@ -570,6 +578,7 @@ async fn test_follow_up_logic() -> Result<()> {
         start_time: 0,
         duration: 100,
         samples: None,
+        refer: None,
     };
     let commands = handler.on_event(&event).await?;
     assert_eq!(commands.len(), 1, "Should trigger follow-up 1");
@@ -586,6 +595,7 @@ async fn test_follow_up_logic() -> Result<()> {
         play_id: None,
         duration: 100,
         ssrc: 0,
+        auto_hangup: None,
     };
     handler.on_event(&event).await?;
     assert!(
@@ -601,6 +611,7 @@ async fn test_follow_up_logic() -> Result<()> {
         start_time: 0,
         duration: 100,
         samples: None,
+        refer: None,
     };
     let commands = handler.on_event(&event).await?;
     assert_eq!(commands.len(), 1, "Should trigger follow-up 2");
@@ -616,6 +627,7 @@ async fn test_follow_up_logic() -> Result<()> {
         play_id: None,
         duration: 100,
         ssrc: 0,
+        auto_hangup: None,
     };
     handler.on_event(&event).await?;
 
@@ -627,6 +639,7 @@ async fn test_follow_up_logic() -> Result<()> {
         start_time: 0,
         duration: 100,
         samples: None,
+        refer: None,
     };
     let commands = handler.on_event(&event).await?;
     assert_eq!(commands.len(), 1, "Should hangup after max count");
@@ -643,6 +656,7 @@ async fn test_follow_up_logic() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
 
     let _ = handler.on_event(&event).await?;
@@ -684,6 +698,7 @@ async fn test_interruption_protection_period() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
     handler.on_event(&event).await?;
     assert!(handler.is_speaking);
@@ -699,6 +714,7 @@ async fn test_interruption_protection_period() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
     let commands = handler.on_event(&event).await?;
     // Should be ignored due to protection period
@@ -739,6 +755,7 @@ async fn test_interruption_filler_word() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
     handler.on_event(&event).await?;
     assert!(handler.is_speaking);
@@ -757,6 +774,7 @@ async fn test_interruption_filler_word() -> Result<()> {
         is_filler: Some(true),
         confidence: None,
         task_id: None,
+        refer: None,
     };
     let commands = handler.on_event(&event).await?;
     // Should be ignored
@@ -774,6 +792,7 @@ async fn test_interruption_filler_word() -> Result<()> {
         is_filler: Some(false),
         confidence: None,
         task_id: None,
+        refer: None,
     };
     let commands = handler.on_event(&event).await?;
     // Should trigger interruption
@@ -808,6 +827,7 @@ async fn test_eou_early_response() -> Result<()> {
         completed: true,
         interrupt_point: None,
         text: Some("User's final utterance".to_string()),
+        refer: None,
     };
     let commands = handler.on_event(&event).await?;
     assert_eq!(commands.len(), 1);
@@ -897,6 +917,7 @@ async fn test_rolling_summary() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
 
     let commands = handler.on_event(&event).await?;
@@ -975,6 +996,54 @@ async fn test_set_var_extraction() {
 }
 
 #[tokio::test]
+async fn test_message_tag_extraction() {
+    let config = LlmConfig::default();
+    let interruption = crate::playbook::InterruptionConfig::default();
+    let provider = Arc::new(TestProvider::new(vec![]));
+    let rag = Arc::new(RecordingRag::new());
+
+    let mut handler = LlmHandler::with_provider(
+        config,
+        provider,
+        rag,
+        interruption,
+        None,
+        std::collections::HashMap::new(),
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let mut buffer =
+        r#"Hold on. <message body="customer_id=12345" contentType="text/plain" refer="true"/> Done."#
+            .to_string();
+    let cmds = handler
+        .extract_streaming_commands(&mut buffer, "test_p", false)
+        .await;
+
+    assert_eq!(cmds.len(), 3);
+    assert!(matches!(
+        &cmds[0],
+        Command::Tts { text, .. } if text == "Hold on. "
+    ));
+    assert!(matches!(
+        &cmds[1],
+        Command::Message {
+            body,
+            content_type: Some(content_type),
+            headers: None,
+            refer: Some(true),
+        } if body == "customer_id=12345" && content_type == "text/plain"
+    ));
+    assert!(matches!(
+        &cmds[2],
+        Command::Tts { text, .. } if text == " Done."
+    ));
+    assert_eq!(buffer, "");
+}
+
+#[tokio::test]
 async fn test_multiple_set_vars() {
     let config = LlmConfig::default();
     let interruption = crate::playbook::InterruptionConfig::default();
@@ -1040,19 +1109,18 @@ async fn test_set_var_updates_state() {
     let session_id = "test-session-set-var".to_string();
     let track_config = TrackConfig::default();
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel_token,
-        session_id,
-        app_state.invitation.clone(),
-        app_state.clone(),
-        track_config,
-        None,
-        false,
-        None,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel_token,
+        session_id: session_id,
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: track_config,
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     let mut handler = LlmHandler::with_provider(
         config,
@@ -1084,11 +1152,8 @@ async fn test_set_var_updates_state() {
     );
 
     // Check ActiveCall state
-    let state = active_call.call_state.read().await;
-    let extras = state
-        .extras
-        .as_ref()
-        .expect("extras should be initialized/set");
+    let extras = active_call.extras.load_full();
+    assert!(!extras.is_empty(), "extras should be initialized/set");
 
     assert_eq!(
         extras.get("my_key").unwrap(),
@@ -1127,19 +1192,18 @@ async fn test_set_var_with_sip_headers() {
     let mut initial_extras = std::collections::HashMap::new();
     initial_extras.insert("X-CID".to_string(), serde_json::json!("123456"));
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel_token,
-        session_id,
-        app_state.invitation.clone(),
-        app_state.clone(),
-        track_config,
-        None,
-        false,
-        None,
-        Some(initial_extras),
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel_token,
+        session_id: session_id,
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: track_config,
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: Some(initial_extras),
+    }));
 
     let mut handler = LlmHandler::with_provider(
         config,
@@ -1168,8 +1232,7 @@ async fn test_set_var_with_sip_headers() {
         buffer
     );
 
-    let state = active_call.call_state.read().await;
-    let extras = state.extras.as_ref().unwrap();
+    let extras = active_call.extras.load_full();
 
     // Verify original header still exists
     assert_eq!(extras.get("X-CID").unwrap(), &serde_json::json!("123456"));
@@ -1213,19 +1276,18 @@ async fn test_http_command_in_stream() {
     let session_id = "test-session-http".to_string();
     let track_config = TrackConfig::default();
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel_token,
-        session_id,
-        app_state.invitation.clone(),
-        app_state.clone(),
-        track_config,
-        None,
-        false,
-        None,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel_token,
+        session_id: session_id,
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: track_config,
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     let mut handler = LlmHandler::with_provider(
         config,
@@ -1302,19 +1364,18 @@ async fn test_http_command_post_with_body() {
     let session_id = "test-session-http-post".to_string();
     let track_config = TrackConfig::default();
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel_token,
-        session_id,
-        app_state.invitation.clone(),
-        app_state.clone(),
-        track_config,
-        None,
-        false,
-        None,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel_token,
+        session_id: session_id,
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: track_config,
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     let mut handler = LlmHandler::with_provider(
         config,
@@ -1381,19 +1442,18 @@ async fn test_multiple_commands_in_sequence() {
     let session_id = "test-session-multi".to_string();
     let track_config = TrackConfig::default();
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel_token,
-        session_id,
-        app_state.invitation.clone(),
-        app_state.clone(),
-        track_config,
-        None,
-        false,
-        None,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel_token,
+        session_id: session_id,
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: track_config,
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     let mut handler = LlmHandler::with_provider(
         config,
@@ -1421,8 +1481,7 @@ async fn test_multiple_commands_in_sequence() {
     assert!(!commands.is_empty());
 
     // Check state was updated
-    let state = active_call.call_state.read().await;
-    let extras = state.extras.as_ref().unwrap();
+    let extras = active_call.extras.load_full();
     assert_eq!(
         extras.get("user_name").unwrap(),
         &serde_json::Value::String("Alice".to_string())
@@ -1454,19 +1513,18 @@ async fn test_set_var_individual_sip_header() {
     let session_id = "test-session-individual-header".to_string();
     let track_config = TrackConfig::default();
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel_token,
-        session_id,
-        app_state.invitation.clone(),
-        app_state.clone(),
-        track_config,
-        None,
-        false,
-        None,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel_token,
+        session_id: session_id,
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: track_config,
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     let mut handler = LlmHandler::with_provider(
         config,
@@ -1493,8 +1551,7 @@ async fn test_set_var_individual_sip_header() {
         .extract_streaming_commands(&mut buffer2, "p2", true)
         .await;
 
-    let state = active_call.call_state.read().await;
-    let extras = state.extras.as_ref().unwrap();
+    let extras = active_call.extras.load_full();
 
     // Both headers should be set
     assert_eq!(
@@ -1552,19 +1609,18 @@ async fn test_bye_headers_with_all_variables() {
     // Mark X-CID as SIP header
     initial_extras.insert("_sip_header_keys".to_string(), serde_json::json!(["X-CID"]));
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel_token,
-        session_id,
-        app_state.invitation.clone(),
-        app_state.clone(),
-        track_config,
-        None,
-        false,
-        None,
-        Some(initial_extras),
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel_token,
+        session_id: session_id,
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: track_config,
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: Some(initial_extras),
+    }));
 
     let mut handler = LlmHandler::with_provider(
         llm_config,
@@ -1637,19 +1693,18 @@ async fn test_bye_headers_with_unset_variables() {
     // Initialize WITHOUT setting hangupreason and skillgroupid
     let initial_extras = StdHashMap::new();
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel_token,
-        session_id,
-        app_state.invitation.clone(),
-        app_state.clone(),
-        track_config,
-        None,
-        false,
-        None,
-        Some(initial_extras),
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel_token,
+        session_id: session_id,
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: track_config,
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: Some(initial_extras),
+    }));
 
     let mut handler = LlmHandler::with_provider(
         llm_config,
@@ -1729,19 +1784,18 @@ async fn test_set_var_then_bye_headers() {
 
     let initial_extras = StdHashMap::new();
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel_token,
-        session_id,
-        app_state.invitation.clone(),
-        app_state.clone(),
-        track_config,
-        None,
-        false,
-        None,
-        Some(initial_extras),
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel_token,
+        session_id: session_id,
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: track_config,
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: Some(initial_extras),
+    }));
 
     let mut handler = LlmHandler::with_provider(
         llm_config,
@@ -1765,8 +1819,8 @@ async fn test_set_var_then_bye_headers() {
     println!("Generated commands: {:?}", commands);
 
     // Now check if variables were set in state
-    let state = active_call.call_state.read().await;
-    if let Some(extras) = &state.extras {
+    {
+        let extras = active_call.extras.load_full();
         println!("Extras after generate_response: {:?}", extras);
 
         // Check if set_var worked
@@ -1781,10 +1835,7 @@ async fn test_set_var_then_bye_headers() {
         } else {
             println!("WARNING: skillgroupid not found in extras!");
         }
-    } else {
-        println!("WARNING: extras is None!");
     }
-    drop(state);
 
     // Now render BYE headers
     let rendered_headers = handler.render_sip_headers().await;
@@ -1890,19 +1941,18 @@ async fn test_hangup_before_set_var_still_works() {
 
     let initial_extras = StdHashMap::new();
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel_token,
-        session_id,
-        app_state.invitation.clone(),
-        app_state.clone(),
-        track_config,
-        None,
-        false,
-        None,
-        Some(initial_extras),
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel_token,
+        session_id: session_id,
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: track_config,
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: Some(initial_extras),
+    }));
 
     let mut handler = LlmHandler::with_provider(
         llm_config,
@@ -1924,8 +1974,8 @@ async fn test_hangup_before_set_var_still_works() {
     println!("Generated commands: {:?}", commands);
 
     // Check if variables were set DESPITE hangup coming first
-    let state = active_call.call_state.read().await;
-    if let Some(extras) = &state.extras {
+    {
+        let extras = active_call.extras.load_full();
         println!("Extras after generate_response: {:?}", extras);
 
         assert_eq!(
@@ -1939,10 +1989,7 @@ async fn test_hangup_before_set_var_still_works() {
             Some("7084rx000003"),
             "skillgroupid should be set even though hangup came first"
         );
-    } else {
-        panic!("extras should not be None!");
     }
-    drop(state);
 
     // Render BYE headers
     let rendered_headers = handler.render_sip_headers().await;
@@ -1984,19 +2031,18 @@ async fn test_dynamic_scene_prompt_rendering() {
         serde_json::json!(["X-Jobid"]),
     );
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel_token,
-        session_id.clone(),
-        app_state.invitation.clone(),
-        app_state.clone(),
-        track_config,
-        None,
-        false,
-        None,
-        Some(initial_extras),
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel_token,
+        session_id: session_id.clone(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: track_config,
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: Some(initial_extras),
+    }));
 
     // Create scenes with raw_prompt templates
     let mut scenes = std::collections::HashMap::new();
@@ -2044,13 +2090,7 @@ async fn test_dynamic_scene_prompt_rendering() {
 
     // Simulate set_var: LLM sets intent during conversation
     {
-        let mut state = active_call.call_state.write().await;
-        let mut extras = state.extras.take().unwrap_or_default();
-        extras.insert(
-            "intent".to_string(),
-            serde_json::Value::String("买零食".to_string()),
-        );
-        state.extras = Some(extras);
+        active_call.set_extra("intent", serde_json::Value::String("买零食".to_string()));
     }
 
     // Now switch to greeting scene, it should dynamically render with the latest variables
@@ -2110,24 +2150,22 @@ async fn test_dynamic_prompt_with_builtin_vars() {
     let session_id = "session-builtin-test".to_string();
     let track_config = TrackConfig::default();
 
-    let active_call = Arc::new(ActiveCall::new(
-        ActiveCallType::Sip,
-        cancel_token,
-        session_id.clone(),
-        app_state.invitation.clone(),
-        app_state.clone(),
-        track_config,
-        None,
-        false,
-        None,
-        None,
-        None,
-    ));
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel_token,
+        session_id: session_id.clone(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: track_config,
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
 
     // Verify built-in variables were injected
     {
-        let state = active_call.call_state.read().await;
-        let extras = state.extras.as_ref().expect("extras should exist");
+        let extras = active_call.extras.load_full();
         assert_eq!(
             extras.get(BUILTIN_SESSION_ID).and_then(|v| v.as_str()),
             Some("session-builtin-test"),

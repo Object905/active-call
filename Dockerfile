@@ -17,7 +17,6 @@ RUN --mount=type=cache,target=/var/cache/apt \
     apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     tzdata \
-    libopus0 \
     curl \
     wget \
     && rm -rf /var/lib/apt/lists/*
@@ -49,7 +48,7 @@ RUN mkdir -p /app/config/mediacache /app/config/cdr /app/config/recorders  /app/
 # Automatically pick the correct binary based on the architecture being built
 # We expect binaries to be placed in bin/amd64/ and bin/arm64/ by the build script
 ARG TARGETARCH
-COPY bin/${TARGETARCH}/active-call /app/active-call
+COPY --chmod=0755 bin/${TARGETARCH}/active-call /app/active-call
 COPY ./static /app/static
 COPY ./features /app/features
 COPY ./config/playbook/hello.md /app/config/playbook/hello.md

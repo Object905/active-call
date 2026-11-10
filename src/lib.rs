@@ -6,8 +6,8 @@ use std::collections::HashMap;
 
 use crate::{
     media::{
-        ambiance::AmbianceOption, recorder::RecorderOption, track::media_pass::MediaPassOption,
-        vad::VADOption,
+        agc::AGCOption, ambiance::AmbianceOption, monitor::MonitorOption,
+        recorder::RecorderOption, track::media_pass::MediaPassOption, vad::VADOption,
     },
     synthesis::SynthesisOption,
     transcription::TranscriptionOption,
@@ -20,6 +20,7 @@ pub mod config;
 pub mod event;
 pub mod handler;
 pub mod locator;
+pub mod main_builder;
 pub mod media;
 pub mod net_tool;
 
@@ -27,14 +28,17 @@ pub mod net_tool;
 pub mod offline;
 
 pub mod playbook;
+pub mod sip_util;
+pub mod sipflow;
 pub mod synthesis;
 pub mod transcription;
 pub mod useragent;
 
-#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[derive(Deserialize, Serialize, Default, Clone)]
 #[serde(default)]
 pub struct SipOption {
     pub username: Option<String>,
+    #[serde(skip_serializing)]
     pub password: Option<String>,
     pub realm: Option<String>,
     pub contact: Option<String>,
@@ -44,11 +48,27 @@ pub struct SipOption {
     pub enable_srtp: Option<bool>,
 }
 
+impl std::fmt::Debug for SipOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SipOption")
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "***"))
+            .field("realm", &self.realm)
+            .field("contact", &self.contact)
+            .field("headers", &self.headers)
+            .field("hangup_headers", &self.hangup_headers)
+            .field("extract_headers", &self.extract_headers)
+            .field("enable_srtp", &self.enable_srtp)
+            .finish()
+    }
+}
+
 #[skip_serializing_none]
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct CallOption {
     pub denoise: Option<bool>,
+    pub agc: Option<AGCOption>,
     pub offer: Option<String>,
     pub callee: Option<String>,
     pub caller: Option<String>,
@@ -61,6 +81,13 @@ pub struct CallOption {
     pub handshake_timeout: Option<u64>,
     pub enable_ipv6: Option<bool>,
     pub inactivity_timeout: Option<u64>, // inactivity timeout in seconds
+    /// Incoming RTC sample timeout in seconds; None or zero disables notifications.
+    pub rtp_timeout: Option<u64>,
+    /// Jitter buffer and loss concealment on this leg's inbound audio (see
+    /// rustrtc's `JitterBuffer::tick`). None: `[jitter_buffer]` in the
+    /// config, by default on for WebRTC, off for SIP. Worth turning on for SIP endpoints on the
+    /// open internet, such as softphones, rather than carrier trunks.
+    pub jitter_buffer: Option<bool>,
     pub sip: Option<SipOption>,
     pub extra: Option<HashMap<String, String>>,
     pub codec: Option<String>, // pcmu, pcma, g722, pcm, only for websocket call
@@ -68,12 +95,18 @@ pub struct CallOption {
     pub eou: Option<EouOption>,
     pub realtime: Option<RealtimeOption>,
     pub subscribe: Option<bool>,
+    /// Side-path audio distribution: dial out to a websocket and mirror both
+    /// legs' audio (one-way tap, the media path is untouched).
+    pub monitor: Option<MonitorOption>,
+    pub enable_ice_lite: Option<bool>,
+    pub ringback_detection: Option<RingbackDetectionOption>,
 }
 
 impl Default for CallOption {
     fn default() -> Self {
         Self {
             denoise: None,
+            agc: None,
             offer: None,
             callee: None,
             caller: None,
@@ -84,6 +117,8 @@ impl Default for CallOption {
             media_pass: None,
             handshake_timeout: None,
             inactivity_timeout: Some(50), // default 50 seconds
+            rtp_timeout: None,
+            jitter_buffer: None,
             enable_ipv6: None,
             sip: None,
             extra: None,
@@ -92,6 +127,9 @@ impl Default for CallOption {
             eou: None,
             realtime: None,
             subscribe: None,
+            monitor: None,
+            enable_ice_lite: None,
+            ringback_detection: None,
         }
     }
 }
@@ -119,11 +157,7 @@ impl CallOption {
         }
         let caller_uri = if let Some(caller) = &self.caller {
             // Ensure caller URI has proper sip: scheme
-            if caller.starts_with("sip:") || caller.starts_with("sips:") {
-                caller.clone()
-            } else {
-                format!("sip:{}", caller)
-            }
+            crate::sip_util::ensure_sip_scheme(caller.clone())
         } else if let Some(username) = self.sip.as_ref().and_then(|sip| sip.username.as_ref()) {
             // If caller is not specified but we have SIP credentials, use username as caller
             // If realm is available, use it, otherwise use local IP
@@ -143,14 +177,14 @@ impl CallOption {
         if let Some(sip) = &self.sip {
             invite_option.credential = Some(Credential {
                 username: sip.username.clone().unwrap_or_default(),
+                auth_username: None,
                 password: sip.password.clone().unwrap_or_default(),
                 realm: sip.realm.clone(),
             });
-            invite_option.headers = sip.headers.as_ref().map(|h| {
-                h.iter()
-                    .map(|(k, v)| rsipstack::rsip::Header::Other(k.clone(), v.clone()))
-                    .collect::<Vec<_>>()
-            });
+            invite_option.headers = sip
+                .headers
+                .as_ref()
+                .map(crate::sip_util::sip_headers_from_map);
             sip.contact.as_ref().map(|c| match c.clone().try_into() {
                 Ok(u) => {
                     invite_option.contact = u;
@@ -167,8 +201,10 @@ impl CallOption {
 #[serde(rename_all = "camelCase")]
 pub struct ReferOption {
     pub denoise: Option<bool>,
+    pub agc: Option<AGCOption>,
     pub timeout: Option<u32>,
     pub moh: Option<String>,
+    pub vad: Option<VADOption>,
     pub asr: Option<TranscriptionOption>,
     /// hangup after the call is ended
     pub auto_hangup: Option<bool>,
@@ -176,6 +212,16 @@ pub struct ReferOption {
     pub call_id: Option<String>,
     /// Pause parent call's ASR during refer call, will resume after refer ends (if auto_hangup is false)
     pub pause_parent_asr: Option<bool>,
+    /// If false, DTMF RTP packets are not forwarded between the main call and the refer call
+    pub forward_dtmf: Option<bool>,
+    /// Custom headers blindly forwarded onto the transfer INVITE (e.g.
+    /// `User-to-User`, `X-ACC-Bizdata` received on an incoming REFER).
+    pub extra_headers: Option<HashMap<String, String>>,
+    /// Inactivity timeout (seconds) for the refer/bridge legs. When the leg
+    /// receives no media frames for this long it fires
+    /// `SessionEvent::Inactivity`, which ends the call. Defaults to
+    /// `CallOption::default()` (50s); `0` disables the watchdog.
+    pub inactivity_timeout: Option<u64>,
 }
 
 #[skip_serializing_none]
@@ -190,6 +236,27 @@ pub struct EouOption {
     /// max timeout in milliseconds
     pub timeout: Option<u32>,
     pub extra: Option<HashMap<String, String>>,
+}
+
+#[skip_serializing_none]
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RingbackDetectionOption {
+    pub enabled: Option<bool>,
+    /// Path to telcoclassifier_weights.bin (default: "./telcoclassifier_weights.bin")
+    pub model_weights_path: Option<String>,
+    /// Minimum audio accumulation (seconds) before first inference
+    pub min_buffer_secs: Option<f32>,
+    /// Seconds between consecutive inferences
+    pub detection_interval_secs: Option<f32>,
+    /// Confidence threshold for reporting a state
+    pub confidence_threshold: Option<f32>,
+    /// Only emit events on state change (ringing→human_voice etc.)
+    pub on_state_change_only: Option<bool>,
+    /// Sliding window size for result accumulation (default: 6, i.e. 4+2)
+    pub sliding_window_size: Option<usize>,
+    /// Confidence threshold for immediate finalization (default: 0.9)
+    pub final_confidence_threshold: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Hash, Eq, PartialEq)]
@@ -255,5 +322,68 @@ where
         spawner(Box::pin(future))
     } else {
         tokio::spawn(future)
+    }
+}
+
+#[cfg(test)]
+mod rtp_timeout_tests {
+    use super::CallOption;
+    use crate::call::Command;
+
+    #[test]
+    fn rtp_timeout_is_optional_and_shared_by_invite_and_accept() {
+        assert_eq!(CallOption::default().rtp_timeout, None);
+        assert!(
+            serde_json::to_value(CallOption::default())
+                .unwrap()
+                .get("rtpTimeout")
+                .is_none()
+        );
+        for command in ["invite", "accept"] {
+            for (option, expected) in [
+                (serde_json::json!({}), None),
+                (serde_json::json!({"rtpTimeout": null}), None),
+                (serde_json::json!({"rtpTimeout": 0}), Some(0)),
+                (serde_json::json!({"rtpTimeout": 30}), Some(30)),
+            ] {
+                let parsed: Command = serde_json::from_value(serde_json::json!({
+                    "command": command, "option": option,
+                }))
+                .unwrap();
+                match parsed {
+                    Command::Invite { option } | Command::Accept { option } => {
+                        assert_eq!(option.rtp_timeout, expected);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod jitter_buffer_option_tests {
+    use crate::call::Command;
+
+    #[test]
+    fn jitter_buffer_is_set_per_call_by_invite_and_accept() {
+        for command in ["invite", "accept"] {
+            for (option, expected) in [
+                (serde_json::json!({}), None),
+                (serde_json::json!({"jitterBuffer": true}), Some(true)),
+                (serde_json::json!({"jitterBuffer": false}), Some(false)),
+            ] {
+                let parsed: Command = serde_json::from_value(serde_json::json!({
+                    "command": command, "option": option,
+                }))
+                .unwrap();
+                match parsed {
+                    Command::Invite { option } | Command::Accept { option } => {
+                        assert_eq!(option.jitter_buffer, expected);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
     }
 }

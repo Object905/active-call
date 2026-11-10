@@ -36,6 +36,8 @@ pub struct VADOption {
     pub endpoint: Option<String>,
     pub secret_key: Option<String>,
     pub secret_id: Option<String>,
+    #[serde(skip)]
+    pub refer: Option<bool>,
 }
 
 impl Default for VADOption {
@@ -52,6 +54,7 @@ impl Default for VADOption {
             endpoint: None,
             secret_key: None,
             secret_id: None,
+            refer: None,
         }
     }
 }
@@ -109,6 +112,7 @@ struct VadProcessorInner {
     triggered_event_sent: bool,
     current_speech_start: Option<u64>,
     temp_end: Option<u64>,
+    refer: Option<bool>,
 }
 pub struct VadProcessor {
     inner: VadProcessorInner,
@@ -116,6 +120,12 @@ pub struct VadProcessor {
 
 pub trait VadEngine: Send + Sync + Any {
     fn process(&mut self, frame: &mut AudioFrame) -> Vec<(bool, u64)>;
+
+    /// Latest raw speech probability in [0, 1] from the underlying model.
+    /// Returns None for engines that don't produce a probability (e.g. NopVad).
+    fn last_probability(&self) -> Option<f32> {
+        None
+    }
 }
 
 impl VadProcessorInner {
@@ -127,6 +137,7 @@ impl VadProcessorInner {
 
         let samples_cloned = samples.to_owned();
         let results = self.vad.process(frame);
+        frame.speech_probability = self.vad.last_probability();
         for (is_speaking, timestamp) in results {
             if is_speaking || self.triggered {
                 let current_buf = SpeechBuf {
@@ -174,6 +185,7 @@ impl VadProcessorInner {
                         start_time,
                         is_filler: None, // Will be enriched by MFCC or ASR
                         confidence: Some(1.0),
+                        refer: self.refer,
                     };
                     self.event_sender.send(event).ok();
                     self.triggered_event_sent = true;
@@ -211,6 +223,7 @@ impl VadProcessorInner {
                                 start_time,
                                 duration,
                                 samples: Some(samples_vec),
+                                refer: self.refer,
                             };
                             self.event_sender.send(event).ok();
                         }
@@ -233,6 +246,7 @@ impl VadProcessorInner {
                             start_time: temp_end,
                             duration: timeout_duration,
                             samples: None,
+                            refer: self.refer,
                         };
                         self.event_sender.send(event).ok();
                         self.temp_end = Some(timestamp);
@@ -278,6 +292,7 @@ impl VadProcessor {
         event_sender: EventSender,
         option: VADOption,
     ) -> Result<Self> {
+        let refer = option.refer;
         let inner = VadProcessorInner {
             vad: engine,
             event_sender,
@@ -287,6 +302,7 @@ impl VadProcessor {
             triggered: false,
             current_speech_start: None,
             temp_end: None,
+            refer,
         };
         Ok(Self { inner })
     }
