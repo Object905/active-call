@@ -5,7 +5,7 @@ use reqwest::Client;
 use serde_json::json;
 use std::pin::Pin;
 
-use super::super::{LlmConfig, ChatMessage};
+use super::super::{ChatMessage, LlmConfig};
 use super::types::ToolInvocation;
 
 #[derive(Debug, Clone)]

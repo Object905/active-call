@@ -1,9 +1,7 @@
 use anyhow::Result;
+use rsipstack::dialog::{authenticate::Credential, registration::Registration};
 use rsipstack::rsip::{HostWithPort, Response, StatusCodeKind, Transport};
 use rsipstack::transport::SipAddr;
-use rsipstack::{
-    dialog::{authenticate::Credential, registration::Registration},
-};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -14,6 +12,9 @@ use super::public_address::{normalize_transport, should_update_address};
 #[derive(Debug, Deserialize, Clone, Serialize)]
 pub struct UserCredential {
     pub username: String,
+    /// Optional digest auth ID, forwarded to rsipstack's `Credential`
+    /// (falls back to `username` when absent).
+    pub auth_username: Option<String>,
     pub password: String,
     pub realm: Option<String>,
 }
@@ -31,6 +32,7 @@ impl From<UserCredential> for Credential {
     fn from(val: UserCredential) -> Self {
         Credential {
             username: val.username,
+            auth_username: val.auth_username,
             password: val.password,
             realm: val.realm,
         }

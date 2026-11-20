@@ -17,6 +17,16 @@ struct WebhookPayload {
     event: String,
 }
 
+/// True when the external `sipbot` binary is on PATH. The SIP integration
+/// tests drive the stack through it, so skip (rather than fail) on machines
+/// that don't have it installed — e.g. CI runners.
+fn sipbot_available() -> bool {
+    match std::env::var_os("PATH") {
+        Some(path) => std::env::split_paths(&path).any(|dir| dir.join("sipbot").is_file()),
+        None => false,
+    }
+}
+
 fn create_test_config(sip_port: u16, http_port: u16, webhook_port: u16) -> Config {
     Config {
         http_addr: format!("127.0.0.1:{}", http_port),
@@ -64,6 +74,11 @@ async fn test_sip_options_ping() {
         .try_init()
         .ok();
 
+    if !sipbot_available() {
+        info!("sipbot not found in PATH; skipping OPTIONS ping test");
+        return;
+    }
+
     let sip_port = 35060;
     let http_port = 9090;
     let webhook_port = 9999;
@@ -95,6 +110,11 @@ async fn test_sip_options_ping() {
 
 #[tokio::test]
 async fn test_sip_invite_call() {
+    if !sipbot_available() {
+        info!("sipbot not found in PATH; skipping invite call test");
+        return;
+    }
+
     let sip_port = 35061;
     let http_port = 9091;
     let webhook_port = 9991;

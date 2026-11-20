@@ -2,7 +2,7 @@ use crate::offline::get_offline_models;
 use crate::synthesis::{SynthesisClient, SynthesisEvent, SynthesisOption, SynthesisType};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use audio_codec::Resampler;
+use audio_codec::BoxedResampler;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use tokio::sync::mpsc;
@@ -91,10 +91,11 @@ impl SupertonicTtsClient {
 
                             // Resample if needed
                             if tts.sample_rate() != target_rate {
-                                let mut resampler = Resampler::new(
+                                let mut resampler = BoxedResampler::new(
                                     tts.sample_rate() as usize,
                                     target_rate as usize,
-                                );
+                                )
+                                .expect("invalid sample rate");
                                 samples_i16 = resampler.resample(&samples_i16);
                             }
 

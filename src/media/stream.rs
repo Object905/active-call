@@ -1,7 +1,9 @@
 use crate::event::{EventSender, SessionEvent};
+use crate::media::ambiance::{AmbianceOption, AmbianceProcessor};
 use crate::media::dtmf::DtmfDetector;
+use crate::media::monitor::MonitorHub;
 use crate::media::volume_control::HoldProcessor;
-use crate::media::{AudioFrame, Samples, TrackId};
+use crate::media::{AudioFrame, INTERNAL_SAMPLERATE, Samples, TrackId};
 use crate::media::{
     processor::Processor,
     recorder::{Recorder, RecorderOption},
@@ -10,6 +12,10 @@ use crate::media::{
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::{
+    Arc, Mutex as StdMutex, Weak,
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::{
@@ -20,11 +26,21 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid;
 
+// leak-diagnosis counters (LEAKSTAT)
+pub static STREAMS_LIVE: AtomicUsize = AtomicUsize::new(0);
+pub static RECORDER_LIVE: AtomicUsize = AtomicUsize::new(0);
+pub static RECORDER_SPAWNED: AtomicUsize = AtomicUsize::new(0);
+pub static RECORDER_DETACHED: AtomicUsize = AtomicUsize::new(0);
+pub static TRACKS_LIVE: AtomicUsize = AtomicUsize::new(0);
+
 pub struct MediaStream {
     id: String,
     pub cancel_token: CancellationToken,
     recorder_option: Mutex<Option<RecorderOption>>,
     tracks: Mutex<HashMap<TrackId, (Box<dyn Track>, DtmfDetector)>>,
+    /// Trickle ICE candidates that arrived before any track existed to feed
+    /// them to. Drained into the next track started.
+    pending_ice_candidates: Mutex<Vec<(String, Option<String>, Option<u32>)>>,
     suppressed_sources: Mutex<HashSet<TrackId>>,
     event_sender: EventSender,
     pub packet_sender: TrackPacketSender,
@@ -32,10 +48,56 @@ pub struct MediaStream {
     recorder_sender: mpsc::UnboundedSender<AudioFrame>,
     recorder_receiver: Mutex<Option<mpsc::UnboundedReceiver<AudioFrame>>>,
     recorder_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Stops the recorder. Independent of `cancel_token`: when the stream
+    /// ends, the recorder supervisor either stops the recorder or hands the
+    /// recording to the bridged peer (`RecorderOption::follow_bridge`).
+    recorder_stop: CancellationToken,
+    /// The stream this one is bridged to, if any.
+    bridge_peer: Arc<StdMutex<Option<BridgePeer>>>,
+    /// Recordings of ended bridged peers that this stream now feeds.
+    adopted_recorders: StdMutex<Vec<AdoptedRecorder>>,
+    /// True once a recorder task is actually consuming `recorder_sender`.
+    /// The ambiance idle loop mirrors its frames to the recorder only when
+    /// this is set, avoiding unbounded buffering when recording starts late.
+    recording_active: Arc<AtomicBool>,
+    ambiance: Mutex<Option<Arc<StdMutex<AmbianceProcessor>>>>,
+    ambiance_source_id: StdMutex<Option<TrackId>>,
+    last_server_packet_ts: Arc<AtomicU64>,
+    ambiance_idle_started: AtomicBool,
+    /// Side-path audio distribution hub (see `media::monitor`). Lazily
+    /// created by `enable_monitor` when the call option asks for it.
+    monitor_hub: Mutex<Option<MonitorHub>>,
+}
+
+impl Drop for MediaStream {
+    fn drop(&mut self) {
+        STREAMS_LIVE.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 const CALLEE_TRACK_ID: &str = "callee-track";
+/// Prefix of the forwarding tracks that carry a bridged peer's audio.
+pub const BRIDGE_TRACK_PREFIX: &str = "bridge:";
 const QUEUE_HOLD_TRACK_ID: &str = "queue-hold-track";
+pub const SERVER_SIDE_TRACK_ID: &str = "server-side-track";
+const AMBIANCE_IDLE_TRACK_ID: &str = "ambiance-track";
+const AMBIANCE_IDLE_PTIME: Duration = Duration::from_millis(20);
+// Skip idle fill if server-side audio arrived within this window (TTS ptime is 20ms).
+const AMBIANCE_IDLE_GAP_MS: u64 = 25;
+
+#[derive(Clone)]
+struct BridgePeer {
+    id: String,
+    stream: Weak<MediaStream>,
+}
+
+/// A recording handed over by an ended bridged peer.
+struct AdoptedRecorder {
+    sender: mpsc::UnboundedSender<AudioFrame>,
+    /// The ended peer's session id: the recorder's own-leg channel.
+    own_leg: TrackId,
+    stop: CancellationToken,
+}
 
 pub struct MediaStreamBuilder {
     cancel_token: Option<CancellationToken>,
@@ -75,11 +137,13 @@ impl MediaStreamBuilder {
         let tracks = Mutex::new(HashMap::new());
         let (track_packet_sender, track_packet_receiver) = mpsc::unbounded_channel();
         let (recorder_sender, recorder_receiver) = mpsc::unbounded_channel();
+        STREAMS_LIVE.fetch_add(1, Ordering::Relaxed);
         MediaStream {
             id: self.id.unwrap_or_default(),
             cancel_token,
             recorder_option: Mutex::new(self.recorder_config),
             tracks,
+            pending_ice_candidates: Mutex::new(Vec::new()),
             suppressed_sources: Mutex::new(HashSet::new()),
             event_sender: self.event_sender,
             packet_sender: track_packet_sender,
@@ -87,6 +151,15 @@ impl MediaStreamBuilder {
             recorder_sender,
             recorder_receiver: Mutex::new(Some(recorder_receiver)),
             recorder_handle: Mutex::new(None),
+            recorder_stop: CancellationToken::new(),
+            bridge_peer: Arc::new(StdMutex::new(None)),
+            adopted_recorders: StdMutex::new(Vec::new()),
+            recording_active: Arc::new(AtomicBool::new(false)),
+            ambiance: Mutex::new(None),
+            ambiance_source_id: StdMutex::new(None),
+            last_server_packet_ts: Arc::new(AtomicU64::new(0)),
+            ambiance_idle_started: AtomicBool::new(false),
+            monitor_hub: Mutex::new(None),
         }
     }
 }
@@ -114,6 +187,96 @@ impl MediaStream {
         Ok(())
     }
 
+    /// Load ambiance once per call and keep mixing it while TTS/file playback is silent.
+    pub async fn ensure_ambiance(
+        &self,
+        option: AmbianceOption,
+        source_track_id: TrackId,
+    ) -> Result<Option<Arc<StdMutex<AmbianceProcessor>>>> {
+        let mut slot = self.ambiance.lock().await;
+        if let Some(existing) = slot.as_ref() {
+            return Ok(Some(existing.clone()));
+        }
+
+        if option.path.is_none() || option.enabled == Some(false) {
+            return Ok(None);
+        }
+
+        let processor = AmbianceProcessor::new(option).await?;
+        let shared = Arc::new(StdMutex::new(processor));
+        *slot = Some(shared.clone());
+        drop(slot);
+
+        *self.ambiance_source_id.lock().unwrap() = Some(source_track_id);
+        self.start_ambiance_idle_loop(shared.clone());
+        info!(session_id = self.id, "ambiance idle mixer started");
+        Ok(Some(shared))
+    }
+
+    fn start_ambiance_idle_loop(&self, processor: Arc<StdMutex<AmbianceProcessor>>) {
+        if self.ambiance_idle_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        let cancel_token = self.cancel_token.clone();
+        let packet_sender = self.packet_sender.clone();
+        let last_server_packet_ts = self.last_server_packet_ts.clone();
+        let session_id = self.id.clone();
+        let recorder_sender = self.recorder_sender.clone();
+        let recording_active = self.recording_active.clone();
+
+        crate::spawn(async move {
+            let mut ticker = tokio::time::interval(AMBIANCE_IDLE_PTIME);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = cancel_token.cancelled() => break,
+                    _ = ticker.tick() => {
+                        let now = crate::media::get_timestamp();
+                        let last = last_server_packet_ts.load(Ordering::Relaxed);
+                        if last != 0 && now.saturating_sub(last) < AMBIANCE_IDLE_GAP_MS {
+                            continue;
+                        }
+
+                        let mut frame = AudioFrame {
+                            track_id: AMBIANCE_IDLE_TRACK_ID.to_string(),
+                            samples: Samples::Empty,
+                            timestamp: now,
+                            sample_rate: INTERNAL_SAMPLERATE,
+                            channels: 1,
+                            ..Default::default()
+                        };
+                        {
+                            let mut ambiance = match processor.lock() {
+                                Ok(guard) => guard,
+                                Err(_) => break,
+                            };
+                            if let Err(e) = ambiance.process_frame(&mut frame) {
+                                warn!(session_id, "ambiance idle mix failed: {}", e);
+                                continue;
+                            }
+                        }
+                        if matches!(frame.samples, Samples::Empty) {
+                            continue;
+                        }
+                        // Mirror the mixed idle ambiance into the recording so the
+                        // stereo WAV's server-side channel reflects what the user
+                        // actually heard, including silent-period background audio.
+                        if recording_active.load(Ordering::SeqCst) {
+                            let mut recorded = frame.clone();
+                            recorded.track_id = SERVER_SIDE_TRACK_ID.to_string();
+                            let _ = recorder_sender.send(recorded);
+                        }
+                        if packet_sender.send(frame).is_err() {
+                            debug!(session_id, "ambiance idle sender closed");
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     pub fn stop(&self, _reason: Option<String>, _initiator: Option<String>) {
         self.cancel_token.cancel()
     }
@@ -122,6 +285,7 @@ impl MediaStream {
         self.cancel_token.cancel();
         {
             let mut tracks = self.tracks.lock().await;
+            TRACKS_LIVE.fetch_sub(tracks.len(), Ordering::Relaxed);
             for (id, (track, _)) in tracks.drain() {
                 if let Err(e) = track.stop().await {
                     warn!(session_id = self.id, track_id = %id, "failed to stop track during cleanup: {}", e);
@@ -131,11 +295,16 @@ impl MediaStream {
         self.suppressed_sources.lock().await.clear();
 
         if let Some(recorder_handle) = self.recorder_handle.lock().await.take() {
+            // The supervisor stops the recorder now that the stream is
+            // cancelled, unless it handed the recording to a bridged peer:
+            // then the recording runs until the peer is done with it.
+            self.recorder_stop.cancelled().await;
             if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(30), recorder_handle).await
             {
                 info!(session_id = self.id, "recorder stopped");
             } else {
                 warn!(session_id = self.id, "recorder timeout");
+                RECORDER_DETACHED.fetch_add(1, Ordering::Relaxed);
             }
         }
         Ok(())
@@ -144,13 +313,69 @@ impl MediaStream {
         self.tracks.lock().await.len()
     }
 
+    /// Record the stream this one is bridged to (`None` when unbridged). A
+    /// new bridge ends recordings adopted from a previous peer: that call is
+    /// over and this leg now talks to someone else.
+    pub fn set_bridge_peer(&self, peer: Option<&Arc<MediaStream>>) {
+        if peer.is_some() {
+            for recording in self.adopted_recorders.lock().unwrap().drain(..) {
+                recording.stop.cancel();
+            }
+        }
+        *self.bridge_peer.lock().unwrap() = peer.map(|p| BridgePeer {
+            id: p.id.clone(),
+            stream: Arc::downgrade(p),
+        });
+    }
+
+    /// Clear the bridge peer if it is `peer_id`.
+    pub fn clear_bridge_peer(&self, peer_id: &str) {
+        let mut peer = self.bridge_peer.lock().unwrap();
+        if peer.as_ref().is_some_and(|p| p.id == peer_id) {
+            *peer = None;
+        }
+    }
+
     pub async fn update_recorder_option(&self, recorder_config: RecorderOption) {
         *self.recorder_option.lock().await = Some(recorder_config);
         self.start_recorder().await.ok();
     }
 
+    /// Create the session's monitor hub on first use and return it. Idempotent.
+    pub async fn enable_monitor(&self) -> MonitorHub {
+        let mut slot = self.monitor_hub.lock().await;
+        if let Some(hub) = slot.as_ref() {
+            return hub.clone();
+        }
+        let hub = MonitorHub::new();
+        *slot = Some(hub.clone());
+        drop(slot);
+        info!(session_id = self.id, "monitor hub enabled");
+        hub
+    }
+
+    /// The session's monitor hub, if `enable_monitor` was called.
+    pub async fn monitor_hub(&self) -> Option<MonitorHub> {
+        self.monitor_hub.lock().await.clone()
+    }
+
+    /// Whether a track that has not ended is registered under `id`.
+    pub async fn has_live_track(&self, id: &TrackId) -> bool {
+        self.tracks
+            .lock()
+            .await
+            .get(id)
+            .is_some_and(|(track, _)| !track.has_ended())
+    }
+
     pub async fn remove_track(&self, id: &TrackId, graceful: bool) {
-        let track_entry = { self.tracks.lock().await.remove(id) };
+        let track_entry = {
+            let removed = self.tracks.lock().await.remove(id);
+            if removed.is_some() {
+                TRACKS_LIVE.fetch_sub(1, Ordering::Relaxed);
+            }
+            removed
+        };
         if let Some((track, _)) = track_entry {
             self.suppressed_sources.lock().await.remove(id);
             let res = if !graceful {
@@ -171,13 +396,20 @@ impl MediaStream {
         track_id: &TrackId,
         answer: &String,
     ) -> Result<()> {
-        let track_entry = { self.tracks.lock().await.remove(track_id) };
+        let track_entry = {
+            let removed = self.tracks.lock().await.remove(track_id);
+            if removed.is_some() {
+                TRACKS_LIVE.fetch_sub(1, Ordering::Relaxed);
+            }
+            removed
+        };
         if let Some((mut track, dtmf)) = track_entry {
             let res = track.update_remote_description(answer).await;
             self.tracks
                 .lock()
                 .await
                 .insert(track_id.clone(), (track, dtmf));
+                TRACKS_LIVE.fetch_add(1, Ordering::Relaxed);
             res?;
         }
         Ok(())
@@ -188,13 +420,46 @@ impl MediaStream {
         track_id: &TrackId,
         answer: &String,
     ) -> Result<()> {
-        let track_entry = { self.tracks.lock().await.remove(track_id) };
+        let track_entry = {
+            let removed = self.tracks.lock().await.remove(track_id);
+            if removed.is_some() {
+                TRACKS_LIVE.fetch_sub(1, Ordering::Relaxed);
+            }
+            removed
+        };
         if let Some((mut track, dtmf)) = track_entry {
             let res = track.update_remote_description_force(answer).await;
             self.tracks
                 .lock()
                 .await
                 .insert(track_id.clone(), (track, dtmf));
+                TRACKS_LIVE.fetch_add(1, Ordering::Relaxed);
+            res?;
+        }
+        Ok(())
+    }
+
+    /// Apply a provisional remote description (SIP 183 early media). See
+    /// `Track::update_remote_description_provisional`.
+    pub async fn update_remote_description_provisional(
+        &self,
+        track_id: &TrackId,
+        answer: &String,
+    ) -> Result<()> {
+        let track_entry = {
+            let removed = self.tracks.lock().await.remove(track_id);
+            if removed.is_some() {
+                TRACKS_LIVE.fetch_sub(1, Ordering::Relaxed);
+            }
+            removed
+        };
+        if let Some((mut track, dtmf)) = track_entry {
+            let res = track.update_remote_description_provisional(answer).await;
+            self.tracks
+                .lock()
+                .await
+                .insert(track_id.clone(), (track, dtmf));
+                TRACKS_LIVE.fetch_add(1, Ordering::Relaxed);
             res?;
         }
         Ok(())
@@ -206,13 +471,20 @@ impl MediaStream {
         offer: String,
         timeout: Option<Duration>,
     ) -> Result<String> {
-        let track_entry = { self.tracks.lock().await.remove(track_id) };
+        let track_entry = {
+            let removed = self.tracks.lock().await.remove(track_id);
+            if removed.is_some() {
+                TRACKS_LIVE.fetch_sub(1, Ordering::Relaxed);
+            }
+            removed
+        };
         if let Some((mut track, dtmf)) = track_entry {
             let res = track.handshake(offer, timeout).await;
             self.tracks
                 .lock()
                 .await
                 .insert(track_id.clone(), (track, dtmf));
+                TRACKS_LIVE.fetch_add(1, Ordering::Relaxed);
             res
         } else {
             anyhow::bail!("track not found: {}", track_id)
@@ -220,12 +492,29 @@ impl MediaStream {
     }
 
     pub async fn update_track(&self, mut track: Box<dyn Track>, play_id: Option<String>) {
-        self.remove_track(track.id(), false).await;
-        if self.recorder_option.lock().await.is_some() {
-            track.insert_processor(Box::new(RecorderProcessor::new(
-                self.recorder_sender.clone(),
-            )));
+        // Detach the replaced track WITHOUT closing its transport right away:
+        // the predecessor's PeerConnection teardown races against the
+        // successor's media setup and can leave the successor completely deaf
+        // (inbound RTP never demuxed — INVITE-mode auto-refer transfers hit
+        // exactly this: the transfer leg consumed no media and the session
+        // was hung up by the inactivity watchdog ~50s later). Disarm the old
+        // track's pipeline (inactivity watchdog, workers) now, and close its
+        // transport after a short grace period.
+        let replaced = {
+            let removed = self.tracks.lock().await.remove(track.id());
+            if removed.is_some() {
+                TRACKS_LIVE.fetch_sub(1, Ordering::Relaxed);
+            }
+            removed
+        };
+        if let Some((old_track, _)) = replaced {
+            old_track.cancel_pipeline();
+            crate::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                let _ = old_track.stop().await;
+            });
         }
+        self.attach_recorder_tap(&mut track).await;
         match track
             .start(self.event_sender.clone(), self.packet_sender.clone())
             .await
@@ -233,10 +522,26 @@ impl MediaStream {
             Ok(_) => {
                 info!(session_id = self.id, track_id = track.id(), "track started");
                 let track_id = track.id().clone();
+                if track_id.as_str() == self.id.as_str() {
+                    let pending = std::mem::take(&mut *self.pending_ice_candidates.lock().await);
+                    for (candidate, sdp_mid, sdp_mline_index) in pending {
+                        if let Err(e) =
+                            track.add_ice_candidate(&candidate, sdp_mid.as_deref(), sdp_mline_index)
+                        {
+                            warn!(
+                                session_id = self.id,
+                                track_id = track.id(),
+                                "failed to apply buffered ICE candidate: {}",
+                                e
+                            );
+                        }
+                    }
+                }
                 self.tracks
                     .lock()
                     .await
                     .insert(track_id.clone(), (track, DtmfDetector::new()));
+                TRACKS_LIVE.fetch_add(1, Ordering::Relaxed);
                 self.event_sender
                     .send(SessionEvent::TrackStart {
                         track_id,
@@ -278,6 +583,86 @@ impl MediaStream {
             for (track, _) in self.tracks.lock().await.values_mut() {
                 MuteProcessor::unmute_track(track.as_mut());
             }
+        }
+    }
+
+    /// Apply a new remote offer to the session's own (WebRTC) track without
+    /// recreating it, e.g. for an ICE restart, and return the new answer.
+    pub async fn renegotiate(&self, offer: String) -> Result<String> {
+        // hold the lock across the handshake (instead of taking the track out
+        // of the map like `handshake` does), so a trickled candidate for the
+        // new ICE generation waits for it rather than landing in
+        // `pending_ice_candidates`, which is only replayed on `update_track`
+        let mut tracks = self.tracks.lock().await;
+        let Some((track, _)) = tracks.get_mut(self.id.as_str()) else {
+            anyhow::bail!("track not found: {}", self.id)
+        };
+        let answer = track.handshake(offer, None).await?;
+        if answer.is_empty() {
+            anyhow::bail!("track {} does not support renegotiation", self.id)
+        }
+        Ok(answer)
+    }
+
+    /// See `Track::on_answered`.
+    pub async fn on_answered(&self, track_id: &TrackId, rtp_timeout: Option<Duration>) {
+        if let Some((track, _)) = self.tracks.lock().await.get(track_id) {
+            track.on_answered(rtp_timeout);
+        }
+    }
+
+    /// Trickle ICE: feed a remote candidate into the ICE-backed (WebRTC)
+    /// track, if it's up yet, or buffer it for `update_track` to replay
+    /// otherwise.
+    pub async fn add_ice_candidate(
+        &self,
+        candidate: &str,
+        sdp_mid: Option<&str>,
+        sdp_mline_index: Option<u32>,
+    ) -> Result<()> {
+        let tracks = self.tracks.lock().await;
+        if let Some((track, _)) = tracks.get(self.id.as_str()) {
+            track.add_ice_candidate(candidate, sdp_mid, sdp_mline_index)?;
+            return Ok(());
+        }
+        drop(tracks);
+        self.pending_ice_candidates.lock().await.push((
+            candidate.to_string(),
+            sdp_mid.map(|s| s.to_string()),
+            sdp_mline_index,
+        ));
+        Ok(())
+    }
+
+    pub async fn pause_playback(&self, id: TrackId) -> Result<()> {
+        self.set_playback_paused(id, true).await
+    }
+
+    pub async fn resume_playback(&self, id: TrackId) -> Result<()> {
+        self.set_playback_paused(id, false).await
+    }
+
+    async fn set_playback_paused(&self, id: TrackId, paused: bool) -> Result<()> {
+        if let Some((track, _)) = self.tracks.lock().await.get_mut(&id) {
+            if track.set_paused(paused) {
+                Ok(())
+            } else {
+                warn!(
+                    session_id = self.id,
+                    track_id = %id,
+                    paused,
+                    "pause state requested for track that does not support pausing"
+                );
+                Err(anyhow::anyhow!("track does not support pausing: {}", id))
+            }
+        } else {
+            warn!(
+                session_id = self.id,
+                track_id = %id,
+                paused,
+                "pause state requested for unknown track"
+            );
+            Err(anyhow::anyhow!("track not found: {}", id))
         }
     }
 
@@ -342,18 +727,24 @@ impl MediaStream {
 #[derive(Clone)]
 pub struct RecorderProcessor {
     sender: mpsc::UnboundedSender<AudioFrame>,
+    /// Only frames tagged with this track id are mirrored. A track may relay
+    /// another leg's audio (e.g. the media-pass track forwards the caller's
+    /// audio to the websocket); that relayed copy is already recorded at its
+    /// origin and must not be written to the recording a second time.
+    owner: TrackId,
 }
 
 impl RecorderProcessor {
-    pub fn new(sender: mpsc::UnboundedSender<AudioFrame>) -> Self {
-        Self { sender }
+    pub fn new(sender: mpsc::UnboundedSender<AudioFrame>, owner: TrackId) -> Self {
+        Self { sender, owner }
     }
 }
 
 impl Processor for RecorderProcessor {
     fn process_frame(&mut self, frame: &mut AudioFrame) -> Result<()> {
-        let frame_clone = frame.clone();
-        let _ = self.sender.send(frame_clone);
+        if frame.track_id == self.owner {
+            let _ = self.sender.send(frame.clone());
+        }
         Ok(())
     }
 }
@@ -375,16 +766,22 @@ impl MediaStream {
                     return Ok(());
                 }
             };
-            let cancel_token = self.cancel_token.child_token();
+            let cancel_token = self.recorder_stop.clone();
             let session_id_clone = self.id.clone();
 
             info!(
                 session_id = session_id_clone,
                 sample_rate = recorder_option.samplerate,
+                native_samplerate = recorder_option.native_samplerate.unwrap_or(false),
                 ptime = recorder_option.ptime,
                 "start recorder",
             );
 
+            let native = recorder_option.native_samplerate.unwrap_or(false);
+            RECORDER_SPAWNED.fetch_add(1, Ordering::Relaxed);
+            RECORDER_LIVE.fetch_add(1, Ordering::Relaxed);
+            let follow_bridge = recorder_option.follow_bridge.unwrap_or(false);
+            let recorder_stop = self.recorder_stop.clone();
             let recorder_handle = crate::spawn(async move {
                 let recorder_file = recorder_option.recorder_file.clone();
                 let recorder =
@@ -401,46 +798,211 @@ impl MediaStream {
                         );
                     }
                 }
+                RECORDER_LIVE.fetch_sub(1, Ordering::Relaxed);
+                // A failed recorder must not keep cleanup waiting.
+                recorder_stop.cancel();
             });
             *self.recorder_handle.lock().await = Some(recorder_handle);
+            self.spawn_recorder_supervisor(follow_bridge);
+            self.recording_active.store(true, Ordering::SeqCst);
+
+            // Inject the recorder tap into tracks that were added before the
+            // recorder started. `set_raw_tap` replaces any previous tap, so
+            // this stays idempotent.
+            for (track, _) in self.tracks.lock().await.values_mut() {
+                if native {
+                    track.set_raw_tap(Some(self.recorder_sender.clone()));
+                } else {
+                    let owner = track.id().clone();
+                    // Go through the chain directly: the media-pass track
+                    // deliberately ignores `Track::insert_processor`, but the
+                    // audio it plays into the call must still be recorded.
+                    let chain = track.processor_chain();
+                    if !chain.has_processor::<RecorderProcessor>() {
+                        chain.append_processor(Box::new(RecorderProcessor::new(
+                            self.recorder_sender.clone(),
+                            owner,
+                        )));
+                    }
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Stop the recorder once the stream ends or, with `follow_bridge`, hand
+    /// the recording to the bridged peer and stop it when the peer is done.
+    fn spawn_recorder_supervisor(&self, follow_bridge: bool) {
+        let stream_cancel = self.cancel_token.clone();
+        let recorder_stop = self.recorder_stop.clone();
+        let bridge_peer = self.bridge_peer.clone();
+        let recording = AdoptedRecorder {
+            sender: self.recorder_sender.clone(),
+            own_leg: self.id.clone(),
+            stop: self.recorder_stop.clone(),
+        };
+        let session_id = self.id.clone();
+        crate::spawn(async move {
+            select! {
+                _ = recorder_stop.cancelled() => return,
+                _ = stream_cancel.cancelled() => {}
+            }
+            let adopted_by = follow_bridge
+                .then(|| bridge_peer.lock().unwrap().clone())
+                .flatten()
+                .and_then(|p| p.stream.upgrade())
+                .and_then(|stream| stream.adopt_recorder(recording));
+            if let Some(peer_cancel) = adopted_by {
+                info!(session_id, "recording handed over to bridged peer");
+                select! {
+                    _ = peer_cancel.cancelled() => {}
+                    _ = recorder_stop.cancelled() => {}
+                }
+            }
+            recorder_stop.cancel();
+        });
+    }
+
+    /// Take over feeding the recording of an ended bridged peer; returns
+    /// this stream's cancel token, which ends the recording at the latest.
+    /// Refused when this stream has ended or is no longer bridged back to
+    /// that peer (e.g. it was already bridged to someone else).
+    fn adopt_recorder(&self, recording: AdoptedRecorder) -> Option<CancellationToken> {
+        let bridged_back = self
+            .bridge_peer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|p| p.id == recording.own_leg);
+        if self.cancel_token.is_cancelled() || !bridged_back {
+            return None;
+        }
+        self.adopted_recorders.lock().unwrap().push(recording);
+        Some(self.cancel_token.clone())
+    }
+
+    /// Mirror a frame from one of this stream's tracks to the recordings
+    /// adopted from ended bridged peers. This stream's own leg is the far
+    /// side of those recordings; everything else it plays (TTS, files,
+    /// ambiance) takes the ended peer's place on the own channel.
+    fn feed_adopted_recorders(&self, frame: &AudioFrame) {
+        let mut adopted = self.adopted_recorders.lock().unwrap();
+        adopted.retain(|r| !r.stop.is_cancelled());
+        if adopted.is_empty()
+            || !matches!(frame.samples, Samples::PCM { .. })
+            // Bridge tracks carry the ended peer's own audio.
+            || frame.track_id.starts_with(BRIDGE_TRACK_PREFIX)
+        {
+            return;
+        }
+        for recording in adopted.iter() {
+            let mut mirrored = frame.clone();
+            if mirrored.track_id != self.id {
+                mirrored.track_id = recording.own_leg.clone();
+            }
+            let _ = recording.sender.send(mirrored);
+        }
+    }
+
+    /// Attach the recorder tap to a track according to the recorder mode:
+    /// native-samplerate mode mirrors pre-resample frames via the chain's
+    /// raw tap, otherwise a post-pipeline RecorderProcessor is appended to
+    /// the track's processor chain. No-op when no recorder is configured.
+    async fn attach_recorder_tap(&self, track: &mut Box<dyn Track>) {
+        let Some(option) = self.recorder_option.lock().await.clone() else {
+            return;
+        };
+        if option.native_samplerate.unwrap_or(false) {
+            track.set_raw_tap(Some(self.recorder_sender.clone()));
+        } else {
+            let owner = track.id().clone();
+            // Reach into the processor chain directly rather than calling
+            // `Track::append_processor`: the media-pass track rejects that
+            // (it ignores audio processors) yet still needs to feed the
+            // recorder with the audio it plays into the call.
+            track
+                .processor_chain()
+                .append_processor(Box::new(RecorderProcessor::new(
+                    self.recorder_sender.clone(),
+                    owner,
+                )));
+        }
+    }
+
+    pub async fn set_track_refer(&self, track_id: &TrackId, refer: Option<bool>) {
+        if let Some((_, dtmf)) = self.tracks.lock().await.get_mut(track_id) {
+            dtmf.refer = refer;
+        }
+    }
+
+    pub async fn set_track_dtmf_forward(&self, track_id: &TrackId, forward: bool) {
+        if let Some((_, dtmf)) = self.tracks.lock().await.get_mut(track_id) {
+            dtmf.suppress_dtmf_forward = !forward;
+        }
     }
 
     async fn handle_forward_track(&self, mut packet_receiver: TrackPacketReceiver) {
         let event_sender = self.event_sender.clone();
         while let Some(packet) = packet_receiver.recv().await {
+            self.feed_adopted_recorders(&packet);
+            if self
+                .ambiance_source_id
+                .lock()
+                .ok()
+                .and_then(|id| id.clone())
+                .as_ref()
+                == Some(&packet.track_id)
+            {
+                self.last_server_packet_ts
+                    .store(crate::media::get_timestamp(), Ordering::Relaxed);
+            }
+
             let suppressed = {
                 self.suppressed_sources
                     .lock()
                     .await
                     .contains(&packet.track_id)
             };
-            // Process the packet with each track
-            for (track, dtmf_detector) in self.tracks.lock().await.values_mut() {
+
+            let is_dtmf = matches!(&packet.samples,
+                Samples::RTP { payload_type, .. } if *payload_type >= 96 && *payload_type <= 127);
+
+            let mut tracks = self.tracks.lock().await;
+
+            // Check once whether the source track suppresses DTMF forwarding.
+            let source_suppresses_dtmf = is_dtmf
+                && tracks
+                    .get(&packet.track_id)
+                    .map(|(_, d)| d.suppress_dtmf_forward)
+                    .unwrap_or(false);
+
+            for (track, dtmf_detector) in tracks.values_mut() {
                 if track.id() == &packet.track_id {
-                    match &packet.samples {
-                        Samples::RTP {
-                            payload_type,
-                            payload,
-                            ..
-                        } => {
-                            if let Some(digit) = dtmf_detector.detect_rtp(*payload_type, payload) {
-                                debug!(track_id = track.id(), digit, "DTMF detected");
-                                event_sender
-                                    .send(SessionEvent::Dtmf {
-                                        track_id: packet.track_id.to_string(),
-                                        timestamp: packet.timestamp,
-                                        digit,
-                                    })
-                                    .ok();
-                            }
+                    if let Samples::RTP {
+                        payload_type,
+                        payload,
+                        ..
+                    } = &packet.samples
+                    {
+                        if let Some(digit) = dtmf_detector.detect_rtp(*payload_type, payload) {
+                            debug!(track_id = track.id(), digit, "DTMF detected");
+                            event_sender
+                                .send(SessionEvent::Dtmf {
+                                    track_id: packet.track_id.to_string(),
+                                    timestamp: packet.timestamp,
+                                    digit,
+                                    refer: dtmf_detector.refer,
+                                })
+                                .ok();
                         }
-                        _ => {}
                     }
                     continue;
                 }
                 if suppressed {
+                    continue;
+                }
+                // Skip DTMF forwarding if source or destination has it suppressed.
+                if source_suppresses_dtmf || (is_dtmf && dtmf_detector.suppress_dtmf_forward) {
                     continue;
                 }
                 if packet.track_id == QUEUE_HOLD_TRACK_ID && track.id() == CALLEE_TRACK_ID {
@@ -506,5 +1068,64 @@ impl HoldTrack {
         let chain = track.processor_chain();
         // Simply remove the hold processor to resume normal operation
         chain.remove_processor::<HoldProcessor>();
+    }
+}
+
+#[cfg(test)]
+mod recorder_owner_tests {
+    use super::*;
+    use crate::media::Samples;
+
+    fn pcm_frame(track_id: &str, len: usize) -> AudioFrame {
+        AudioFrame {
+            track_id: track_id.to_string(),
+            samples: Samples::PCM {
+                samples: vec![100i16; len],
+            },
+            sample_rate: 16000,
+            channels: 1,
+            ..Default::default()
+        }
+    }
+
+    /// Regression for media-pass recordings in non-native mode: the track's own
+    /// processor chain also processes audio it relays for another leg (the
+    /// caller's audio forwarded to the websocket). `RecorderProcessor` must
+    /// mirror only the track's own frames so the relayed copy is not written to
+    /// the recording twice.
+    #[test]
+    fn recorder_processor_only_mirrors_owned_frames() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut processor = RecorderProcessor::new(tx, "server-side-track".to_string());
+
+        let mut relayed = pcm_frame("caller-leg", 160);
+        processor.process_frame(&mut relayed).unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "relayed caller audio must not be recorded"
+        );
+
+        let mut own = pcm_frame("server-side-track", 160);
+        processor.process_frame(&mut own).unwrap();
+        let mirrored = rx
+            .try_recv()
+            .expect("the track's own audio must be recorded");
+        assert_eq!(mirrored.track_id, "server-side-track");
+    }
+
+    /// A bare `RecorderProcessor` (e.g. attached to the caller leg) records its
+    /// own frames and ignores anything else.
+    #[test]
+    fn recorder_processor_records_caller_leg_only() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut processor = RecorderProcessor::new(tx, "caller-leg".to_string());
+
+        let mut own = pcm_frame("caller-leg", 160);
+        processor.process_frame(&mut own).unwrap();
+        assert!(rx.try_recv().is_ok());
+
+        let mut foreign = pcm_frame("server-side-track", 160);
+        processor.process_frame(&mut foreign).unwrap();
+        assert!(rx.try_recv().is_err());
     }
 }
